@@ -265,3 +265,32 @@ int SDL_main(int argc, char *argv[]) {
     }
     return 0;
 }
+
+/* ---------------------------------------------------------------- on-screen controls: a virtual SDL gamepad
+ * TouchControls.java -> GameActivity.nativeTouchPad (UI thread). The pad is attached on the first touch, so a player
+ * with a real controller and the overlay hidden has only the real one. Bits = SDL_GamepadButton; 16 / 17 = ZL / ZR. */
+static SDL_Joystick *g_vpad;
+JNIEXPORT void JNICALL Java_me_hapke_opensmash_GameActivity_nativeTouchPad(JNIEnv *env, jclass cls, jint buttons, jfloat lx, jfloat ly, jfloat rx, jfloat ry) {
+    (void)env; (void)cls;
+    if (!g_vpad) {
+        SDL_VirtualJoystickDesc desc;
+        SDL_INIT_INTERFACE(&desc);
+        desc.type = SDL_JOYSTICK_TYPE_GAMEPAD;
+        desc.naxes = SDL_GAMEPAD_AXIS_COUNT;
+        desc.nbuttons = SDL_GAMEPAD_BUTTON_COUNT;
+        desc.vendor_id = 0x057e; desc.product_id = 0x2009;      /* reported as a Pro Controller: its face labels are the Switch ones (A east, B south) */
+        desc.name = "OpenSmash touch controls";
+        SDL_JoystickID id = SDL_AttachVirtualJoystick(&desc);
+        if (!id) { printf("android: the virtual pad cannot be attached: %s\n", SDL_GetError()); return; }
+        g_vpad = SDL_OpenJoystick(id);
+        if (!g_vpad) { printf("android: the virtual pad cannot be opened: %s\n", SDL_GetError()); return; }
+        printf("android: on-screen controls attached as a virtual gamepad\n");
+    }
+    for (int b = 0; b < 15; b++) SDL_SetJoystickVirtualButton(g_vpad, b, (buttons >> b & 1) != 0);
+    SDL_SetJoystickVirtualAxis(g_vpad, SDL_GAMEPAD_AXIS_LEFTX, (Sint16)(lx * 32767));
+    SDL_SetJoystickVirtualAxis(g_vpad, SDL_GAMEPAD_AXIS_LEFTY, (Sint16)(ly * 32767));
+    SDL_SetJoystickVirtualAxis(g_vpad, SDL_GAMEPAD_AXIS_RIGHTX, (Sint16)(rx * 32767));
+    SDL_SetJoystickVirtualAxis(g_vpad, SDL_GAMEPAD_AXIS_RIGHTY, (Sint16)(ry * 32767));
+    SDL_SetJoystickVirtualAxis(g_vpad, SDL_GAMEPAD_AXIS_LEFT_TRIGGER, (buttons >> 16 & 1) ? 32767 : 0);
+    SDL_SetJoystickVirtualAxis(g_vpad, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER, (buttons >> 17 & 1) ? 32767 : 0);
+}
