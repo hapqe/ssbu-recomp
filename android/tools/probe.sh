@@ -3,7 +3,7 @@
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 NDK=${NDK:-$HOME/Library/Android/sdk/ndk/29.0.14206865}
 CC=$NDK/toolchains/llvm/prebuilt/darwin-x86_64/bin/clang
-DEPS=${DEPS:-$ROOT/../deps}
+DEPS=${DEPS:-$ROOT/../ssbu-recomp-deps}
 STAGE=$ROOT/android/build/stage
 python3 "$ROOT/android/tools/stage.py" "$STAGE" > /dev/null
 mkdir -p /tmp/osprobe

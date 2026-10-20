@@ -5,7 +5,7 @@
 # Output: android/build/deps/{sdl3,glslang,opus}/install
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-SRC="$(cd "${1:-$ROOT/../deps}" && pwd)"
+SRC="$(cd "${1:-$ROOT/../ssbu-recomp-deps}" && pwd)"
 SDK="${ANDROID_HOME:-$HOME/Library/Android/sdk}"
 NDK="${NDK:-$SDK/ndk/29.0.14206865}"
 API=30

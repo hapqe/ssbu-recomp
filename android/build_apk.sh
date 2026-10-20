@@ -4,7 +4,7 @@
 #   2. android/tools/build_native.sh  libmain.so (the runtime), libssbu_glslang.so
 #   3. libdevcheck.so, the Java side (launcher, game activity, SDL3's Java glue), resources, signing
 # Needs: Android SDK (build-tools, platform 36), NDK 29, JDK 17, python3, and the sources of SDL3 3.4.18, glslang 16.6.0,
-# opus 1.5.2 and Vulkan-Headers 1.4.329 in DEPS (default: ../deps beside the repository; android/tools/fetch_deps.sh).
+# opus 1.5.2 and Vulkan-Headers 1.4.329 in DEPS (default: ../ssbu-recomp-deps beside the repository).
 # Output: android/build/OpenSmash.apk. Nothing of the game is in it.
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -13,7 +13,7 @@ SDK="${ANDROID_HOME:-$HOME/Library/Android/sdk}"
 BT="$SDK/build-tools/36.0.0"
 PLATFORM="$SDK/platforms/android-36/android.jar"
 NDK="${NDK:-$SDK/ndk/29.0.14206865}"
-DEPS="${DEPS:-$ROOT/../deps}"
+DEPS="${DEPS:-$ROOT/../ssbu-recomp-deps}"
 export SRCDEPS="$DEPS"
 if [ -z "${JAVA_HOME:-}" ]; then for j in /opt/homebrew/opt/openjdk@17 /usr/lib/jvm/java-17-openjdk-amd64; do [ -d "$j" ] && export JAVA_HOME="$j" && break; done; fi
 JAVA_BIN="${JAVA_HOME:+$JAVA_HOME/bin/}"
