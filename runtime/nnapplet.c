@@ -187,6 +187,9 @@ typedef struct {
     wchar_t text[SWKBD_MAX_CHARS + 2];
 } KbdDialog;
 
+#ifdef SSBU_ANDROID
+static int kbd_run_dialog(KbdDialog *k) { (void)k; return 0; }      /* Android: osk_run (android/runtime/osk_android.c) always answers */
+#else
 #define IDC_EDIT 1001
 #define IDC_INFO 1002
 static INT_PTR CALLBACK kbd_proc(HWND dlg, UINT msg, WPARAM wp, LPARAM lp) {
@@ -250,6 +253,7 @@ static int kbd_run_dialog(KbdDialog *k) {
     if (r == -1) { printf("nn::swkbd: the text dialog could not be created (error %lu); answered as cancelled\n", GetLastError()); return 0; }
     return (int)r;
 }
+#endif
 static void copy_w(wchar_t *dst, uint64_t src, int max) {
     int i = 0;
     for (; i < max; i++) { uint16_t ch = rd16(src + (uint64_t)i * 2); if (!ch) break; dst[i] = ch; }
@@ -458,6 +462,9 @@ static int guard_ok(const uint8_t *p, size_t from, size_t to, uint8_t v) { for (
 static volatile int g_kbd_test_initial_seen;
 static DWORD WINAPI kbd_test_driver(LPVOID arg) {
     (void)arg;
+#ifdef SSBU_ANDROID
+    return 1;                                         /* drives the Windows dialog: not on Android */
+#else
     for (int round = 0; round < 2; round++) {
         HWND w = NULL;
         for (int i = 0; i < 500 && !w; i++) { Sleep(10); w = FindWindowW(NULL, L"Software keyboard (SSBU native)"); }
@@ -474,6 +481,7 @@ static DWORD WINAPI kbd_test_driver(LPVOID arg) {
         for (int i = 0; i < 500 && IsWindow(w); i++) Sleep(10);
     }
     return 0;
+#endif
 }
 int nnapplet_selftest(Ctx *c) {
     int bad = 0, ok;

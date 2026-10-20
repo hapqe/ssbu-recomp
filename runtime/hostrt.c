@@ -728,9 +728,14 @@ static void diag_modules(FILE *f) {
         char name[MAX_PATH] = "?";
         if (!K32GetModuleInformation(GetCurrentProcess(), mods[i], &mi, sizeof mi)) continue;
         GetModuleFileNameA(mods[i], name, MAX_PATH);
+#ifdef SSBU_ANDROID
+        unsigned long stamp = 0;                    /* ELF modules: no link time stamp */
+#else
         const IMAGE_NT_HEADERS *nt = (const IMAGE_NT_HEADERS *)((const char *)mi.lpBaseOfDll + ((const IMAGE_DOS_HEADER *)mi.lpBaseOfDll)->e_lfanew);
+        unsigned long stamp = (unsigned long)nt->FileHeader.TimeDateStamp;
+#endif
         fprintf(f, "  %016llx-%016llx  linked %08lx  %s\n", (unsigned long long)(uintptr_t)mi.lpBaseOfDll,
-                (unsigned long long)(uintptr_t)mi.lpBaseOfDll + mi.SizeOfImage, (unsigned long)nt->FileHeader.TimeDateStamp, base_name(name));
+                (unsigned long long)(uintptr_t)mi.lpBaseOfDll + mi.SizeOfImage, stamp, base_name(name));
     }
 }
 

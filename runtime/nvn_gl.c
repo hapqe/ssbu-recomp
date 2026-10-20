@@ -3852,6 +3852,10 @@ void nvn_gl_start(void *hwnd) {
         if (e && e[0] && strcmp(e, "gl") && strcmp(e, "vk")) { printf("nvn: SSBU_RENDERER=%s is not a renderer (gl, vk)\n", e); fflush(stdout); ExitProcess(5); }
         /* Track V session 4: VULKAN IS THE DEFAULT. SSBU_RENDERER=gl|vk wins; else renderer = vulkan | opengl of config\graphics.ini. */
         g_vk = e && e[0] ? !strcmp(e, "vk") : !gfx_options()->renderer;
+#ifdef SSBU_ANDROID
+        if (!g_vk) printf("nvn: the OpenGL renderer is not available on Android: Vulkan\n");
+        g_vk = 1;                                     /* no desktop OpenGL on Android */
+#endif
         g_rb = g_vk ? &rb_vk : &rb_gl;
         printf("nvn: renderer: %s (%s)\n", g_vk ? "Vulkan (nvn_vk.c)" : "OpenGL (nvn_gl.c)", e && e[0] ? "SSBU_RENDERER" : "graphics.ini; the default is Vulkan");
     }
@@ -4371,7 +4375,7 @@ static void cmd_get_control_size(Ctx *c) { RET(cb_get(A0)->ctrl_size); }
 static void cmd_is_recording(Ctx *c) { RET(cb_get(A0)->recording); }
 /* L1 round 2, TEST ONLY (SSBU_L1_TRACE=1 with SSBU_L1=1): for the 5 presents after the first press, every command-buffer
  * recording, submission, fence, sync wait, window acquire and present, with the guest thread name and the guest return address. */
-int display_l1_trace(void); double display_l1_ms(void); const char *guest_thread_name_of(unsigned long tid);
+int display_l1_trace(void); double display_l1_ms(void); const char *guest_thread_name_of(DWORD tid);
 #define L1T(...) do { if (display_l1_trace()) { char l1b_[240]; snprintf(l1b_, sizeof l1b_, __VA_ARGS__); printf("l1-trace: %+8.2f %-26s lr %09llx %s%c", display_l1_ms(), guest_thread_name_of(GetCurrentThreadId()) ? guest_thread_name_of(GetCurrentThreadId()) : "?", (unsigned long long)c->x[30], l1b_, 10); } } while (0)
 static void cmd_begin(Ctx *c) { L1T("begin recording cb %llx", (unsigned long long)A0); CmdBuf *cb = cb_get(A0); cb->len = 0; cb->recording = 1; cb->rec_cmd = cb->rec_ctrl = 0; cb->dispatches = 0; }
 static void cmd_end(Ctx *c) {

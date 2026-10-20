@@ -150,6 +150,54 @@ static void precise_wait_until(LONGLONG target, HANDLE timer) {
     if (due.QuadPart < 0) { if (timer && SetWaitableTimer(timer, &due, 0, NULL, NULL, FALSE)) WaitForSingleObject(timer, 100); else Sleep((DWORD)(left * 1000 / g_freq.QuadPart)); }
     for (QueryPerformanceCounter(&now); now.QuadPart < target; QueryPerformanceCounter(&now)) YieldProcessor();
 }
+#ifdef SSBU_ANDROID
+/* Android: the display's vblanks from AChoreographer (CLOCK_MONOTONIC, the clock QueryPerformanceCounter reads here),
+ * on a looper thread of its own; the same bookkeeping as the D3DKMT thread below. */
+#include <android/choreographer.h>
+#include <android/looper.h>
+static LONGLONG g_cg_prev, g_cg_first[24];
+static int g_cg_nfirst;
+static void vblank_frame(int64_t t, void *data) {
+    (void)data;
+    LONGLONG now = t, dt = g_cg_prev ? now - g_cg_prev : 0;
+    g_cg_prev = now;
+    LONG64 steps = 1;
+    if (g_vb_state == 1) {
+        if (dt > 0 && dt < g_freq.QuadPart / 20) g_cg_first[g_cg_nfirst++] = dt;
+        if (g_cg_nfirst == 24) {
+            LONGLONG *first = g_cg_first;
+            for (int i = 1; i < 24; i++) { LONGLONG v = first[i]; int k = i; while (k > 0 && first[k - 1] > v) { first[k] = first[k - 1]; k--; } first[k] = v; }
+            AcquireSRWLockExclusive(&g_vb_lock);
+            g_vb_period = (double)(first[11] + first[12]) / 2.0;
+            ReleaseSRWLockExclusive(&g_vb_lock);
+            printf("display: refresh measured %.3f Hz (AChoreographer, median of 24 frame intervals: %.3f ms)%c", (double)g_freq.QuadPart / g_vb_period, g_vb_period * 1000.0 / (double)g_freq.QuadPart, 10);
+            InterlockedExchange(&g_vb_state, 2);
+        }
+    } else if (dt > 0 && g_vb_period > 0) {
+        double r = (double)dt / g_vb_period;
+        steps = (LONG64)(r + 0.5);
+        if (steps < 1) steps = 1;
+        if (steps <= 4 && r / (double)steps > 0.9 && r / (double)steps < 1.1) g_vb_period += ((double)dt / (double)steps - g_vb_period) * 0.01;
+    }
+    AcquireSRWLockExclusive(&g_vb_lock);
+    g_vb_count += steps;
+    g_vb_qpc = now;
+    ReleaseSRWLockExclusive(&g_vb_lock);
+    WakeAllConditionVariable(&g_vb_cv);
+    AChoreographer_postFrameCallback64(AChoreographer_getInstance(), vblank_frame, NULL);
+}
+static DWORD WINAPI vblank_thread(LPVOID arg) {
+    (void)arg;
+    ALooper_prepare(0);
+    AChoreographer *cg = AChoreographer_getInstance();
+    if (!cg) { printf("display: no vblank source (AChoreographer): the refresh clock stays our own 60 Hz clock%c", 10); InterlockedExchange(&g_vb_state, -1); return 0; }
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+    InterlockedExchange(&g_vb_state, 1);
+    AChoreographer_postFrameCallback64(cg, vblank_frame, NULL);
+    for (;;) ALooper_pollOnce(-1, NULL, NULL, NULL);
+    return 0;
+}
+#else
 static DWORD WINAPI vblank_thread(LPVOID arg) {
     (void)arg;
     HMODULE gdi = LoadLibraryA("gdi32.dll");
@@ -202,6 +250,7 @@ static DWORD WINAPI vblank_thread(LPVOID arg) {
         WakeAllConditionVariable(&g_vb_cv);
     }
 }
+#endif
 static void pace_options(void) {
     if (g_pace_want >= 0) return;
     const char *e = getenv("SSBU_PACE"), *h = getenv("SSBU_PACE_HOLD"), *p = getenv("SSBU_PACE_PHASE");
@@ -260,6 +309,31 @@ void display_fit(int sw, int sh, int dw, int dh, int out[4]) {      /* the large
         if (memcmp(last, out, sizeof last) && said++ < 20) { memcpy(last, out, sizeof last); printf("display: picture %dx%d at %d,%d in %dx%d\n", out[2], out[3], out[0], out[1], dw, dh); fflush(stdout); }
     }
 }
+#ifdef SSBU_ANDROID
+/* Android: the window is the activity's surface (android/runtime/android_main.c owns it, SDL3 delivers it); it is always
+ * full screen, so the window modes of the settings menu do nothing. Closing = the activity finishing (back gesture). */
+void *android_native_window(void);                     /* android_main.c: ANativeWindow * of the activity, waits until there is one */
+static int g_full = 1;
+void display_set_window_mode(int mode) { (void)mode; }
+void display_set_client_size(int w, int h) { (void)w; (void)h; }
+int display_window_mode(void) { return 1; }
+static char g_title[96];
+/* android_main.c: the user leaves the game (back gesture, the activity finishes): as WM_CLOSE on Windows */
+void display_close_request(void) {
+    printf("\nwindow closed by the user after %lld frames\n", (long long)g_frames);
+    { extern volatile LONG g_display_close; InterlockedExchange(&g_display_close, 1); }
+    if (!oe_exit_request()) report_and_exit(0);
+}
+static DWORD WINAPI window_thread(LPVOID arg) {
+    (void)arg;
+    snprintf(g_title, sizeof g_title, "%s", getenv("SSBU_TITLE") ? getenv("SSBU_TITLE") : "OpenSmash (Android)");
+    g_hwnd = android_native_window();
+    printf("display: the activity's surface %p is the window\n", (void *)g_hwnd);
+    InterlockedExchange(&g_ready, 1);
+    return 0;
+}
+
+#else
 static void sizing_keep_aspect(HWND h, WPARAM edge, RECT *r) {
     RECT frame = {0, 0, 0, 0};
     AdjustWindowRectEx(&frame, (DWORD)GetWindowLongPtrA(h, GWL_STYLE), FALSE, (DWORD)GetWindowLongPtrA(h, GWL_EXSTYLE));
@@ -410,6 +484,7 @@ static DWORD WINAPI window_thread(LPVOID arg) {
     return 0;
 }
 
+#endif
 /* Signals the guest's vsync event 60 times per second. */
 static DWORD WINAPI vsync_thread(LPVOID arg) {
     (void)arg;

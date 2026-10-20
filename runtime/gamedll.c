@@ -25,9 +25,18 @@ typedef struct {
     const int *sym_count;
 } GameTables;
 
+#ifdef SSBU_ANDROID
+/* Android: the game library is not a link-time dependency (it is built on the PC from the dump and copied into the app's
+ * private folder by the launcher), so the two entry points are looked up when the launcher has loaded it:
+ * android_main.c calls game_dll_bind() before the runtime's main. SSBU_GAME_DLL names the file (LoadLibraryA). */
+#include <windows.h>
+static void (*game_bind)(const GameHost *h, GameTables *t);
+static void (*game_data_bind)(const GameDataHost *h, GameData *d);
+#else
 __declspec(dllimport) void game_bind(const GameHost *h, GameTables *t);
 /* game_data.h: the dump-derived tables and the lifted SDK code, in the DLL too (game_data.c) */
 __declspec(dllimport) void game_data_bind(const GameDataHost *h, GameData *d);
+#endif
 GameData game_data;
 void sdk_host_call(Ctx *c, int index);                   /* sdklift_rt.c */
 void sdk_trap_call(Ctx *c, const char *name);
@@ -45,7 +54,25 @@ const int *game_fn_table_count_p;
 const DynSym (*game_dyn_syms_p)[];
 const int *game_dyn_sym_count_p;
 
+#ifdef SSBU_ANDROID
+static void bind_game(void);
+/* 0 = bound; otherwise a message for the launcher */
+const char *game_dll_bind(void) {
+    static char msg[512];
+    const char *name = getenv("SSBU_GAME_DLL");
+    if (!name || !name[0]) name = "ssbu_game_eh_o1.dll";
+    HMODULE m = LoadLibraryA(name);
+    if (!m) { snprintf(msg, sizeof msg, "The game library %s could not be loaded. Build it on the PC (android/tools/build_game_android.py) and copy it into the game folder's work folder.", name); return msg; }
+    game_bind = (void (*)(const GameHost *, GameTables *))GetProcAddress(m, "game_bind");
+    game_data_bind = (void (*)(const GameDataHost *, GameData *))GetProcAddress(m, "game_data_bind");
+    if (!game_bind || !game_data_bind) { snprintf(msg, sizeof msg, "%s is not a game library of this port (no game_bind / game_data_bind).", name); return msg; }
+    bind_game();
+    return NULL;
+}
+static void bind_game(void) {
+#else
 __attribute__((constructor)) static void bind_game(void) {
+#endif
     GameHost h = {call_indirect, host_import, guest_trap, guest_unimpl, guest_svc, stx_diag};
     GameTables t;
     game_bind(&h, &t);

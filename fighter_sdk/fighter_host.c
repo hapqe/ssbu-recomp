@@ -726,14 +726,21 @@ static void __declspec(noinline) fs_compare(Ctx *c, FsFiber *ff, int partial) {
  * tested on the made-up agent (reported as such), during the SOURCE's run it is a difference. */
 static FsFiber *g_fs_guard_ff; static int g_fs_guard_phase;      /* 1 = the original runs, 2 = the source runs */
 static void fs_guard_resume(CONTEXT *x, jmp_buf jb, int value) {
+#ifdef SSBU_ANDROID
+    (void)x; (void)jb; (void)value;                  /* Android: no resumable fault guard (fs_guard declines, the fault is a crash) */
+#else
     _JUMP_BUFFER *j = (_JUMP_BUFFER *)jb;
     x->Rbx = j->Rbx; x->Rsp = j->Rsp; x->Rbp = j->Rbp; x->Rsi = j->Rsi; x->Rdi = j->Rdi;
     x->R12 = j->R12; x->R13 = j->R13; x->R14 = j->R14; x->R15 = j->R15; x->Rip = j->Rip;
     memcpy(&x->Xmm6, &j->Xmm6, 160);
     x->Rax = (DWORD64)value;
+#endif
 }
 static LONG CALLBACK fs_guard(EXCEPTION_POINTERS *ep) {
     FsFiber *ff = g_fs_guard_ff;
+#ifdef SSBU_ANDROID
+    if (ff) return EXCEPTION_CONTINUE_SEARCH;
+#endif
     if (!ff || !g_fs_guard_phase || ep->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION) return EXCEPTION_CONTINUE_SEARCH;
     int phase = g_fs_guard_phase;
     g_fs_guard_phase = 0;

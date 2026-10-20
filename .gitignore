@@ -72,3 +72,8 @@ dist/
 config/
 build_location.txt
 __pycache__/
+
+# Android port: build output (android/tools/*.sh)
+android/build/
+*.apk
+*.idsig

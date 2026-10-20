@@ -104,6 +104,10 @@ static void wd_addr(uint64_t pc, char *out, size_t n) {
 /* The return addresses of another thread (suspended by the caller). Unwind data that cannot be read ends the walk. */
 static int wd_walk(CONTEXT *ctx, uint64_t *pcs, int max) {
     int n = 0;
+#ifdef SSBU_ANDROID
+    (void)ctx; (void)pcs; (void)max;                  /* Android: other threads cannot be suspended and walked */
+    return n;
+#else
     __try {
         while (n < max && ctx->Rip) {
             DWORD64 base = 0, ef = 0;
@@ -115,6 +119,7 @@ static int wd_walk(CONTEXT *ctx, uint64_t *pcs, int max) {
         }
     } __except (1) { }
     return n;
+#endif
 }
 static const char *wd_tname(DWORD tid, char *buf, size_t n) {
     const char *g = tid == g_render_tid ? "render (host)" : tid == g_wd_main_tid ? "the process's first thread (boot.c main: waits for the game)" : guest_thread_name_of(tid);

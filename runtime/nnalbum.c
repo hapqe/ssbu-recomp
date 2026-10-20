@@ -58,10 +58,19 @@
  * FNV-1a over the date and content type; an entry whose hash does not match is refused as "file not found". */
 #define COBJMACROS
 #include <windows.h>
+#ifdef SSBU_ANDROID
+/* Android: no Media Foundation. The movie maker (game clips saved to the album) cannot open its encoder: StartMovieFile
+ * fails the way it does on a PC without an H.264 encoder, and the game reports that the clip cannot be saved. */
+typedef struct IMFSinkWriter IMFSinkWriter;
+#define IMFSinkWriter_Release(w) ((void)(w))
+#define IMFSinkWriter_Finalize(w) ((void)(w), E_FAIL)
+#define E_INVALIDARG ((HRESULT)0x80070057)
+#else
 #include <mfapi.h>
 #include <mfidl.h>
 #include <mfreadwrite.h>
 #include <mferror.h>
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -435,6 +444,19 @@ static void mm_unlock(void) { LeaveCriticalSection(&g_mm.lock); }
 uint64_t album_movie_native_window(void) { return (uint64_t)(uintptr_t)g_mm_window_token; }
 void album_movie_frame_source_attach(void) { g_mm.frame_source = 1; }
 
+static void mm_release_writer(int delete_file) {
+    if (g_mm.writer) { IMFSinkWriter_Release(g_mm.writer); g_mm.writer = NULL; }
+    free(g_mm.nv12); g_mm.nv12 = NULL;
+    if (delete_file && g_mm.tmp_path[0]) DeleteFileA(g_mm.tmp_path);
+}
+#ifdef SSBU_ANDROID
+static HRESULT mm_open(const uint8_t *param) {
+    (void)param;
+    printf("nn::album movie maker: no video encoder in the Android build: the clip is not recorded\n");
+    return E_NOTIMPL;
+}
+static HRESULT mm_write(DWORD stream, const void *data, size_t size, int64_t time, int64_t duration) { (void)stream; (void)data; (void)size; (void)time; (void)duration; return E_FAIL; }
+#else
 static HRESULT mm_set_video(IMFMediaType *t, const GUID *sub, int w, int h, int fps) {
     HRESULT hr = IMFMediaType_SetGUID(t, &MF_MT_MAJOR_TYPE, &MFMediaType_Video);
     if (SUCCEEDED(hr)) hr = IMFMediaType_SetGUID(t, &MF_MT_SUBTYPE, sub);
@@ -458,11 +480,6 @@ static HRESULT mm_set_audio(IMFMediaType *t, const GUID *sub, int rate, int chan
         if (SUCCEEDED(hr)) hr = IMFMediaType_SetUINT32(t, &MF_MT_AUDIO_AVG_BYTES_PER_SECOND, (UINT32)(rate * channels * 2));
     }
     return hr;
-}
-static void mm_release_writer(int delete_file) {
-    if (g_mm.writer) { IMFSinkWriter_Release(g_mm.writer); g_mm.writer = NULL; }
-    free(g_mm.nv12); g_mm.nv12 = NULL;
-    if (delete_file && g_mm.tmp_path[0]) DeleteFileA(g_mm.tmp_path);
 }
 /* grc::StartMovieFile: opens the encoder for the 0x80-byte MovieMakerMovieParameter. Returns an HRESULT. */
 static HRESULT mm_open(const uint8_t *param) {
@@ -519,6 +536,7 @@ static HRESULT mm_write(DWORD stream, const void *data, size_t size, int64_t tim
     if (b) IMFMediaBuffer_Release(b);
     return hr;
 }
+#endif
 /* One picture of the movie layer (what the game presented to the movie maker's native window): RGBA8, `stride` bytes per
  * row, first row = top unless bottom_up. Any size: it is scaled to the movie's. Returns 0 when it was taken. */
 int album_movie_push_frame(const uint8_t *rgba, int w, int h, int stride, int bottom_up) {

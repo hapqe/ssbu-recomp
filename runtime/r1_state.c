@@ -129,6 +129,9 @@ static uint8_t *g_ar;
 static int cmp_rng(const void *x, const void *y) { const Rng *a = x, *b = y; return a->a < b->a ? -1 : a->a > b->a; }
 /* host DLLs that run fighter code (fighters_bin\*.dll, track S): their writable sections are simulation state too */
 #include <tlhelp32.h>
+#ifdef SSBU_ANDROID
+size_t android_writable_segments(uint8_t *base, void (*add)(uint8_t *, uint8_t *));   /* android/compat/win32_compat.c */
+#endif
 static void add_fighter_dlls(void) {
     HANDLE sn = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, GetCurrentProcessId());
     if (sn == INVALID_HANDLE_VALUE) return;
@@ -137,6 +140,11 @@ static void add_fighter_dlls(void) {
     for (BOOL ok = Module32First(sn, &me); ok; ok = Module32Next(sn, &me)) {
         if (!strstr(me.szExePath, "fighters_bin") || getenv("SSBU_R1_NO_DLLS")) continue;
         uint8_t *b = me.modBaseAddr;
+#ifdef SSBU_ANDROID
+        size_t got = android_writable_segments(b, add_span);   /* ELF: the writable PT_LOAD segments */
+        bytes += got; nmod++;
+        continue;
+#endif
         IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS *)(b + ((IMAGE_DOS_HEADER *)b)->e_lfanew);
         IMAGE_SECTION_HEADER *sh = IMAGE_FIRST_SECTION(nt);
         for (int i = 0; i < nt->FileHeader.NumberOfSections; i++)

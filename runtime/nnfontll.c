@@ -97,6 +97,9 @@ typedef struct {
     uint32_t kern_len, gpos_len, cmap_len, name_len;
     int sub_format;
     HFONT hfont;
+#ifdef SSBU_ANDROID
+    void *stb;                                    /* Android: stbtt_fontinfo of this face (outlines from stb_truetype, not GDI) */
+#endif
     int gdi;                                      /* 0 not tried, 1 usable, -1 unusable */
     int no_alt;                                   /* the cmap has no U+25A1 (a replacement font): see ALT_CHAR */
     int shared;                                   /* one of the system's shared fonts (nn::pl), not a font of the game's own */
@@ -135,7 +138,9 @@ static FontData g_fontdata[MAX_FONTDATA];
 static int g_fontdata_count;
 static CRITICAL_SECTION g_lock;                   /* GDI, the font list and the engine table */
 static HDC g_dc;
+#ifndef SSBU_ANDROID
 static const MAT2 identity = {{0, 1}, {0, 0}, {0, 0}, {0, 1}};
+#endif
 
 static uint32_t be16(const uint8_t *p) { return (uint32_t)p[0] << 8 | p[1]; }
 static uint32_t be32(const uint8_t *p) { return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3]; }
@@ -336,7 +341,9 @@ static void path_close(Path *path) {
     if (path->contours == path->ccap) { path->ccap = path->ccap ? path->ccap * 2 : 16; path->end = realloc(path->end, (size_t)path->ccap * sizeof(int)); }
     path->end[path->contours++] = path->n;
 }
+#ifndef SSBU_ANDROID
 static double fx(FIXED v) { return v.value + v.fract / 65536.0; }
+#endif
 
 /* Whether `face` is one of the font's Windows family names (name ID 1) in any language. GetTextFace answers with the
  * name in the user's display language when the font has one: on a Chinese Windows "DFHeiGB Std W12" is reported as
@@ -364,6 +371,72 @@ static int has_family_name(const FontData *f, const WCHAR *face) {
     return 0;
 }
 
+#ifdef SSBU_ANDROID
+/* Android has no GDI: the outlines come from the font file itself through stb_truetype (public domain, Sean Barrett),
+ * in font units like GetGlyphOutline at an em of upem pixels, with the same transform and curve subdivision below. */
+#define STBTT_STATIC
+#define STB_TRUETYPE_IMPLEMENTATION
+#include "stb_truetype.h"
+static int gdi_prepare(FontData *f) {             /* callers hold g_lock */
+    if (f->gdi) return f->gdi > 0;
+    f->gdi = -1;
+    int off = stbtt_GetFontOffsetForIndex(f->data, (int)f->face_index);
+    stbtt_fontinfo *info = calloc(1, sizeof *info);
+    if (off < 0 || !info || !stbtt_InitFont(info, f->data, off)) { free(info); printf("nn::fontll: font \"%s\" REJECTED BY stb_truetype: its glyphs will be blank\n", f->name); return 0; }
+    f->stb = info;
+    f->gdi = 1;
+    return 1;
+}
+static void glyph_path(FontData *f, uint32_t glyph, const int32_t *m, Path *path) {
+    EnterCriticalSection(&g_lock);
+    if (gdi_prepare(f)) {
+        stbtt_vertex *v = NULL;
+        int nv = stbtt_GetGlyphShape((stbtt_fontinfo *)f->stb, (int)glyph, &v);
+        double a = m[0] / 65536.0 / f->upem, b = m[1] / 65536.0 / f->upem, c2 = m[2] / 65536.0 / f->upem, d = m[3] / 65536.0 / f->upem;
+        double pixels = fabs(a) > fabs(d) ? fabs(a) : fabs(d);
+#define TX(px, py) ((px) * a + (py) * b)
+#define TY(px, py) ((px) * c2 + (py) * d)
+        double x0 = 0, y0 = 0;
+        int open = 0;
+        for (int i = 0; i < nv; i++) {
+            double x = v[i].x, y = v[i].y;
+            if (v[i].type == STBTT_vmove) {
+                if (open) path_close(path);
+                path_point(path, TX(x, y), TY(x, y));
+                open = 1;
+            } else if (v[i].type == STBTT_vline) {
+                path_point(path, TX(x, y), TY(x, y));
+            } else if (v[i].type == STBTT_vcurve) {               /* quadratic: control (cx, cy) */
+                double x1 = v[i].cx, y1 = v[i].cy;
+                double len = (fabs(x1 - x0) + fabs(y1 - y0) + fabs(x - x1) + fabs(y - y1)) * pixels;
+                int steps = 2 + (int)(len / 3.0);
+                if (steps > 32) steps = 32;
+                for (int k = 1; k <= steps; k++) {
+                    double t = (double)k / steps, u = 1 - t, px = u * u * x0 + 2 * u * t * x1 + t * t * x, py = u * u * y0 + 2 * u * t * y1 + t * t * y;
+                    path_point(path, TX(px, py), TY(px, py));
+                }
+            } else if (v[i].type == STBTT_vcubic) {               /* CFF: controls (cx, cy), (cx1, cy1) */
+                double x1 = v[i].cx, y1 = v[i].cy, x2 = v[i].cx1, y2 = v[i].cy1;
+                double len = (fabs(x1 - x0) + fabs(y1 - y0) + fabs(x2 - x1) + fabs(y2 - y1) + fabs(x - x2) + fabs(y - y2)) * pixels;
+                int steps = 2 + (int)(len / 3.0);
+                if (steps > 32) steps = 32;
+                for (int k = 1; k <= steps; k++) {
+                    double t = (double)k / steps, u = 1 - t;
+                    double px = u * u * u * x0 + 3 * u * u * t * x1 + 3 * u * t * t * x2 + t * t * t * x;
+                    double py = u * u * u * y0 + 3 * u * u * t * y1 + 3 * u * t * t * y2 + t * t * t * y;
+                    path_point(path, TX(px, py), TY(px, py));
+                }
+            }
+            x0 = x; y0 = y;
+        }
+        if (open) path_close(path);
+#undef TX
+#undef TY
+        if (v) stbtt_FreeShape((stbtt_fontinfo *)f->stb, v);
+    }
+    LeaveCriticalSection(&g_lock);
+}
+#else
 /* Makes GDI able to draw from this font file; verifies that the face GDI selects really is this file. */
 static int gdi_prepare(FontData *f) {             /* callers hold g_lock */
     if (f->gdi) return f->gdi > 0;
@@ -461,6 +534,7 @@ static void glyph_path(FontData *f, uint32_t glyph, const int32_t *m, Path *path
     }
     LeaveCriticalSection(&g_lock);
 }
+#endif
 
 /* ---------------------------------------------------------------- scan conversion (exact area coverage) */
 static void cover_line(float *acc, int w, int h, double x0, double y0, double x1, double y1) {
@@ -1169,7 +1243,9 @@ static const ImportDef fontll_imports[] = {
 
 void register_fontll_imports(void) {
     InitializeCriticalSection(&g_lock);
+#ifndef SSBU_ANDROID
     g_dc = CreateCompatibleDC(NULL);
+#endif
     register_imports(fontll_imports, (int)(sizeof fontll_imports / sizeof fontll_imports[0]));
 }
 

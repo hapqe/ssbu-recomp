@@ -291,6 +291,9 @@ static void print_build_identity(void) {
     size_t dl = slash ? (size_t)(slash - exe + 1) : 0;
     SYSTEMTIME st; GetLocalTime(&st);
     printf("build: %s, started %04d-%02d-%02d %02d:%02d:%02d, process %lu\n", exe + dl, st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, GetCurrentProcessId());
+#ifdef SSBU_ANDROID
+    return;                                         /* Android: the modules are ELF files, without a PE time stamp */
+#endif
     HMODULE mods[256];
     DWORD need = 0;
     if (!K32EnumProcessModules(GetCurrentProcess(), mods, sizeof mods, &need)) return;

@@ -494,7 +494,16 @@ static int resolve(void) {
 
 /* ---------------------------------------------------------------- no server: room codes, STUN, the in-game lobby */
 #include "net_minilobby.c"                      /* the lobby of tools_net/ssbu_lobby.py in C: runs inside the host's game */
+#ifdef SSBU_ANDROID                                  /* no COM UPnP client on Android: HOST mode asks for a forwarded port */
+static int upnp_map_udp(uint16_t port, uint32_t lan_ip_host_order, const char *desc, char *ext, size_t ext_n, char *why, size_t why_n) {
+    (void)port; (void)lan_ip_host_order; (void)desc; if (ext_n) ext[0] = 0;
+    snprintf(why, why_n, "not available on Android (forward the UDP port on the router by hand)");
+    return 0;
+}
+static void upnp_unmap_udp(uint16_t port) { (void)port; }
+#else
 #include "net_upnp.c"                           /* UPnP-IGD port mapping (HOST mode, online_upnp) */
+#endif
 
 /* A room code is an IPv4 address and a UDP port (6 bytes) in Crockford base32: 10 characters, shown as XXXXX-XXXXX.
  * Reading it ignores '-', spaces and case; O reads as 0, I and L as 1. "a.b.c.d:port" is accepted as well. */

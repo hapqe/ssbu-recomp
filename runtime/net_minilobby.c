@@ -295,7 +295,7 @@ static void ml_on_join(const uint8_t *p, int len, const struct sockaddr_in *at, 
         memcpy(c->nonce, nonce, 8);
         snprintf(c->name, sizeof c->name, "%s", name); snprintf(c->build, sizeof c->build, "%s", build); snprintf(c->code, sizeof c->code, "%s", code);
         ml_log("%s joined (code '%s', build %s) as %s from %u.%u.%u.%u:%d, LAN %u.%u.%u.%u:%u, direct %s", name, code, build, ml_vip(ip),
-               at->sin_addr.S_un.S_un_b.s_b1, at->sin_addr.S_un.S_un_b.s_b2, at->sin_addr.S_un.S_un_b.s_b3, at->sin_addr.S_un.S_un_b.s_b4, ntohs(at->sin_port), lan_ip >> 24, lan_ip >> 16 & 255, lan_ip >> 8 & 255, lan_ip & 255,
+               ((const uint8_t *)&at->sin_addr)[0], ((const uint8_t *)&at->sin_addr)[1], ((const uint8_t *)&at->sin_addr)[2], ((const uint8_t *)&at->sin_addr)[3], ntohs(at->sin_port), lan_ip >> 24, lan_ip >> 16 & 255, lan_ip >> 8 & 255, lan_ip & 255,
                lan_port, direct ? "yes" : "no");
     }
     c->seen = now; c->lan_ip = lan_ip; c->lan_port = lan_port; c->direct = direct;
