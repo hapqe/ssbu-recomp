@@ -16,15 +16,19 @@ import android.provider.DocumentsContract;
 import android.provider.Settings;
 import android.text.InputType;
 import android.view.Gravity;
+import android.view.InputDevice;
 import android.view.View;
 import android.view.ViewGroup;
+import android.widget.ArrayAdapter;
 import android.widget.Button;
-import android.widget.CheckBox;
 import android.widget.EditText;
 import android.widget.LinearLayout;
 import android.widget.ProgressBar;
 import android.widget.ScrollView;
+import android.widget.Spinner;
 import android.widget.TextView;
+
+import org.json.JSONObject;
 
 import java.io.File;
 import java.io.FileInputStream;
@@ -37,21 +41,29 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
 import java.util.TimeZone;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipInputStream;
 
 /**
  * The launcher: where the game folder is, whether it is complete, whether this device can run the port, and the copy of
  * the game libraries into the app's private storage (Android runs no code from shared storage). Nothing of the game is
  * in the APK: the folder is made on a PC from the user's own dump (android/tools/export_for_android.py).
+ * Also the GPU driver: the system's, or a custom one from an AdrenoTools driver package (a .zip with meta.json and the
+ * driver .so, e.g. Mesa Turnip for Adreno) installed into private storage and loaded by android/runtime/vk_driver.c.
  */
 public class LauncherActivity extends Activity {
     static final String PREFS = "opensmash";
     static final int REQ_TREE = 1;
+    static final int REQ_DRIVER = 2;
 
     private EditText folder, extraEnv;
-    private TextView checks, device, status;
+    private TextView checks, device, status, driverInfo;
     private Button start, access, copy;
     private ProgressBar progress;
-    private CheckBox touch;
+    private Spinner touch, resolution;
+    /* the game's render resolution: resolution_scale of graphics.ini against the Switch's 1920x1080 (SSBU_VK_SCALE) */
+    private static final String[] RES_NAMES = {"From graphics.ini", "540p (0.5x)", "720p (0.67x)", "900p (0.83x)", "1080p (native)", "1440p (1.33x)", "2160p (2x)"};
+    private static final String[] RES_SCALE = {null, "0.5", "0.6667", "0.8333", "1.0", "1.3333", "2.0"};
     private final Handler ui = new Handler(Looper.getMainLooper());
     private volatile boolean copying;
 
@@ -114,10 +126,12 @@ public class LauncherActivity extends Activity {
         status = new TextView(this);
         col.addView(status);
 
-        touch = new CheckBox(this);
-        touch.setText("On-screen controls (touch)");
-        touch.setChecked(p.getBoolean("touch", true));
+        col.addView(label("On-screen controls (touch)"));
+        touch = spinner(new String[] {"Auto: off while a controller is connected", "On", "Off"}, p.getInt("touch_mode", p.getBoolean("touch", true) ? 0 : 2));
         col.addView(touch);
+        col.addView(label("Render resolution (lower = faster)"));
+        resolution = spinner(RES_NAMES, p.getInt("resolution", 0));
+        col.addView(resolution);
         col.addView(label("Extra settings (one NAME=VALUE per line, e.g. SSBU_VK_MISSING=warn)"));
         extraEnv = new EditText(this);
         extraEnv.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
@@ -136,15 +150,97 @@ public class LauncherActivity extends Activity {
         log.setOnClickListener(v -> showLog());
         col.addView(log);
 
+        col.addView(label("GPU driver"));
+        driverInfo = new TextView(this);
+        col.addView(driverInfo);
+        Button installDriver = new Button(this);
+        installDriver.setText("Install a driver (AdrenoTools .zip, e.g. Turnip)…");
+        installDriver.setOnClickListener(v -> {
+            Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+            i.addCategory(Intent.CATEGORY_OPENABLE);
+            i.setType("*/*");
+            i.putExtra(Intent.EXTRA_MIME_TYPES, new String[] {"application/zip", "application/x-zip-compressed", "application/octet-stream"});
+            startActivityForResult(i, REQ_DRIVER);
+        });
+        col.addView(installDriver);
+        Button systemDriver = new Button(this);
+        systemDriver.setText("Use the system driver");
+        systemDriver.setOnClickListener(v -> { deleteTree(driverDir()); driverChanged("system driver selected"); });
+        col.addView(systemDriver);
+
         col.addView(label("This device"));
         device = mono();
         col.addView(device);
         setContentView(scroll);
+        driverChanged(null);
+    }
+
+    /* ---------------------------------------------------------------- the GPU driver */
+    File driverDir() { return new File(getFilesDir(), "gpu_driver"); }
+    /** The installed custom driver's .so (meta.json "libraryName"), or null: the system's driver. */
+    File driverLib() {
+        try {
+            JSONObject m = new JSONObject(readText(new File(driverDir(), "meta.json"), 1 << 16));
+            File f = new File(driverDir(), new File(m.getString("libraryName")).getName());
+            return f.isFile() ? f : null;
+        } catch (Exception e) { return null; }
+    }
+    private String driverName() {
+        try {
+            JSONObject m = new JSONObject(readText(new File(driverDir(), "meta.json"), 1 << 16));
+            return m.optString("name", "?") + " (" + m.optString("driverVersion", "?") + ", " + m.optString("author", "?") + ")";
+        } catch (Exception e) { return "?"; }
+    }
+    private void driverChanged(String msg) {
+        File lib = driverLib();
+        driverInfo.setText((msg != null ? msg + "\n" : "") + (lib != null ? "Custom driver: " + driverName() : "System driver"));
+        device.setText("checking the Vulkan driver…");
+        final String path = lib != null ? lib.getAbsolutePath() : null;
         new Thread(() -> {
             String r;
-            try { r = DeviceCheck.report(); } catch (Throwable t) { r = "device check failed: " + t; }
+            try { r = DeviceCheck.report(path); } catch (Throwable t) { r = "device check failed: " + t; }
             final String text = r;
             ui.post(() -> device.setText(text));
+        }).start();
+    }
+    private static void deleteTree(File f) {
+        File[] fs = f.listFiles();
+        if (fs != null) for (File c : fs) deleteTree(c);
+        f.delete();
+    }
+    /** An AdrenoTools driver package: meta.json (libraryName = the driver .so) and the files beside it, at its top level. */
+    private void installDriver(Uri zip) {
+        driverInfo.setText("installing the driver…");
+        new Thread(() -> {
+            String msg;
+            File tmp = new File(getFilesDir(), "gpu_driver.new");
+            deleteTree(tmp);
+            try (ZipInputStream in = new ZipInputStream(getContentResolver().openInputStream(zip))) {
+                tmp.mkdirs();
+                ZipEntry e;
+                byte[] buf = new byte[1 << 16];
+                while ((e = in.getNextEntry()) != null) {
+                    if (e.isDirectory()) continue;
+                    String name = new File(e.getName()).getName();                 /* top level only: no paths out of the folder */
+                    if (name.isEmpty() || name.startsWith(".")) continue;
+                    try (OutputStream out = new FileOutputStream(new File(tmp, name))) {
+                        int n;
+                        while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
+                    }
+                }
+                JSONObject m = new JSONObject(readText(new File(tmp, "meta.json"), 1 << 16));
+                String lib = new File(m.getString("libraryName")).getName();
+                if (!new File(tmp, lib).isFile()) throw new IOException("the package has no " + lib);
+                if (!isAndroidElf(new File(tmp, lib))) throw new IOException(lib + " is not a 64-bit ARM library");
+                deleteTree(driverDir());
+                if (!tmp.renameTo(driverDir())) throw new IOException("cannot rename " + tmp);
+                msg = "driver installed";
+            } catch (Exception ex) {
+                deleteTree(tmp);
+                msg = "not an AdrenoTools driver package (meta.json + driver .so): " + ex.getMessage();
+            }
+            final String m = msg;
+            ui.post(() -> driverChanged(m));
         }).start();
     }
 
@@ -162,7 +258,27 @@ public class LauncherActivity extends Activity {
 
     private void save() {
         getSharedPreferences(PREFS, MODE_PRIVATE).edit().putString("folder", folder.getText().toString().trim())
-                .putString("env", extraEnv.getText().toString()).putBoolean("touch", touch.isChecked()).apply();
+                .putString("env", extraEnv.getText().toString()).putInt("touch_mode", touch.getSelectedItemPosition())
+                .putInt("resolution", resolution.getSelectedItemPosition()).apply();
+    }
+
+    private Spinner spinner(String[] items, int sel) {
+        Spinner sp = new Spinner(this);
+        ArrayAdapter<String> a = new ArrayAdapter<>(this, android.R.layout.simple_spinner_item, items);
+        a.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
+        sp.setAdapter(a);
+        sp.setSelection(sel >= 0 && sel < items.length ? sel : 0);
+        return sp;
+    }
+    /** A game controller (not the phone's own buttons) is connected now; its name, or null. */
+    static String controllerName() {
+        for (int id : InputDevice.getDeviceIds()) {
+            InputDevice d = InputDevice.getDevice(id);
+            if (d == null || d.isVirtual()) continue;
+            int s = d.getSources();
+            if ((s & InputDevice.SOURCE_GAMEPAD) == InputDevice.SOURCE_GAMEPAD || (s & InputDevice.SOURCE_JOYSTICK) == InputDevice.SOURCE_JOYSTICK) return d.getName();
+        }
+        return null;
     }
 
     private int dp(int v) { return (int) (v * getResources().getDisplayMetrics().density + 0.5f); }
@@ -181,7 +297,9 @@ public class LauncherActivity extends Activity {
     @Override
     protected void onActivityResult(int req, int res, Intent data) {
         super.onActivityResult(req, res, data);
-        if (req != REQ_TREE || res != RESULT_OK || data == null || data.getData() == null) return;
+        if (res != RESULT_OK || data == null || data.getData() == null) return;
+        if (req == REQ_DRIVER) { installDriver(data.getData()); return; }
+        if (req != REQ_TREE) return;
         String id = DocumentsContract.getTreeDocumentId(data.getData());       /* "primary:OpenSmash" or "1234-ABCD:Games/OpenSmash" */
         int colon = id.indexOf(':');
         String vol = colon >= 0 ? id.substring(0, colon) : id, rel = colon >= 0 ? id.substring(colon + 1) : "";
@@ -319,6 +437,10 @@ public class LauncherActivity extends Activity {
             return;
         }
         ArrayList<String> env = new ArrayList<>();
+        File driver = driverLib();
+        if (driver != null) env.add("SSBU_VK_DRIVER=" + driver.getAbsolutePath());     /* first: an extra setting can override it */
+        String scale = RES_SCALE[resolution.getSelectedItemPosition()];
+        if (scale != null) env.add("SSBU_VK_SCALE=" + scale);                       /* before the extra settings: one of them can override it */
         for (String l : extraEnv.getText().toString().split("\n")) { l = l.trim(); if (l.contains("=") && !l.startsWith("#")) env.add(l); }
         env.add("SSBU_LOCALE=" + Locale.getDefault().toLanguageTag());
         env.add("SSBU_REGION=" + Locale.getDefault().getCountry());
@@ -326,7 +448,12 @@ public class LauncherActivity extends Activity {
         Intent i = new Intent(this, GameActivity.class);
         i.putExtra("game", game().getAbsolutePath());
         i.putExtra("libdir", libDir().getAbsolutePath());
-        i.putExtra("touch", touch.isChecked());
+        /* Auto: a connected controller is player 1, so the on-screen pad (which would take that slot) is left out */
+        String pad = controllerName();
+        int tm = touch.getSelectedItemPosition();
+        i.putExtra("touch", tm == 1 || (tm == 0 && pad == null));
+        i.putExtra("touch_mode", tm);
+        if (pad != null) status.setText("Controller: " + pad);
         i.putStringArrayListExtra("env", env);
         startActivity(i);
     }

@@ -8,6 +8,13 @@
 #endif
 #define COMPAT_NO_FILE_WRAPPERS
 #include "windows.h"
+/* build_native.sh force-includes android_port.h (so windows.h) before the first line, where COMPAT_NO_FILE_WRAPPERS is not
+ * defined yet: the wrappers implemented here must not wrap the C library calls they make (compat_fopen called itself) */
+#undef fopen
+#undef freopen
+#undef remove
+#undef rename
+#undef fread
 #include "psapi.h"
 #include "tlhelp32.h"
 #include "wincrypt.h"
@@ -61,11 +68,12 @@ static int futex_wait(volatile int32_t *addr, int32_t val, const struct timespec
 }
 static void futex_wake(volatile int32_t *addr, int n) { syscall(SYS_futex, addr, FUTEX_WAKE_PRIVATE, n, NULL, NULL, 0); }
 static int64_t mono_ns(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (int64_t)t.tv_sec * 1000000000LL + t.tv_nsec; }
+static void maps_changed(void);                 /* the cached /proc/self/maps table (maps_query) is out of date */
 static struct timespec ns_to_ts(int64_t ns) { if (ns < 0) ns = 0; struct timespec t = {(time_t)(ns / 1000000000LL), (long)(ns % 1000000000LL)}; return t; }
 
 /* ================================================================ memory */
 #define PAGE 4096ull
-typedef struct Alloc { uintptr_t base, size; DWORD prot0; uint8_t *page; struct Alloc *next; } Alloc;   /* page[i]: 0 reserved, else prot index */
+typedef struct Alloc { uintptr_t base, size; DWORD prot0; uint8_t *page; uint8_t *written; struct Alloc *next; } Alloc;   /* page[i]: 0 reserved, else prot index; written: MEM_WRITE_WATCH marks */
 static Alloc *g_allocs;
 static pthread_mutex_t g_alloc_mu = PTHREAD_MUTEX_INITIALIZER;
 static const DWORD k_prots[] = {0, PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE, PAGE_EXECUTE, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE};
@@ -91,6 +99,100 @@ static Alloc *alloc_find(uintptr_t a) {
     for (Alloc *x = g_allocs; x; x = x->next) if (a >= x->base && a < x->base + x->size) return x;
     return NULL;
 }
+/* the guest's fixed address range, reserved PROT_NONE by libguestreserve.so (android/runtime/guest_reserve.c, preloaded
+ * by wrap.sh): an allocation there maps over the reservation, a release gives the pages back to it. Under g_alloc_mu. */
+static int in_guest_reserve(uintptr_t a, uintptr_t end) {
+    static const uintptr_t *lo, *hi;
+    static int looked;
+    if (!looked) { lo = dlsym(RTLD_DEFAULT, "guest_reserve_lo"); hi = dlsym(RTLD_DEFAULT, "guest_reserve_hi"); looked = 1; }
+    return lo && hi && *lo && a >= *lo && end <= *hi;
+}
+static int overlaps_alloc(uintptr_t a, uintptr_t end) {
+    for (Alloc *x = g_allocs; x; x = x->next) if (a < x->base + x->size && end > x->base) return 1;
+    return 0;
+}
+/* ---------------------------------------------------------------- write watch (MEM_WRITE_WATCH, GetWriteWatch)
+ * As upstream's macOS build (runtime/plat_posix.c; Linux 6.7's asynchronous userfaultfd protection is newer than these
+ * phones' kernels): a watched page that has not been written since the last reset has no write right; the first write
+ * faults, compat_ww_fault (first thing in crash_handler) gives the right back and marks the page written; GetWriteWatch
+ * lists the marked pages and, with the reset flag, takes the right away again. nvn_gl.c then hashes only the textures
+ * whose pages were written (without it: every texture every frame). The kernel does not fault for its own writes (read,
+ * pread, getrandom: EFAULT), so those call compat_ww_prepare first. The fault path takes no lock: slots never move. */
+typedef struct { volatile uintptr_t lo, hi; Alloc *volatile x; } WwSlot;
+static WwSlot g_ww[64];
+static volatile int g_nww;
+static volatile LONG64 g_ww_faults;
+static void install_signals(void);
+static Alloc *ww_alloc(uintptr_t a) {
+    int n = __atomic_load_n(&g_nww, __ATOMIC_ACQUIRE);
+    for (int i = 0; i < n; i++) {
+        uintptr_t lo = __atomic_load_n(&g_ww[i].lo, __ATOMIC_ACQUIRE), hi = __atomic_load_n(&g_ww[i].hi, __ATOMIC_ACQUIRE);
+        if (a >= lo && a < hi) return g_ww[i].x;
+    }
+    return NULL;
+}
+static int page_rights(const Alloc *x, size_t i) { uint8_t s = __atomic_load_n(&x->page[i], __ATOMIC_ACQUIRE); return s ? posix_prot(k_prots[s]) : PROT_NONE; }
+/* a write fault on a watched page that may be written: the right back, the page marked. 1 = handled (run it again). */
+int compat_ww_fault(void *addr) {
+    uintptr_t a = (uintptr_t)addr;
+    Alloc *x = ww_alloc(a);
+    if (!x) return 0;
+    size_t i = (a - x->base) / PAGE;
+    int r = page_rights(x, i);
+    if (!(r & PROT_WRITE) || mprotect((void *)(a & ~(PAGE - 1)), PAGE, r)) return 0;
+    __atomic_store_n(&x->written[i], 1, __ATOMIC_SEQ_CST);
+    __atomic_fetch_add(&g_ww_faults, 1, __ATOMIC_RELAXED);
+    return 1;
+}
+/* before the kernel writes into [p, p+n): the watched pages in it get their right back (and are marked) */
+void compat_ww_prepare(void *p, size_t n) {
+    if (!n || !__atomic_load_n(&g_nww, __ATOMIC_ACQUIRE)) return;
+    for (uintptr_t a = (uintptr_t)p & ~(PAGE - 1), e = (uintptr_t)p + n; a < e; a += PAGE) {
+        Alloc *x = ww_alloc(a);
+        if (x && !__atomic_load_n(&x->written[(a - x->base) / PAGE], __ATOMIC_ACQUIRE)) compat_ww_fault((void *)a);
+    }
+}
+static void ww_add(Alloc *x) {                        /* g_alloc_mu held */
+    if (getenv("SSBU_NO_WRITEWATCH")) return;
+    int slot = -1;
+    for (int i = 0; i < g_nww; i++) if (!g_ww[i].hi) { slot = i; break; }
+    if (slot < 0) { if (g_nww == 64) return; slot = g_nww; }
+    if (!(x->written = calloc(x->size / PAGE, 1))) return;
+    install_signals();
+    g_ww[slot].x = x;
+    __atomic_store_n(&g_ww[slot].lo, x->base, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_ww[slot].hi, x->base + x->size, __ATOMIC_RELEASE);
+    if (slot == g_nww) __atomic_store_n(&g_nww, g_nww + 1, __ATOMIC_RELEASE);
+}
+static void ww_drop(Alloc *x) {                       /* g_alloc_mu held; the marks stay allocated (a late fault reads them) */
+    for (int i = 0; i < g_nww; i++) if (g_ww[i].x == x) { __atomic_store_n(&g_ww[i].hi, 0, __ATOMIC_RELEASE); break; }
+}
+/* the rights of [a, e) of a watched allocation as page[] says, without the write right where a page is not marked */
+static void ww_apply(Alloc *x, uintptr_t a, uintptr_t e) {
+    for (uintptr_t p = a; p < e; ) {
+        size_t i = (p - x->base) / PAGE;
+        int r = page_rights(x, i), w = __atomic_load_n(&x->written[i], __ATOMIC_ACQUIRE);
+        uintptr_t q = p + PAGE;
+        while (q < e && page_rights(x, (q - x->base) / PAGE) == r && __atomic_load_n(&x->written[(q - x->base) / PAGE], __ATOMIC_ACQUIRE) == w) q += PAGE;
+        mprotect((void *)p, q - p, w ? r : r & ~PROT_WRITE);
+        p = q;
+    }
+}
+/* the marks of [a, e) cleared, the pages that had them armed again (protect, clear, protect: a write racing the first
+ * mprotect either sets its mark after the clear or is caught by the second one) */
+static void ww_reset(Alloc *x, uintptr_t a, uintptr_t e) {
+    for (uintptr_t p = a; p < e; ) {
+        size_t i = (p - x->base) / PAGE;
+        if (!__atomic_load_n(&x->written[i], __ATOMIC_ACQUIRE)) { p += PAGE; continue; }
+        uintptr_t q = p + PAGE;
+        int r = page_rights(x, i);
+        while (q < e && __atomic_load_n(&x->written[(q - x->base) / PAGE], __ATOMIC_ACQUIRE) && page_rights(x, (q - x->base) / PAGE) == r) q += PAGE;
+        if (r & PROT_WRITE) mprotect((void *)p, q - p, r & ~PROT_WRITE);
+        for (uintptr_t k = p; k < q; k += PAGE) __atomic_store_n(&x->written[(k - x->base) / PAGE], 0, __ATOMIC_SEQ_CST);
+        if (r & PROT_WRITE) mprotect((void *)p, q - p, r & ~PROT_WRITE);
+        p = q;
+    }
+}
 LPVOID VirtualAlloc(LPVOID addr, SIZE_T size, DWORD type, DWORD prot) {
     if (!size) { t_last_error = ERROR_INVALID_PARAMETER; return NULL; }
     uintptr_t a = (uintptr_t)addr & ~(PAGE - 1);
@@ -99,7 +201,9 @@ LPVOID VirtualAlloc(LPVOID addr, SIZE_T size, DWORD type, DWORD prot) {
     Alloc *x = a ? alloc_find(a) : NULL;
     if (x && (type & MEM_COMMIT)) {                         /* commit inside an existing reservation */
         if (end > x->base + x->size) { pthread_mutex_unlock(&g_alloc_mu); t_last_error = ERROR_INVALID_PARAMETER; return NULL; }
-        if (mprotect((void *)a, end - a, posix_prot(prot))) { set_errno_error(); pthread_mutex_unlock(&g_alloc_mu); return NULL; }
+        int cp = posix_prot(prot);
+        if (x->written) { memset(x->written + (a - x->base) / PAGE, 0, (end - a) / PAGE); cp &= ~PROT_WRITE; }    /* watched: armed */
+        if (mprotect((void *)a, end - a, cp)) { set_errno_error(); pthread_mutex_unlock(&g_alloc_mu); return NULL; }
         memset(x->page + (a - x->base) / PAGE, prot_index(prot), (end - a) / PAGE);
         pthread_mutex_unlock(&g_alloc_mu);
         return (void *)a;
@@ -109,7 +213,10 @@ LPVOID VirtualAlloc(LPVOID addr, SIZE_T size, DWORD type, DWORD prot) {
     if (!a) end = (size + 0xffff) & ~(uintptr_t)0xffff, a = 0;
     size_t len = a ? end - a : end;
     int pp = (type & MEM_COMMIT) ? posix_prot(prot) : PROT_NONE;
-    int flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | (a ? MAP_FIXED_NOREPLACE : 0);
+    if (type & MEM_WRITE_WATCH) pp &= ~PROT_WRITE;           /* armed from the start (ww_add) */
+    int guest = a && in_guest_reserve(a, a + len);
+    if (guest && overlaps_alloc(a, a + len)) { pthread_mutex_unlock(&g_alloc_mu); t_last_error = ERROR_INVALID_ADDRESS; return NULL; }
+    int flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | (guest ? MAP_FIXED : a ? MAP_FIXED_NOREPLACE : 0);
     void *m = mmap((void *)a, len, pp, flags, -1, 0);
     if (m == MAP_FAILED || (a && (uintptr_t)m != a)) {
         if (m != MAP_FAILED) munmap(m, len);                /* an old kernel took the address as a hint */
@@ -121,6 +228,7 @@ LPVOID VirtualAlloc(LPVOID addr, SIZE_T size, DWORD type, DWORD prot) {
     x->base = (uintptr_t)m; x->size = len; x->prot0 = prot;
     x->page = malloc(len / PAGE);
     memset(x->page, (type & MEM_COMMIT) ? prot_index(prot) : 0, len / PAGE);
+    if (type & MEM_WRITE_WATCH) { ww_add(x); if (!x->written && pp != ((type & MEM_COMMIT) ? posix_prot(prot) : PROT_NONE)) mprotect(m, len, posix_prot(prot)); }
     x->next = g_allocs; g_allocs = x;
     pthread_mutex_unlock(&g_alloc_mu);
     return m;
@@ -133,36 +241,87 @@ BOOL VirtualFree(LPVOID addr, SIZE_T size, DWORD type) {
     if (!x) { pthread_mutex_unlock(&g_alloc_mu); t_last_error = ERROR_INVALID_PARAMETER; return FALSE; }
     if (type & MEM_RELEASE) {
         *pp = x->next;
-        munmap((void *)x->base, x->size);
-        free(x->page); free(x);
+        maps_changed();
+        if (x->written) ww_drop(x);
+        if (in_guest_reserve(x->base, x->base + x->size))
+            mmap((void *)x->base, x->size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED, -1, 0);
+        else
+            munmap((void *)x->base, x->size);
+        if (!x->written) { free(x->page); free(x); }      /* a watched one stays (ww_drop: a late fault reads it) */
     } else if (type & MEM_DECOMMIT) {
+        maps_changed();
         uintptr_t s = a & ~(PAGE - 1), e = size ? ((a + size + PAGE - 1) & ~(PAGE - 1)) : x->base + x->size;
         if (e > x->base + x->size) e = x->base + x->size;
         mmap((void *)s, e - s, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED, -1, 0);   /* drops the pages */
         memset(x->page + (s - x->base) / PAGE, 0, (e - s) / PAGE);
+        if (x->written) memset(x->written + (s - x->base) / PAGE, 0, (e - s) / PAGE);
     }
     pthread_mutex_unlock(&g_alloc_mu);
     return TRUE;
 }
-/* a mapping outside our allocations: /proc/self/maps */
-static int maps_query(uintptr_t a, uintptr_t *lo, uintptr_t *hi, int *prot, uintptr_t *next_lo) {
-    FILE *f = fopen("/proc/self/maps", "r");
-    if (!f) return 0;
-    char line[512];
-    int found = 0;
-    *next_lo = 0;
-    while (fgets(line, sizeof line, f)) {
-        unsigned long s, e; char perm[8];
-        if (sscanf(line, "%lx-%lx %7s", &s, &e, perm) != 3) continue;
-        if (a >= s && a < e) {
-            *lo = s; *hi = e; *prot = (perm[0] == 'r' ? PROT_READ : 0) | (perm[1] == 'w' ? PROT_WRITE : 0) | (perm[2] == 'x' ? PROT_EXEC : 0);
-            found = 1; break;
-        }
-        if (s > a) { *next_lo = s; break; }
+/* a mapping outside our allocations: /proc/self/maps, parsed into a table that is kept for 20 ms. Reading and parsing the
+ * text (thousands of lines: the module libraries, the driver) on every query was 17% of the game's CPU time in a fight
+ * (simpleperf, 2026-10-21): the guest-pointer checks ask about the game image and the libraries all the time. An address
+ * in no mapping reads the text again (a mapping made since); our own unmapping and protection changes drop the table. */
+typedef struct { uintptr_t lo, hi; int prot; } MapEnt;
+static MapEnt *g_maps;
+static int g_nmaps, g_maps_cap, g_maps_seen = -1;
+static uint64_t g_maps_at;
+static atomic_int g_maps_gen;
+static pthread_mutex_t g_maps_mu = PTHREAD_MUTEX_INITIALIZER;
+static void maps_changed(void) { atomic_fetch_add(&g_maps_gen, 1); }
+static uintptr_t maps_hex(const char **p) {
+    uintptr_t v = 0;
+    for (;; (*p)++) {
+        char c = **p;
+        int d = c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : -1;
+        if (d < 0) return v;
+        v = v << 4 | (uintptr_t)d;
     }
-    fclose(f);
+}
+static void maps_load(void) {                      /* under g_maps_mu */
+    static char buf[1 << 16];
+    g_nmaps = 0;
+    int fd = open("/proc/self/maps", O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return;
+    size_t have = 0;
+    ssize_t r;
+    while ((r = read(fd, buf + have, sizeof buf - have)) > 0) {
+        have += (size_t)r;
+        char *s = buf, *end = buf + have, *nl;
+        while ((nl = memchr(s, '\n', (size_t)(end - s)))) {
+            const char *p = s;
+            uintptr_t lo = maps_hex(&p), hi;
+            if (*p++ == '-' && (hi = maps_hex(&p)) > lo && *p++ == ' ' && nl - p >= 3) {
+                if (g_nmaps == g_maps_cap) { g_maps_cap = g_maps_cap ? g_maps_cap * 2 : 4096; g_maps = realloc(g_maps, (size_t)g_maps_cap * sizeof *g_maps); }
+                g_maps[g_nmaps++] = (MapEnt){lo, hi, (p[0] == 'r' ? PROT_READ : 0) | (p[1] == 'w' ? PROT_WRITE : 0) | (p[2] == 'x' ? PROT_EXEC : 0)};
+            }
+            s = nl + 1;
+        }
+        have = (size_t)(end - s);
+        memmove(buf, s, have);
+        if (have == sizeof buf) have = 0;           /* a line longer than the buffer: dropped */
+    }
+    close(fd);
+}
+static int maps_query_ex(uintptr_t a, uintptr_t *lo, uintptr_t *hi, int *prot, uintptr_t *next_lo, int fresh) {
+    pthread_mutex_lock(&g_maps_mu);
+    uint64_t now = (uint64_t)mono_ns();
+    int gen = atomic_load(&g_maps_gen), loaded = 0, found = 0;
+    if (fresh || g_maps_seen != gen || now - g_maps_at > 20000000ull) { maps_load(); g_maps_at = now; g_maps_seen = gen; loaded = 1; }
+    for (;;) {
+        int l = 0, h = g_nmaps;                     /* the first mapping that ends above a (the table is in address order) */
+        while (l < h) { int m = (l + h) / 2; if (g_maps[m].hi <= a) l = m + 1; else h = m; }
+        *next_lo = 0;
+        if (l < g_nmaps && g_maps[l].lo <= a) { *lo = g_maps[l].lo; *hi = g_maps[l].hi; *prot = g_maps[l].prot; found = 1; break; }
+        if (l < g_nmaps) *next_lo = g_maps[l].lo;
+        if (loaded) break;
+        maps_load(); g_maps_at = now; g_maps_seen = gen; loaded = 1;
+    }
+    pthread_mutex_unlock(&g_maps_mu);
     return found;
 }
+static int maps_query(uintptr_t a, uintptr_t *lo, uintptr_t *hi, int *prot, uintptr_t *next_lo) { return maps_query_ex(a, lo, hi, prot, next_lo, 0); }
 static DWORD win_prot(int p) {
     if (p & PROT_EXEC) return (p & PROT_WRITE) ? PAGE_EXECUTE_READWRITE : (p & PROT_READ) ? PAGE_EXECUTE_READ : PAGE_EXECUTE;
     if (p & PROT_WRITE) return PAGE_READWRITE;
@@ -203,16 +362,39 @@ BOOL VirtualProtect(LPVOID addr, SIZE_T size, DWORD prot, PDWORD old) {
     Alloc *x = alloc_find(a);
     if (old) *old = x ? k_prots[x->page[(a - x->base) / PAGE]] : PAGE_READWRITE;
     int r = mprotect((void *)a, e - a, posix_prot(prot));
+    if (!x) maps_changed();
     if (!r && x) {
         uintptr_t ee = e > x->base + x->size ? x->base + x->size : e;
         memset(x->page + (a - x->base) / PAGE, prot_index(prot), (ee - a) / PAGE);
+        if (x->written) ww_apply(x, a, ee);          /* watched: the pages not written keep no write right */
     }
     pthread_mutex_unlock(&g_alloc_mu);
     if (r) { set_errno_error(); return FALSE; }
     return TRUE;
 }
-UINT GetWriteWatch(DWORD flags, PVOID base, SIZE_T size, PVOID *addrs, ULONG_PTR *count, ULONG *gran) { (void)flags; (void)base; (void)size; (void)addrs; if (count) *count = 0; if (gran) *gran = 4096; return 1; }
-UINT ResetWriteWatch(LPVOID base, SIZE_T size) { (void)base; (void)size; return 1; }
+UINT GetWriteWatch(DWORD flags, PVOID base, SIZE_T size, PVOID *addrs, ULONG_PTR *count, ULONG *gran) {
+    uintptr_t lo = (uintptr_t)base & ~(PAGE - 1), hi = ((uintptr_t)base + size + PAGE - 1) & ~(PAGE - 1);
+    pthread_mutex_lock(&g_alloc_mu);
+    Alloc *x = alloc_find(lo);
+    if (!x || !x->written || !size || hi > x->base + x->size || !count) { pthread_mutex_unlock(&g_alloc_mu); t_last_error = ERROR_INVALID_PARAMETER; return 1; }
+    ULONG_PTR max = *count, got = 0;
+    uintptr_t p = lo;
+    for (; p < hi && got < max; p += PAGE) if (__atomic_load_n(&x->written[(p - x->base) / PAGE], __ATOMIC_ACQUIRE)) addrs[got++] = (PVOID)p;
+    if (flags & WRITE_WATCH_FLAG_RESET) ww_reset(x, lo, p);     /* the pages looked at */
+    pthread_mutex_unlock(&g_alloc_mu);
+    if (gran) *gran = (ULONG)PAGE;
+    *count = got;
+    return 0;
+}
+UINT ResetWriteWatch(LPVOID base, SIZE_T size) {
+    uintptr_t lo = (uintptr_t)base & ~(PAGE - 1), hi = ((uintptr_t)base + size + PAGE - 1) & ~(PAGE - 1);
+    pthread_mutex_lock(&g_alloc_mu);
+    Alloc *x = alloc_find(lo);
+    if (!x || !x->written || hi > x->base + x->size) { pthread_mutex_unlock(&g_alloc_mu); t_last_error = ERROR_INVALID_PARAMETER; return 1; }
+    ww_reset(x, lo, hi);
+    pthread_mutex_unlock(&g_alloc_mu);
+    return 0;
+}
 BOOL FlushInstructionCache(HANDLE p, LPCVOID base, SIZE_T n) { (void)p; if (base) __builtin___clear_cache((char *)base, (char *)base + n); return TRUE; }
 void *compat_aligned_malloc(size_t size, size_t align) {
     void *p = NULL;
@@ -796,6 +978,7 @@ void DeleteFiber(LPVOID p) {
     if (!f) return;
     if (f == t_fiber) ExitThread(0);
     if (f->stack) munmap(f->stack, f->stack_size);
+    maps_changed();
     if (!f->is_thread) free(f);
 }
 void SwitchToFiber(LPVOID p) {
@@ -887,6 +1070,7 @@ const char *compat_path(const char *in, char *dst, size_t n) {
 FILE *compat_fopen(const char *path, const char *mode) { PATHBUF; return fopen(P(path), mode); }
 FILE *compat_freopen(const char *path, const char *mode, FILE *f) { PATHBUF; return freopen(path ? P(path) : NULL, mode, f); }
 int compat_remove(const char *path) { PATHBUF; return remove(P(path)); }
+size_t compat_fread(void *p, size_t size, size_t n, FILE *f) { compat_ww_prepare(p, size * n); return fread(p, size, n, f); }
 int compat_rename(const char *a, const char *b) { char x[MAX_PATH * 4], y[MAX_PATH * 4]; return rename(compat_path(a, x, sizeof x), compat_path(b, y, sizeof y)); }
 int compat_stat(const char *path, struct stat *st) { PATHBUF; return stat(P(path), st); }
 int compat_access(const char *p, int m) { PATHBUF; return access(P(p), m == 6 ? R_OK | W_OK : m == 2 ? W_OK : m == 4 ? R_OK : F_OK); }
@@ -955,6 +1139,7 @@ BOOL ReadFile(HANDLE h, LPVOID buf, DWORD n, LPDWORD got, LPOVERLAPPED ov) {
     int fd = fd_of(h);
     if (fd < 0) { t_last_error = ERROR_INVALID_HANDLE; return FALSE; }
     ssize_t r;
+    compat_ww_prepare(buf, n);                         /* the kernel does not fault on a watched page */
     if (ov) r = pread(fd, buf, n, (off_t)(((uint64_t)ov->OffsetHigh << 32) | ov->Offset));
     else { size_t done = 0; r = 0; while (done < n) { r = read(fd, (char *)buf + done, n - done); if (r <= 0) break; done += (size_t)r; } if (r >= 0) r = (ssize_t)done; }
     if (r < 0) { set_errno_error(); if (got) *got = 0; return FALSE; }
@@ -1170,7 +1355,8 @@ LPVOID MapViewOfFileEx(HANDLE m, DWORD access, DWORD hi, DWORD lo, SIZE_T n, LPV
 LPVOID MapViewOfFile(HANDLE m, DWORD access, DWORD hi, DWORD lo, SIZE_T n) { return MapViewOfFileEx(m, access, hi, lo, n, NULL); }
 BOOL UnmapViewOfFile(LPCVOID p) {
     uintptr_t lo, hi, next; int prot;
-    if (!maps_query((uintptr_t)p, &lo, &hi, &prot, &next)) return FALSE;
+    if (!maps_query_ex((uintptr_t)p, &lo, &hi, &prot, &next, 1)) return FALSE;
+    maps_changed();
     return munmap((void *)p, hi - (uintptr_t)p) == 0;
 }
 /* shlwapi */
@@ -1242,6 +1428,7 @@ HMODULE LoadLibraryExA(LPCSTR name, HANDLE f, DWORD flags) {
         {"opus.dll", "libopus.so"}, {"libopus-0.dll", "libopus.so"},
     };
     for (unsigned i = 0; i < sizeof sys / sizeof sys[0]; i++) if (!strcasecmp(base, sys[i][0])) snprintf(path, sizeof path, "%s", sys[i][1]);
+    if (!strcasecmp(base, "bcrypt.dll")) return (HMODULE)self_base();     /* its SHA-256 is in this library (compat_hash.c) */
     static const char *const absent[] = {"gdi32.dll", "user32.dll", "kernel32.dll", "ntdll.dll", "dbghelp.dll", "opengl32.dll", "dwmapi.dll", "winmm.dll", "shcore.dll"};
     for (unsigned i = 0; i < sizeof absent / sizeof absent[0]; i++) if (!strcasecmp(base, absent[i])) { t_last_error = ERROR_FILE_NOT_FOUND; return NULL; }
     void *h = dlopen(path, RTLD_NOW | RTLD_GLOBAL);
@@ -1624,6 +1811,7 @@ BOOL AttachConsole(DWORD pid) { (void)pid; return FALSE; }
 HWND GetConsoleWindow(void) { return NULL; }
 BOOLEAN SystemFunction036(PVOID buf, ULONG n) {
     uint8_t *p = buf;
+    compat_ww_prepare(p, n);
     while (n) { ssize_t r = getrandom(p, n, 0); if (r <= 0) { if (errno == EINTR) continue; return FALSE; } p += r; n -= (ULONG)r; }
     return TRUE;
 }
@@ -1742,9 +1930,11 @@ static void ctx_from_uc(PCONTEXT c, const ucontext_t *uc) {
     c->Rsi = m->regs[4]; c->Rdi = m->regs[5]; c->R8 = m->regs[8]; c->R9 = m->regs[9];
     c->R10 = m->regs[10]; c->R11 = m->regs[11]; c->R12 = m->regs[19]; c->R13 = m->regs[20]; c->R14 = m->regs[21]; c->R15 = m->regs[30];
 }
+static int g_native_crashes;
 static void crash_handler(int sig, siginfo_t *si, void *ucv) {
     ucontext_t *uc = ucv;
-    if (!t_in_handler) {
+    if ((sig == SIGSEGV || sig == SIGBUS) && compat_ww_fault(si->si_addr)) return;      /* a watched page's first write */
+    if (!t_in_handler && !g_native_crashes) {
         t_in_handler = 1;
         EXCEPTION_RECORD er = {0}; CONTEXT cx; EXCEPTION_POINTERS ep = {&er, &cx};
         ctx_from_uc(&cx, uc);
@@ -1772,6 +1962,7 @@ static void install_signals(void) {
     static int done;
     if (done) return;
     done = 1;
+    g_native_crashes = getenv("SSBU_NATIVE_CRASHES") != NULL;    /* debugging: crashes go to debuggerd (a tombstone with every thread's stack); the write watch still runs */
     altstack_setup();
     struct sigaction sa = {0};
     sa.sa_sigaction = crash_handler;
@@ -1965,4 +2156,40 @@ size_t android_writable_segments(uint8_t *base, void (*add)(uint8_t *, uint8_t *
     WSeg w = {(uintptr_t)base, add, 0};
     dl_iterate_phdr(wseg_cb, &w);
     return w.bytes;
+}
+
+/* ================================================================ upstream plat_ helpers (runtime/plat/windows.h) */
+#include <unwind.h>
+typedef struct { uintptr_t *pcs; int n, max; } BtState;
+static _Unwind_Reason_Code bt_step(struct _Unwind_Context *ctx, void *arg) {
+    BtState *s = arg;
+    uintptr_t pc = (uintptr_t)_Unwind_GetIP(ctx);
+    if (pc && s->n < s->max) s->pcs[s->n++] = pc;
+    return s->n < s->max ? _URC_NO_REASON : _URC_END_OF_STACK;
+}
+int plat_backtrace(uintptr_t *pcs, int max) {
+    BtState s = {pcs, 0, max};
+    if (max > 0) _Unwind_Backtrace(bt_step, &s);
+    return s.n;
+}
+/* the game libraries are ELF objects without a PE time stamp: their names and sizes in the app's private copy */
+void plat_print_build_identity(const char *exe, size_t dir_len) {
+    (void)exe; (void)dir_len;
+    const char *dir = getenv("SSBU_LIBDIR");
+    char path[MAX_PATH * 2];
+    struct stat st;
+    snprintf(path, sizeof path, "%s/ssbu_game_eh_o1.dll", dir ? dir : ".");
+    if (!stat(path, &st)) printf("build: %-22s %lld bytes, modified %lld\n", "ssbu_game_eh_o1.dll", (long long)st.st_size, (long long)st.st_mtime);
+}
+/* the stack this thread runs on now: the running fiber's (CreateFiber), else the thread's own */
+int plat_current_stack(uintptr_t *lo, uintptr_t *hi) {
+    Fiber *f = t_fiber;
+    if (f && !f->is_thread && f->stack) { *lo = (uintptr_t)f->stack; *hi = (uintptr_t)f->stack + f->stack_size; return 1; }
+    pthread_attr_t a;
+    void *base = NULL; size_t size = 0;
+    if (pthread_getattr_np(pthread_self(), &a)) return 0;
+    int ok = !pthread_attr_getstack(&a, &base, &size);
+    pthread_attr_destroy(&a);
+    if (ok) { *lo = (uintptr_t)base; *hi = (uintptr_t)base + size; }
+    return ok;
 }

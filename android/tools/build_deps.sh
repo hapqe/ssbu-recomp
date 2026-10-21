@@ -1,8 +1,11 @@
 #!/bin/bash
 # Builds the third-party libraries of the Android port for arm64-v8a with the NDK and CMake:
-#   SDL3 (libSDL3.so + its Java sources), glslang (static, for libssbu_glslang.so), libopus (libopus.so).
-# Usage: android/tools/build_deps.sh <folder with SDL3-3.4.18, glslang-16.6.0, opus-1.5.2>
-# Output: android/build/deps/{sdl3,glslang,opus}/install
+#   SDL3 (libSDL3.so + its Java sources), glslang (static, for libssbu_glslang.so), libopus (libopus.so),
+#   libadrenotools (libadrenotools.so + its hook libraries: a custom Vulkan driver such as Turnip, android/runtime/vk_driver.c).
+# Usage: android/tools/build_deps.sh <folder with SDL3-3.4.18, glslang-16.6.0, opus-1.5.2, libadrenotools-8fae8ce>
+#   (libadrenotools-8fae8ce: git clone --recursive https://github.com/bylaws/libadrenotools at commit 8fae8ce, with its
+#   submodule lib/linkernsbypass)
+# Output: android/build/deps/{sdl3,glslang,opus,adrenotools}/install
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 SRC="$(cd "${1:-$ROOT/../ssbu-recomp-deps}" && pwd)"
@@ -39,5 +42,12 @@ if [ ! -f "$OUT/opus/install/lib/libopus.so" ]; then
       -DBUILD_SHARED_LIBS=ON -DOPUS_BUILD_TESTING=OFF -DOPUS_BUILD_PROGRAMS=OFF > "$OUT/opus.log"
   "$CMAKE" --build "$OUT/opus/build" >> "$OUT/opus.log"
   "$CMAKE" --install "$OUT/opus/build" >> "$OUT/opus.log"
+fi
+if [ ! -f "$OUT/adrenotools/install/lib/libadrenotools.so" ]; then
+  echo "== libadrenotools"
+  "$CMAKE" "${GEN[@]}" -S "$SRC/libadrenotools-8fae8ce" -B "$OUT/adrenotools/build" "${common[@]}" -DCMAKE_INSTALL_PREFIX="$OUT/adrenotools/install" \
+      -DBUILD_SHARED_LIBS=ON -DGEN_INSTALL_TARGET=ON -DCMAKE_SHARED_LINKER_FLAGS="-Wl,-z,max-page-size=16384" > "$OUT/adrenotools.log"
+  "$CMAKE" --build "$OUT/adrenotools/build" >> "$OUT/adrenotools.log"
+  "$CMAKE" --install "$OUT/adrenotools/build" >> "$OUT/adrenotools.log"
 fi
 echo "== deps ready in $OUT"

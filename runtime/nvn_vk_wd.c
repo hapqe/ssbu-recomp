@@ -138,7 +138,7 @@ static void wd_owner(const char *name, CRITICAL_SECTION *cs) {
 #ifdef _WIN32
     DWORD o = (DWORD)(uintptr_t)cs->OwningThread;
     if (o) wdp("  lock %s: OWNED by thread %lu (%s), recursion %ld, lock count %ld\n", name, (unsigned long)o, wd_tname(o, tb, sizeof tb), (long)cs->RecursionCount, (long)cs->LockCount);
-#elif defined(__APPLE__)
+#elif defined(__APPLE__) || defined(SSBU_ANDROID)
     DWORD o = 0;                                                           /* macOS: a pthread mutex does not show its owner */
     (void)cs; (void)tb;
     if (o) wdp("  lock %s: owned\n", name);

@@ -4,7 +4,7 @@
 #   2. android/tools/build_native.sh  libmain.so (the runtime), libssbu_glslang.so
 #   3. libdevcheck.so, the Java side (launcher, game activity, SDL3's Java glue), resources, signing
 # Needs: Android SDK (build-tools, platform 36), NDK 29, JDK 17, python3, and the sources of SDL3 3.4.18, glslang 16.6.0,
-# opus 1.5.2 and Vulkan-Headers 1.4.329 in DEPS (default: ../ssbu-recomp-deps beside the repository).
+# opus 1.5.2, Vulkan-Headers 1.4.329 and libadrenotools (commit 8fae8ce, android/tools/build_deps.sh) in DEPS (default: ../ssbu-recomp-deps beside the repository).
 # Output: android/build/OpenSmash.apk. Nothing of the game is in it.
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -23,10 +23,17 @@ case "$(uname -s)" in Darwin) HOST=darwin-x86_64 ;; Linux) HOST=linux-x86_64 ;; 
 
 tools/build_deps.sh "$DEPS"
 tools/build_native.sh
+echo "== libguestreserve.so, libnoaslr.so, wrap.sh"
+# the guest's fixed address range, reserved before anything else maps there (runtime/guest_reserve.c); wrap.sh preloads it
+"$NDK/toolchains/llvm/prebuilt/$HOST/bin/clang" --target=aarch64-linux-android30 -shared -fPIC -O2 runtime/guest_reserve.c \
+    -o build/lib/arm64-v8a/libguestreserve.so -llog -Wl,-z,max-page-size=16384 -Wl,-soname,libguestreserve.so
+"$NDK/toolchains/llvm/prebuilt/$HOST/bin/clang" --target=aarch64-linux-android30 -fPIE -pie -O2 runtime/noaslr.c \
+    -o build/lib/arm64-v8a/libnoaslr.so -Wl,-z,max-page-size=16384
 echo "== libdevcheck.so"
 VKH="$DEPS/Vulkan-Headers-1.4.329/include"
-"$NDK/toolchains/llvm/prebuilt/$HOST/bin/clang" --target=aarch64-linux-android30 -shared -fPIC -O2 -I "$VKH" runtime/devcheck.c \
-    -o build/lib/arm64-v8a/libdevcheck.so -ldl -Wl,-z,max-page-size=16384 -Wl,-soname,libdevcheck.so
+AT=build/deps/adrenotools/install
+"$NDK/toolchains/llvm/prebuilt/$HOST/bin/clang" --target=aarch64-linux-android30 -shared -fPIC -O2 -I "$VKH" -I "$AT/include" \
+    runtime/devcheck.c runtime/vk_driver.c -o build/lib/arm64-v8a/libdevcheck.so -L"$AT/lib" -ladrenotools -ldl -Wl,-z,max-page-size=16384 -Wl,-soname,libdevcheck.so
 
 rm -rf "$OUT"
 mkdir -p "$OUT/classes" "$OUT/dex" "$OUT/gen" "$OUT/src"
@@ -50,6 +57,7 @@ echo "== d8"
 (cd "$OUT/dex" && zip -q ../base.apk classes*.dex)
 mkdir -p "$OUT/lib/arm64-v8a"
 cp build/lib/arm64-v8a/*.so "$OUT/lib/arm64-v8a/"
+install -m 755 app/wrap.sh "$OUT/lib/arm64-v8a/wrap.sh"     # debuggable APK: the app starts through it (runtime/guest_reserve.c)
 (cd "$OUT" && zip -q -r base.apk lib)
 
 echo "== align + sign"

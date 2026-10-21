@@ -51,6 +51,15 @@ GAME_DATA_SOURCES = ['game_data.c', 'sdkdata.c', 'nro_registry.c', 'sdklift_gen.
 NOCRT = os.environ.get('RECOMP_NOCRT', '') not in ('', '0')
 NOCRT_DIR = os.path.join(HERE, 'nocrt')
 NOCRT_FLAGS = ['-nostdlibinc', '-isystem', NOCRT_DIR, '-DGAME_NOCRT'] if NOCRT else []
+# RECOMP_TARGET=android: the game libraries for arm64 Android (android/tools/build_game_android.py). RECOMP_CLANG is the NDK's
+# clang, the objects are ELF and every "DLL" is a shared object that android/compat's LoadLibraryA opens with dlopen. The
+# C library is bionic's (the same one libmain.so uses, so SDK_SETJMP's jmp_buf matches). -fdeclspec takes the sources'
+# __declspec(dllexport) (ignored on ELF: every symbol is exported); -ffp-contract=off because clang contracts a * b + c into
+# an FMA by default on aarch64, which the guest's separate fmul / fadd do not do; -fshort-wchar as libmain.so.
+ANDROID = os.environ.get('RECOMP_TARGET', '') == 'android'
+ANDROID_TARGET = '--target=aarch64-linux-android30'
+if ANDROID:
+    NOCRT_FLAGS = [ANDROID_TARGET, '-fPIC', '-fdeclspec', '-fshort-wchar', '-ffp-contract=off']
 LLD_LINK = os.path.join(os.path.dirname(CLANG), 'lld-link.exe')
 # A handful of files hold functions so large that clang -O1 needs more than an hour on them;
 # pass --opt=-O0 to compile whatever is still missing without optimization.
@@ -243,6 +252,12 @@ def link_dll(objs, dll, rsp, implib=True, fltused=False):
         objs = list(objs) + [nocrt_fltused(libdir)]
     with open(rsp, 'w') as f:
         f.write('\n'.join('"%s"' % o.replace('\\', '/') for o in objs))
+    if ANDROID:
+        # -Bsymbolic: each library binds its own symbols (every module defines nro_bind, r1_m1, ...; they are opened
+        # RTLD_GLOBAL, where the first definition loaded would otherwise win, unlike Windows' per-DLL imports)
+        return subprocess.run([CLANG, ANDROID_TARGET, '-shared', '-fuse-ld=lld', '-Wl,-Bsymbolic', '-Wl,-z,max-page-size=16384',
+                               '-Wl,-soname,' + os.path.basename(dll), '@' + rsp, '-lm', '-o', dll],
+                              capture_output=True, text=True, errors='replace')
     if TARGET_MACOS:          # a .dylib found through the exe's rpath; undefined names resolve at load, as on Linux
         return subprocess.run([CLANG, '-dynamiclib', '@' + rsp, '-o', dll] + PLAT_FLAGS + ['-lm', '-Wl,-install_name,@rpath/' + os.path.basename(dll), '-Wl,-undefined,dynamic_lookup'], capture_output=True, text=True, errors='replace')
     if TARGET_LINUX:          # a .so: -z now resolves everything at load, as a DLL is
@@ -291,7 +306,7 @@ def build_game_dll():
         return 1
     objs = sorted(os.path.join(OBJ, n) for n in os.listdir(OBJ) if n.endswith('.obj')) + data_objs
     newest = max(os.path.getmtime(o) for o in objs)
-    if os.path.exists(dll) and os.path.exists(lib) and os.path.getmtime(dll) >= newest:
+    if os.path.exists(dll) and (os.path.exists(lib) or ANDROID) and os.path.getmtime(dll) >= newest:      # (no import library on ELF)
         return 0
     t0 = time.time()
     r = link_dll(objs, dll, os.path.join(data_dir, 'link.rsp'))

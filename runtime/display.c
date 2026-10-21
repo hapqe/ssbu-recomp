@@ -207,6 +207,8 @@ static DWORD WINAPI vblank_thread(LPVOID arg) {
     InterlockedExchange(&g_vb_state, 1);
     AChoreographer_postFrameCallback64(cg, vblank_frame, NULL);
     for (;;) ALooper_pollOnce(-1, NULL, NULL, NULL);
+    return 0;
+}
 #elif !defined(_WIN32)
 /* Linux build: no vblank source yet (D3DKMT is Windows); vsync = auto / display then run on our own 60 Hz clock, as on a
  * Windows PC without one */
@@ -277,6 +279,11 @@ static void pace_options(void) {
     g_pace_want = e ? !_stricmp(e, "display") || !_stricmp(e, "auto") : opt == 4 || opt == 5;
     g_hold_on = h ? atoi(h) != 0 : opt != 1 && opt != 2;               /* fifo: the swapchain holds the presents itself; off: at once, by request */
     { int latency_mode(void); if (!h && latency_mode() >= 2) g_hold_on = 0; }      /* L1: latency = lowest: the frame goes to the window as soon as it is ready */
+#ifdef SSBU_ANDROID
+    /* Android: holding the present for its tick put every fight frame at 2 ticks (30 fps; the compositor adds its own
+     * frame of queueing); presented when ready, the Marble ran 46 fps with the GPU governor clocking higher (2026-10-21) */
+    if (!h) g_hold_on = 0;
+#endif
     if (p && atof(p) > 0.02 && atof(p) < 0.98) g_lock_phase = atof(p);
     printf("display: pacing: %s; a finished frame is presented %s%c", g_pace_want ? "locked to the display when its refresh rate is k x 60 Hz within 1.1 % (vsync = display / auto)" : "our own 60.000 Hz clock (vsync = clock)",
            g_hold_on ? "at the next tick (steady cadence)" : "as soon as it is ready", 10);
@@ -333,6 +340,10 @@ void display_fit(int sw, int sh, int dw, int dh, int out[4]) {      /* the large
  * full screen, so the window modes of the settings menu do nothing. Closing = the activity finishing (back gesture). */
 void *android_native_window(void);                     /* android_main.c: ANativeWindow * of the activity, waits until there is one */
 static int g_full = 1;
+/* U3: no loading animation on Android yet (the Windows one is loading_anim.c), as in the Linux build */
+static volatile LONG g_la_first = 1;
+static void la_stop(void) {}
+static void la_note(const char *note) { (void)note; }
 void display_set_window_mode(int mode) { (void)mode; }
 void display_set_client_size(int w, int h) { (void)w; (void)h; }
 int display_window_mode(void) { return 1; }

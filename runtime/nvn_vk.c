@@ -24,7 +24,12 @@
 #include <string.h>
 #include <windows.h>
 /* Session 2: the Khronos headers (reference\upstream\Vulkan-Headers\include, -I in build.py) replace our own vk_min.h subset. */
-#ifdef _WIN32
+#ifdef SSBU_ANDROID
+#define VK_USE_PLATFORM_ANDROID_KHR                       /* the surface is the activity's ANativeWindow (display.c) */
+#include <android/native_window.h>
+void *android_vulkan_open(void);                          /* android/runtime/vk_driver.c: the system's or the installed driver */
+void *android_vulkan_sym(void *lib, const char *name);
+#elif defined(_WIN32)
 #define VK_USE_PLATFORM_WIN32_KHR
 #endif
 #define VK_NO_PROTOTYPES
@@ -55,10 +60,19 @@ int display_wait_refresh(void);
 void display_before_present(void);
 
 /* ---------------------------------------------------------------- the loader's functions */
-#ifdef _WIN32
+#ifdef SSBU_ANDROID
+#define VK_SURFACE_EXT "VK_KHR_android_surface"
+#define VKF_SURFACE(X) X(VkResult, vkCreateAndroidSurfaceKHR, (VkInstance, const VkAndroidSurfaceCreateInfoKHR *, const VkAllocationCallbacks *, VkSurfaceKHR *))
+/* the swapchain keeps the identity transform while the display is turned, so Android answers every acquire and present
+ * with VK_SUBOPTIMAL_KHR; making the swapchain again for it (after waiting for the GPU) every frame halved the frame rate */
+#define VK_SUBOPT(r) 0
+#elif defined(_WIN32)
 #define VKF_SURFACE(X) X(VkResult, vkCreateWin32SurfaceKHR, (VkInstance, const VkWin32SurfaceCreateInfoKHR *, const VkAllocationCallbacks *, VkSurfaceKHR *))
 #else
 #define VKF_SURFACE(X)
+#endif
+#ifndef VK_SUBOPT
+#define VK_SUBOPT(r) ((r) == VK_SUBOPTIMAL_KHR)
 #endif
 #define VKF(X) \
     X(VkResult, vkEnumerateInstanceLayerProperties, (uint32_t *, VkLayerProperties *)) \
@@ -123,13 +137,16 @@ static struct {
     VkSurfaceFormatKHR format;
     VkPresentModeKHR mode;
     VkExtent2D extent;
-    VkImage images[16];
+    VkImage images[16];                                  /* what the frame is drawn into: the swapchain's images, or (Android, V.rot) landscape ones */
+    VkImage sc_images[16];                               /* the swapchain's own images */
+    int rot;                                             /* Android: the swapchain is the display's portrait shape, 1 = turned clockwise, 2 = anticlockwise */
     uint32_t image_count;
     VkCommandPool pool;
     VkCommandBuffer cmd;
     VkSemaphore acquired, rendered;
     VkFence fence;
     int fence_pending, alive, validate;
+    int surface_lost;                                    /* VK_ERROR_SURFACE_LOST_KHR seen: swapchain_create makes the surface again (Android) */
 } V;
 static volatile LONG64 g_vk_frames, g_vk_recreated, g_vk_skipped, g_vk_errors, g_vk_messages, g_vk_missing_calls;
 static int g_vk_missing_warn = -1;
@@ -193,22 +210,51 @@ static int has_name(const VkExtensionProperties *e, uint32_t n, const char *name
 /* ---------------------------------------------------------------- swapchain */
 static void wait_last_submit(void);
 static void menu_vk_views_drop(void);                  /* U1 (nvn_vk_menu.c): its views of the swapchain images */
+static void rot_drop(void);                            /* Android pre-rotation (nvn_vk_draw.c): the landscape images and their views */
 static int g_mu_shot_src;                               /* U1: the swapchain images can be read back (SSBU_MENU_TEST only) */
 static void swapchain_destroy(void) {
     if (!V.swapchain) return;
     wait_last_submit();                                  /* also resets the fence for the next submit */
     vkDeviceWaitIdle(V.device);
     menu_vk_views_drop();
+    rot_drop();
     vkDestroySwapchainKHR(V.device, V.swapchain, NULL);
     V.swapchain = NULL; V.image_count = 0;
 }
-/* Returns 0 when there is nothing to present to (a minimised window has a zero-sized surface). */
+#ifdef SSBU_ANDROID
+void *android_native_window(void);                      /* android_main.c */
+/* Android destroys the activity's surface and makes it again behind the same ANativeWindow (the activity went to the
+ * background, the display turned to landscape): the VkSurfaceKHR made from the old one is then lost for good
+ * (VK_ERROR_SURFACE_LOST_KHR at the acquire). A new one is made from the activity's window; the swapchain must be gone. */
+static int surface_remake(void) {
+    ANativeWindow *w = (ANativeWindow *)android_native_window();
+    if (V.surface) vkDestroySurfaceKHR(V.instance, V.surface, NULL);
+    V.surface = VK_NULL_HANDLE;
+    VkAndroidSurfaceCreateInfoKHR si;
+    memset(&si, 0, sizeof si);
+    si.sType = VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR; si.window = w;
+    VkResult r = vkCreateAndroidSurfaceKHR(V.instance, &si, NULL, &V.surface);
+    printf("nvn_vk: the window's surface was lost: made again from %p: %s\n", (void *)w, vk_result_name(r));
+    if (r != VK_SUCCESS) { V.surface = VK_NULL_HANDLE; return 0; }
+    V.hwnd = (HWND)w;
+    V.surface_lost = 0;
+    return 1;
+}
+#endif
+/* Returns 0 when there is nothing to present to (a minimised window has a zero-sized surface, a lost one is made again
+ * at the next call). */
 static int swapchain_create(void) {
     VkSurfaceCapabilitiesKHR caps;
+#ifdef SSBU_ANDROID
+    if (V.surface_lost && !surface_remake()) return 0;
+#endif
     VkResult r = vkGetPhysicalDeviceSurfaceCapabilitiesKHR(V.gpu, V.surface, &caps);
+    if (r == VK_ERROR_SURFACE_LOST_KHR) { V.surface_lost = 1; return 0; }
     if (r != VK_SUCCESS) vk_fatal("vkGetPhysicalDeviceSurfaceCapabilitiesKHR", r);
     VkExtent2D ext = caps.currentExtent;
-#ifdef _WIN32
+#ifdef SSBU_ANDROID
+    if (ext.width == 0xffffffffu) { ext.width = (uint32_t)ANativeWindow_getWidth((ANativeWindow *)V.hwnd); ext.height = (uint32_t)ANativeWindow_getHeight((ANativeWindow *)V.hwnd); }
+#elif defined(_WIN32)
     if (ext.width == 0xffffffffu) { RECT rc; GetClientRect(V.hwnd, &rc); ext.width = (uint32_t)rc.right; ext.height = (uint32_t)rc.bottom; }
 #else
     if (ext.width == 0xffffffffu) { int w = 0, h = 0; SDL_GetWindowSizeInPixels((SDL_Window *)V.hwnd, &w, &h); ext.width = (uint32_t)w; ext.height = (uint32_t)h; }   /* Wayland leaves the size to us */
@@ -233,22 +279,60 @@ static int swapchain_create(void) {
         g_mu_shot_src = mt && mt[0] && (caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
         if (g_mu_shot_src) ci.imageUsage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT; }
     ci.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
+#ifdef SSBU_ANDROID
+    /* On a phone held in landscape the surface reports a 90/270 degree transform (its natural orientation is portrait).
+     * The identity transform made the compositor turn every frame itself on the GPU (SurfaceFlinger: CLIENT composition,
+     * ROT_90; 2026-10-21), so the swapchain takes the display's transform and portrait shape and rot_draw (nvn_vk_draw.c)
+     * turns the landscape picture into it; V.extent stays landscape for everything else. SSBU_VK_PRETURN=0: as before,
+     * the identity transform with the window's landscape shape. */
+    V.rot = 0;
+    {   const char *e = getenv("SSBU_VK_PRETURN");
+        VkFlags t = caps.currentTransform & (VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR | VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR);
+        if (t && (caps.supportedTransforms & t) && (!e || atoi(e)) && (caps.supportedUsageFlags & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT))
+            V.rot = t == VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR ? 1 : 2;
+        if (V.rot && ext.width > ext.height) {         /* the window's landscape size (the Marble reports it so): the display's portrait shape */
+            uint32_t w = ext.width; ext.width = ext.height; ext.height = w;
+            ci.imageExtent = ext;
+        }
+    }
+    printf("nvn_vk: surface %ux%u, transform now 0x%x, supported 0x%x%s\n", (unsigned)ext.width, (unsigned)ext.height, (unsigned)caps.currentTransform,
+           (unsigned)caps.supportedTransforms, V.rot ? ": the swapchain takes the display's transform" : "");
+    if (V.rot) ci.preTransform = (VkSurfaceTransformFlagBitsKHR)(caps.currentTransform & (VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR | VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR));
+    else if (caps.supportedTransforms & VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR) {
+        ci.preTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
+        if ((caps.currentTransform & (VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR | VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR)) && ext.width < ext.height) {
+            uint32_t t = ext.width; ext.width = ext.height; ext.height = t;
+            ci.imageExtent = ext;
+        }
+    } else ci.preTransform = caps.currentTransform;
+#else
     ci.preTransform = caps.currentTransform;
+#endif
     ci.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
     ci.presentMode = V.mode;
     ci.clipped = VK_TRUE;
     r = vkCreateSwapchainKHR(V.device, &ci, NULL, &V.swapchain);
+    if (r == VK_ERROR_SURFACE_LOST_KHR) { V.swapchain = VK_NULL_HANDLE; V.surface_lost = 1; return 0; }
     if (r != VK_SUCCESS) vk_fatal("vkCreateSwapchainKHR", r);
     V.image_count = 16;
-    r = vkGetSwapchainImagesKHR(V.device, V.swapchain, &V.image_count, V.images);
+    r = vkGetSwapchainImagesKHR(V.device, V.swapchain, &V.image_count, V.sc_images);
     if (r != VK_SUCCESS && r != VK_INCOMPLETE) vk_fatal("vkGetSwapchainImagesKHR", r);
+    memcpy(V.images, V.sc_images, sizeof V.images);     /* V.rot: rot_images (nvn_vk_draw.c) puts the landscape ones in their place */
     V.extent = ext;
+    if (V.rot) { V.extent.width = ext.height; V.extent.height = ext.width; }
     return 1;
 }
 
 /* ---------------------------------------------------------------- start */
+static void *vk_loader_sym(const char *name) {
+#ifdef SSBU_ANDROID
+    return android_vulkan_sym(V.loader, name);            /* a dlopen handle (vk_driver.c), not a module of the compat layer */
+#else
+    return (void *)GetProcAddress(V.loader, name);
+#endif
+}
 static void *vk_sym(const char *name) {
-    void *p = (void *)GetProcAddress(V.loader, name);
+    void *p = vk_loader_sym(name);
     if (!p) { printf("nvn_vk: vulkan-1.dll does not export %s\n", name); fflush(stdout); ExitProcess(5); }
     return p;
 }
@@ -287,12 +371,17 @@ int nvn_vk_init(void *hwnd) {
                                            "VK_EXT_index_type_uint8", "VK_EXT_full_screen_exclusive", "VK_EXT_blend_operation_advanced", "VK_KHR_pipeline_library"};
     VkResult r;
     V.hwnd = hwnd;
+#ifdef SSBU_ANDROID
+    V.loader = android_vulkan_open();
+    if (!V.loader) { printf("nvn_vk: libvulkan.so cannot be loaded: no Vulkan driver on this device\n"); fflush(stdout); ExitProcess(5); }
+#else
     V.loader = LoadLibraryA("vulkan-1.dll");
     if (!V.loader) { printf("nvn_vk: vulkan-1.dll cannot be loaded (error %lu): no Vulkan driver on this PC\n", GetLastError()); fflush(stdout); vk_unavailable(); }
+#endif
 #define X(ret, name, args) name = vk_sym(#name);
     VKF(X)
 #undef X
-    vkEnumerateInstanceVersion = (void *)GetProcAddress(V.loader, "vkEnumerateInstanceVersion");
+    vkEnumerateInstanceVersion = vk_loader_sym("vkEnumerateInstanceVersion");
     uint32_t loader_version = VK_MAKE_API_VERSION(0, 1, 0, 0);
     if (vkEnumerateInstanceVersion) vkEnumerateInstanceVersion(&loader_version);
 
@@ -307,7 +396,10 @@ int nvn_vk_init(void *hwnd) {
     const char *exts[14], *layers[1];                 /* Linux build: SDL may name several surface extensions */
 #endif
     uint32_t next = 0, nlayers = 0;
-#ifdef _WIN32
+#ifdef SSBU_ANDROID
+    exts[next++] = "VK_KHR_surface"; exts[next++] = VK_SURFACE_EXT;
+    if (!has_name(iext, niext, "VK_KHR_surface") || !has_name(iext, niext, VK_SURFACE_EXT)) { printf("nvn_vk: the Vulkan loader has no VK_KHR_surface / %s\n", VK_SURFACE_EXT); fflush(stdout); ExitProcess(5); }
+#elif defined(_WIN32)
     exts[next++] = "VK_KHR_surface"; exts[next++] = "VK_KHR_win32_surface";
     if (!has_name(iext, niext, "VK_KHR_surface") || !has_name(iext, niext, "VK_KHR_win32_surface")) { printf("nvn_vk: the Vulkan loader has no VK_KHR_surface / VK_KHR_win32_surface\n"); fflush(stdout); vk_unavailable(); }
 #else
@@ -342,7 +434,7 @@ int nvn_vk_init(void *hwnd) {
     memset(&ici, 0, sizeof ici);
     ici.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO; ici.pApplicationInfo = &app;
     ici.enabledLayerCount = nlayers; ici.ppEnabledLayerNames = layers; ici.enabledExtensionCount = next; ici.ppEnabledExtensionNames = exts;
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(SSBU_ANDROID)
     ici.flags = iflags;
 #endif
     r = vkCreateInstance(&ici, NULL, &V.instance);
@@ -360,7 +452,13 @@ int nvn_vk_init(void *hwnd) {
         printf("nvn_vk: validation layer on (VK_LAYER_KHRONOS_validation); messages are printed as vk-validation:\n");
     }
 
-#ifdef _WIN32
+#ifdef SSBU_ANDROID
+    VkAndroidSurfaceCreateInfoKHR si;
+    memset(&si, 0, sizeof si);
+    si.sType = VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR; si.window = (ANativeWindow *)hwnd;
+    r = vkCreateAndroidSurfaceKHR(V.instance, &si, NULL, &V.surface);
+    if (r != VK_SUCCESS) vk_fatal("vkCreateAndroidSurfaceKHR", r);
+#elif defined(_WIN32)
     VkWin32SurfaceCreateInfoKHR si;
     memset(&si, 0, sizeof si);
     si.sType = VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR; si.hinstance = GetModuleHandleA(NULL); si.hwnd = hwnd;
@@ -516,14 +614,15 @@ static void present_colour(const float rgba[4]) {
     if (!V.swapchain && !swapchain_create()) { InterlockedIncrement64(&g_vk_skipped); return; }
     uint32_t index = 0;
     VkResult r = vkAcquireNextImageKHR(V.device, V.swapchain, 1000000000ull, V.acquired, NULL, &index);
-    if (r == VK_ERROR_OUT_OF_DATE_KHR) {                        /* the window changed size: a new swapchain, this frame is shown by it */
+    if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_ERROR_SURFACE_LOST_KHR) {   /* the window changed size (or its surface is gone): a new swapchain, this frame is shown by it */
+        if (r == VK_ERROR_SURFACE_LOST_KHR) V.surface_lost = 1;
         swapchain_destroy();
         InterlockedIncrement64(&g_vk_recreated);
         if (!swapchain_create()) { InterlockedIncrement64(&g_vk_skipped); return; }
         r = vkAcquireNextImageKHR(V.device, V.swapchain, 1000000000ull, V.acquired, NULL, &index);
     }
     if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) { vk_ok("vkAcquireNextImageKHR", r); InterlockedIncrement64(&g_vk_skipped); return; }
-    int suboptimal = r == VK_SUBOPTIMAL_KHR;
+    int suboptimal = VK_SUBOPT(r);
 
     VkCommandBufferBeginInfo bi;
     memset(&bi, 0, sizeof bi);
@@ -534,13 +633,13 @@ static void present_colour(const float rgba[4]) {
     memset(&b, 0, sizeof b);
     b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
     b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    b.image = V.images[index];
+    b.image = V.sc_images[index];                        /* a clear: the same whatever the swapchain's orientation */
     b.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT; b.subresourceRange.levelCount = 1; b.subresourceRange.layerCount = 1;
     b.srcAccessMask = 0; b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT; b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED; b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
     vkCmdPipelineBarrier(V.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &b);
     VkClearColorValue cv;
     memcpy(cv.float32, rgba, sizeof cv.float32);
-    vkCmdClearColorImage(V.cmd, V.images[index], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &cv, 1, &b.subresourceRange);
+    vkCmdClearColorImage(V.cmd, V.sc_images[index], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &cv, 1, &b.subresourceRange);
     b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT; b.dstAccessMask = 0; b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL; b.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
     vkCmdPipelineBarrier(V.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, NULL, 0, NULL, 1, &b);
     vk_ok("vkEndCommandBuffer", vkEndCommandBuffer(V.cmd));
@@ -561,7 +660,7 @@ static void present_colour(const float rgba[4]) {
     pr.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
     pr.waitSemaphoreCount = 1; pr.pWaitSemaphores = &V.rendered; pr.swapchainCount = 1; pr.pSwapchains = &V.swapchain; pr.pImageIndices = &index;
     r = vkQueuePresentKHR(V.queue, &pr);
-    if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR || suboptimal) { swapchain_destroy(); InterlockedIncrement64(&g_vk_recreated); }      /* made again at the next present */
+    if (r == VK_ERROR_OUT_OF_DATE_KHR || VK_SUBOPT(r) || suboptimal) { swapchain_destroy(); InterlockedIncrement64(&g_vk_recreated); }      /* made again at the next present */
     else vk_ok("vkQueuePresentKHR", r);
     InterlockedIncrement64(&g_vk_frames);
 }

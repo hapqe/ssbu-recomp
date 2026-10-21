@@ -449,6 +449,19 @@ static void dev_add(SDL_JoystickID id) {
     }
     d->wireless = SDL_GetJoystickConnectionState(d->js) == SDL_JOYSTICK_CONNECTION_WIRELESS;
     d->slot = assign_slot(d);
+#ifdef SSBU_ANDROID
+    /* Android: the on-screen controls are a virtual pad that is player 1 from the start (android_main.c vpad_attach); a
+     * real controller that connects takes player 1 from it (the on-screen pad moves to its slot) */
+    if (!d->virt && d->slot > 0)
+        for (int i = 0; i < MAXDEV; i++) {
+            Dev *t = &g_dev[i];
+            if (t == d || !t->used || t->ignored || !t->virt || t->gca || t->slot != 0) continue;
+            t->slot = d->slot; d->slot = 0;
+            remember(t->guid, t->slot); apply_player_index(t);
+            say("nn::pad: \"%s\" -> player %d (a controller takes player 1)\n", t->name, t->slot + 1);
+            break;
+        }
+#endif
     if (d->slot >= 0) { remember(d->guid, d->slot); apply_player_index(d); }
     say("nn::pad: connected \"%s\" (%s, %s%s) GUID %s -> %s", d->name, d->gp ? "gamepad" : "joystick WITHOUT mapping (guessed layout)", d->gp ? type_name(d->gtype) : "raw",
         d->has_gyro ? ", gyro" : "", d->guid, d->slot >= 0 ? "player " : "no free slot\n");
@@ -459,6 +472,16 @@ static void dev_remove(Dev *d) {
         if (d->gp) { SDL_RumbleGamepad(d->gp, 0, 0, 0); SDL_CloseGamepad(d->gp); } else if (d->js) SDL_CloseJoystick(d->js);
         say("nn::pad: disconnected \"%s\" (player %d)\n", d->name, d->slot + 1);
     }
+#ifdef SSBU_ANDROID
+    if (d->used && !d->ignored && !d->virt && d->slot == 0)          /* player 1's controller is gone: the on-screen pad is player 1 again */
+        for (int i = 0; i < MAXDEV; i++) {
+            Dev *t = &g_dev[i];
+            if (t == d || !t->used || t->ignored || !t->virt || t->gca) continue;
+            t->slot = 0; remember(t->guid, 0); apply_player_index(t);
+            say("nn::pad: \"%s\" -> player 1 (the controller is gone)\n", t->name);
+            break;
+        }
+#endif
     memset(d, 0, sizeof *d);
 }
 static void reassign_all(void) {                  /* [players] changed in the file */

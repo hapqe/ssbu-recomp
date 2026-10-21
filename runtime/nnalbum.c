@@ -64,10 +64,7 @@
 #include <mfreadwrite.h>
 #include <mferror.h>
 #elif defined(SSBU_ANDROID)
-/* Android: no Media Foundation and no plat/ headers (android/compat): the types the movie maker's refusal path names */
-typedef struct IMFSinkWriter IMFSinkWriter;
-#define IMFSinkWriter_Release(w) ((void)(w))
-#define IMFSinkWriter_Finalize(w) ((void)(w), E_FAIL)
+/* Android (android/compat, no plat/ headers): the movie maker's refusal path below as in the Linux build */
 #ifndef E_INVALIDARG
 #define E_INVALIDARG ((HRESULT)0x80070057)
 #endif

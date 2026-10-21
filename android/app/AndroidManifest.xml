@@ -17,7 +17,8 @@
     <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
     <uses-permission android:name="android.permission.VIBRATE" />
 
-    <uses-feature android:name="android.hardware.vulkan.version" android:version="0x403000" android:required="true" />
+    <!-- Vulkan 1.3 is needed, but not from the system driver: a custom one (Turnip) can be installed in the launcher -->
+    <uses-feature android:name="android.hardware.vulkan.version" android:version="0x400000" android:required="true" />
     <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
     <uses-feature android:name="android.hardware.gamepad" android:required="false" />
     <uses-feature android:name="android.hardware.bluetooth" android:required="false" />
@@ -31,7 +32,9 @@
         android:extractNativeLibs="true"
         android:largeHeap="true"
         android:requestLegacyExternalStorage="true"
-        android:hardwareAccelerated="true">
+        android:hardwareAccelerated="true"
+        android:debuggable="true"
+        android:allowNativeHeapPointerTagging="false">
         <activity
             android:name=".LauncherActivity"
             android:exported="true"

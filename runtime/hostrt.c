@@ -713,7 +713,7 @@ void report_and_exit(int code) {
     ExitProcess((UINT)code);
 }
 
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(SSBU_ANDROID)
 /* Linux build: the guest functions on the host stack of this thread (plat_backtrace), innermost first. */
 static void print_host_guest_stack(void) {
     uintptr_t pcs[400];
@@ -729,7 +729,7 @@ static void print_host_guest_stack(void) {
 void guest_trap(const char *what, uint64_t addr) {
     printf("\nGUEST TRAP: %s (0x%llx)\n", what, (unsigned long long)addr);
     trace_printf("GUEST TRAP: %s (0x%llx)\n", what, (unsigned long long)addr);
-#ifdef _WIN32
+#if defined(_WIN32) || defined(SSBU_ANDROID)        /* Android: the Win32 path on android/compat */
     RaiseException(0xE0000001, 0, 0, NULL);
 #else
     print_host_guest_stack();
@@ -739,7 +739,7 @@ void guest_trap(const char *what, uint64_t addr) {
 void guest_unimpl(uint64_t pc, uint32_t insn, const char *what) {
     printf("\nUNTRANSLATED INSTRUCTION at 0x%llx: %08x (%s)\n", (unsigned long long)pc, insn, what);
     trace_printf("UNTRANSLATED INSTRUCTION at 0x%llx: %08x (%s)\n", (unsigned long long)pc, insn, what);
-#ifdef _WIN32
+#if defined(_WIN32) || defined(SSBU_ANDROID)        /* Android: the Win32 path on android/compat */
     RaiseException(0xE0000002, 0, 0, NULL);
 #else
     print_host_guest_stack();
@@ -760,7 +760,7 @@ int diag_report_path(char *out, size_t size, const char *suffix) {
     char exe[MAX_PATH];
     DWORD n = GetModuleFileNameA(NULL, exe, MAX_PATH);
     if (n <= 4 || n >= MAX_PATH) return 0;
-#ifdef _WIN32
+#if defined(_WIN32) || defined(SSBU_ANDROID)        /* Android: the Win32 path on android/compat */
     exe[n - 4] = 0;                                 /* without ".exe" */
 #else
     if (!_stricmp(exe + n - 4, ".exe")) exe[n - 4] = 0;      /* Linux build: the exe has no ".exe" */
@@ -769,13 +769,13 @@ int diag_report_path(char *out, size_t size, const char *suffix) {
     int k = dir && dir[0] ? snprintf(out, size, "%s\\%s%s", dir, base ? base + 1 : exe, suffix) : snprintf(out, size, "%s%s", exe, suffix);
     return k > 0 && (size_t)k < size;
 }
-#ifdef _WIN32
+#if defined(_WIN32) || defined(SSBU_ANDROID)        /* Android: the Win32 path on android/compat */
 static const char *base_name(const char *path) { const char *s = strrchr(path, '\\'); return s ? s + 1 : path; }     /* the reports name files, not folders: logs get posted */
 #else
 static const char *base_name(const char *path) { const char *s = strrchr(path, '/'); return s ? s + 1 : path; }      /* Linux build: '/' separates folders */
 #endif
 
-#ifdef _WIN32
+#if defined(_WIN32) || defined(SSBU_ANDROID)        /* Android: the Win32 path on android/compat */
 /* SSBU_MINIDUMP: not set = a minidump when the game crashes; 0 = none at all; "freeze" = also when the freeze watchdog
  * reports a stall of 5 s or more (never for the 1 s reports: the start-up white screen and the opening movie trip those on a
  * normal start); "full" = the whole memory instead of the stacks and what they point to (several GB). Joined: freeze,full. */
@@ -1168,7 +1168,7 @@ void runtime_init(const char *elf, const char *trace_path) {
                (void *)g_by_host[0].fn, (void *)g_by_host[fn_table_count - 1].fn);
     }
     g_trace = fopen(trace_path, "w");
-#ifdef _WIN32
+#if defined(_WIN32) || defined(SSBU_ANDROID)        /* Android: the Win32 path on android/compat */
     SetUnhandledExceptionFilter(crash_filter);
     (void)minidump_mode();                          /* read SSBU_MINIDUMP now: the crash path should not have to */
 #else
@@ -1251,6 +1251,9 @@ int audit_trivial(ImportFn fn, long long *x0, int *sets_x0) {
     long long rax = 0;
     *x0 = 0; *sets_x0 = 0;
     if (!p) return 0;
+#ifndef __x86_64__
+    return 0;                                       /* the patterns below are x86-64 machine code: elsewhere nothing is known */
+#endif
     for (int hop = 0; hop < 4 && p[0] == 0xE9; hop++) p = p + 5 + *(const int *)(p + 1);      /* linker thunk / tail jump */
     for (int step = 0; step < 12; step++) {
         const unsigned char *q = p;
@@ -1339,7 +1342,7 @@ static void audit_hostfn(const char *name, ImportFn fn) {
 
 static void audit_write(const char *path, int with_counts) {
     FILE *f = fopen(path, "w");
-#ifdef _WIN32
+#if defined(_WIN32) || defined(SSBU_ANDROID)        /* Android: the Win32 path on android/compat */
     uintptr_t base = (uintptr_t)GetModuleHandleA(NULL);
 #else
     uintptr_t base = plat_module_base(NULL);

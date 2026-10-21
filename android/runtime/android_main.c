@@ -194,6 +194,7 @@ static DWORD WINAPI runtime_thread(LPVOID arg) {
 }
 static int exists(const char *p) { struct stat st; return stat(p, &st) == 0; }
 
+static int vpad_attach(void);
 int SDL_main(int argc, char *argv[]) {
     if (argc < 3) { __android_log_print(ANDROID_LOG_FATAL, "OpenSmash", "SDL_main: game folder and library folder missing"); return 1; }
     snprintf(g_game, sizeof g_game, "%s", argv[1]);
@@ -216,6 +217,7 @@ int SDL_main(int argc, char *argv[]) {
     SDL_SetHint(SDL_HINT_ANDROID_TRAP_BACK_BUTTON, "1");
     SDL_SetHint(SDL_HINT_ORIENTATIONS, "LandscapeLeft LandscapeRight");
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS | SDL_INIT_GAMEPAD | SDL_INIT_JOYSTICK)) { printf("android: SDL_Init failed: %s\n", SDL_GetError()); return 1; }
+    if (getenv("SSBU_TOUCH_PAD")) vpad_attach();                       /* the on-screen pad is player 1 (see vpad_attach) */
     SDL_AddEventWatch(event_watch, NULL);
     g_window = SDL_CreateWindow("OpenSmash", 1280, 720, SDL_WINDOW_FULLSCREEN | SDL_WINDOW_VULKAN | SDL_WINDOW_HIGH_PIXEL_DENSITY);
     if (!g_window) { printf("android: SDL_CreateWindow failed: %s\n", SDL_GetError()); return 1; }
@@ -258,6 +260,10 @@ int SDL_main(int argc, char *argv[]) {
     g_argc = 2;
     g_argv[0] = exe;
     g_argv[1] = elf;
+    {   const char *sec = getenv("SSBU_SECONDS");                    /* tests: the run ends after that many seconds, with its reports (boot.c argv[2]) */
+        if (sec && sec[0]) { g_argv[2] = (char *)sec; g_argc = 3; } }
+    __argc = g_argc;                                                   /* as the Windows C runtime sets them (sdklift_rt.c finds sdk.elf beside main.elf) */
+    __argv = g_argv;
     CloseHandle(CreateThread(NULL, (SIZE_T)64 << 20, runtime_thread, NULL, 0, NULL));
     for (;;) {                                                         /* keep SDL's Android glue serviced */
         SDL_PumpEvents();
@@ -267,11 +273,12 @@ int SDL_main(int argc, char *argv[]) {
 }
 
 /* ---------------------------------------------------------------- on-screen controls: a virtual SDL gamepad
- * TouchControls.java -> GameActivity.nativeTouchPad (UI thread). The pad is attached on the first touch, so a player
- * with a real controller and the overlay hidden has only the real one. Bits = SDL_GamepadButton; 16 / 17 = ZL / ZR. */
+ * TouchControls.java -> GameActivity.nativeTouchPad (UI thread). With the overlay on (SSBU_TOUCH_PAD, GameActivity) the pad
+ * is attached at the start, before the runtime looks for pads, so it is player 1 and the keyboard takes the next slot (it
+ * was attached on the first touch, after the keyboard had become player 1: the game's player-1 screens ignored it). With
+ * the overlay hidden there is no virtual pad at all. Bits = SDL_GamepadButton; 16 / 17 = ZL / ZR. */
 static SDL_Joystick *g_vpad;
-JNIEXPORT void JNICALL Java_me_hapke_opensmash_GameActivity_nativeTouchPad(JNIEnv *env, jclass cls, jint buttons, jfloat lx, jfloat ly, jfloat rx, jfloat ry) {
-    (void)env; (void)cls;
+static int vpad_attach(void) {
     if (!g_vpad) {
         SDL_VirtualJoystickDesc desc;
         SDL_INIT_INTERFACE(&desc);
@@ -281,11 +288,16 @@ JNIEXPORT void JNICALL Java_me_hapke_opensmash_GameActivity_nativeTouchPad(JNIEn
         desc.vendor_id = 0x057e; desc.product_id = 0x2009;      /* reported as a Pro Controller: its face labels are the Switch ones (A east, B south) */
         desc.name = "OpenSmash touch controls";
         SDL_JoystickID id = SDL_AttachVirtualJoystick(&desc);
-        if (!id) { printf("android: the virtual pad cannot be attached: %s\n", SDL_GetError()); return; }
+        if (!id) { printf("android: the virtual pad cannot be attached: %s\n", SDL_GetError()); return 0; }
         g_vpad = SDL_OpenJoystick(id);
-        if (!g_vpad) { printf("android: the virtual pad cannot be opened: %s\n", SDL_GetError()); return; }
+        if (!g_vpad) { printf("android: the virtual pad cannot be opened: %s\n", SDL_GetError()); return 0; }
         printf("android: on-screen controls attached as a virtual gamepad\n");
     }
+    return g_vpad != NULL;
+}
+JNIEXPORT void JNICALL Java_me_hapke_opensmash_GameActivity_nativeTouchPad(JNIEnv *env, jclass cls, jint buttons, jfloat lx, jfloat ly, jfloat rx, jfloat ry) {
+    (void)env; (void)cls;
+    if (!vpad_attach()) return;
     for (int b = 0; b < 15; b++) SDL_SetJoystickVirtualButton(g_vpad, b, (buttons >> b & 1) != 0);
     SDL_SetJoystickVirtualAxis(g_vpad, SDL_GAMEPAD_AXIS_LEFTX, (Sint16)(lx * 32767));
     SDL_SetJoystickVirtualAxis(g_vpad, SDL_GAMEPAD_AXIS_LEFTY, (Sint16)(ly * 32767));

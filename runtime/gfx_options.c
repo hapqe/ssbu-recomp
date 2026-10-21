@@ -116,7 +116,11 @@ static const char *const k_default_ini =
 ";   start:   every shader of the game is loaded into memory at the start, behind a 'LOADING SHADERS NN %' screen (a few\r\n"
 ";            seconds, more on a CPU with few cores): the loading screens before a fight do no shader work. Uses more memory.\r\n"
 ";   loading: as before: the shaders of a fighter or stage are loaded at its loading screen (less memory).\r\n"
+#ifdef SSBU_ANDROID
+"shader_load = loading\r\n"                      /* a phone: the memory of every shader at once costs other apps their place */
+#else
 "shader_load = start\r\n"
+#endif
 "\r\n"
 "; profile = custom | low\r\n"
 ";   custom: every key of this file as written. low: the set measured for a weak or integrated GPU (2026-10-12, Intel\r\n"
@@ -184,6 +188,9 @@ static BOOL CALLBACK opt_load(PINIT_ONCE once, PVOID arg, PVOID *ctx) {
     int written = 0, unknown = 0;
     memset(o, 0, sizeof *o);
     o->width = 1280; o->height = 720; o->scale = 1.0f; o->present = 5;      /* vsync = auto when the key is missing (track V session 14) */
+#ifdef SSBU_ANDROID
+    o->shader_load = 1;                                                     /* loading: see the default file above */
+#endif
     opt_path(o->path);
     FILE *f = fopen(o->path, "rb");
     if (!f) {

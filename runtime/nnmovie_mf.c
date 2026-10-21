@@ -79,11 +79,29 @@
 #define COBJMACROS
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#ifdef SSBU_ANDROID
+/* Android: the same protocol on the NDK's media library (AMediaExtractor demuxes, AMediaCodec decodes; the SDK's movie
+ * library is a port of the same stagefright, so the mapping is direct). Only the parts marked SSBU_ANDROID differ: the
+ * extractor's source and tracks (ext_open_bytes, ext_select, ext_fill, SeekTo, the destructor) and the copy of a decoded
+ * sample. A decoded sample is a host block (MovieSample) where Windows has an IMFSample; the names below keep the
+ * shared code as it is. The H.264 elementary streams of the final smash movies have no decoder here yet (h264_available
+ * = 0, as on a PC without one). */
+#include <media/NdkMediaCodec.h>
+#include <media/NdkMediaExtractor.h>
+#include <media/NdkMediaFormat.h>
+#include <sys/mman.h>
+typedef struct MovieSample { unsigned char *data; size_t len; } MovieSample;
+#define IMFSample MovieSample
+static void movie_sample_free(MovieSample *s) { if (s) { free(s->data); free(s); } }
+#define IMFSample_Release(s) movie_sample_free(s)
+typedef struct IMFTransform IMFTransform;            /* the H.264 path of Windows: not built here */
+#else
 #include <mfapi.h>
 #include <mfidl.h>
 #include <mfreadwrite.h>
 #include <mferror.h>
 #include <shlwapi.h>
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -152,6 +170,9 @@ int movie_mf_present(void) {
 #endif
 }
 
+#ifdef SSBU_ANDROID
+static void com_init(void) { (void)t_com_init; (void)g_mf_started; }      /* the NDK media library needs no start */
+#else
 static void vorbis_store_register(void);
 static void com_init(void) {
     if (!t_com_init) { CoInitializeEx(NULL, COINIT_MULTITHREADED); t_com_init = 1; }
@@ -161,6 +182,7 @@ static void com_init(void) {
         vorbis_store_register();
     }
 }
+#endif
 
 /* The FFmpeg fallback (Windows): SSBU_MOVIE_FFMPEG=1 always, =0 never, otherwise when Media Foundation fails. */
 #ifdef MOVIE_FFMPEG
@@ -179,6 +201,7 @@ static int ffmf_test(void) {
     return t;
 }
 #endif
+#ifndef SSBU_ANDROID                                   /* Media Foundation objects: none on Android (AMediaCodec below) */
 /* A new Media Foundation object of the same side as `like` (a reader or a transform): FFmpeg's or Media Foundation's. */
 static HRESULT new_media_type(const void *like, IMFMediaType **t) {
 #ifdef MOVIE_FFMPEG
@@ -201,6 +224,8 @@ static HRESULT new_buffer(const void *like, DWORD size, IMFMediaBuffer **b) {
     (void)like;
     return MFCreateMemoryBuffer(size, b);
 }
+
+#endif
 
 /* Call a guest function with up to five arguments; the caller's registers are preserved. */
 static uint64_t gcall(Ctx *c, uint64_t fn, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4) {
@@ -399,12 +424,25 @@ typedef struct {
     double fps;
     uint32_t fourcc;
     int failed;                                       /* close4: the source reader's decoder reported an error for this track */
+#ifdef SSBU_ANDROID
+    AMediaCodec *codec;                               /* made by SelectTrack */
+    int in_eos, out_eos;                              /* end of stream sent to the codec / come out of it */
+    int color, stride, slice_h, crop_l, crop_t;       /* the codec's output layout (INFO_OUTPUT_FORMAT_CHANGED) */
+    struct { MovieSample *s; int64_t us; } q[64];     /* decoded samples not yet the track's next one, oldest first */
+    int qn;
+#endif
 } Track;
 
 typedef struct Ext {
     CRITICAL_SECTION cs;
+#ifdef SSBU_ANDROID
+    AMediaExtractor *rd;                              /* NULL = no source (the checks of e->rd are shared) */
+    int fd;                                           /* the movie's bytes (a memfd the extractor reads) */
+    int src_eos;                                      /* the extractor has no sample left */
+#else
     IMFSourceReader *rd;
     IMFByteStream *bs;
+#endif
     int ntracks;
     Track tr[MAX_TRACKS];
     int64_t duration_us;
@@ -466,6 +504,10 @@ typedef struct {
     int h264, csd_sent, plane_h, mft_provides, warned_h264;
     IMFTransform *mft;
     DWORD mft_out_size;
+#ifdef SSBU_ANDROID
+    AMediaCodec *acodec;                              /* the H.264 decoder of a final smash movie (h264_open) */
+    int a_color, a_stride, a_slice, a_crop_l, a_crop_t;
+#endif
     unsigned char *csd; size_t csd_len;               /* start code + SPS + start code + PPS, sent before the first unit (owned) */
     struct { IMFSample *s; int64_t ts; uint32_t flags; } pend[MAX_OUT];
     int pend_n;
@@ -496,6 +538,7 @@ static void *volatile g_h264_mem_grace;
 
 typedef struct { uint64_t magic; IMFSample *s; int64_t ts; uint64_t gen; } Token;   /* gen = Ext::gen when it was read */
 
+#ifndef SSBU_ANDROID
 static const GUID GUID_Vorbis = {0x8D2FD10B, 0x5841, 0x4a6b, {0x89, 0x05, 0x58, 0x8F, 0xEC, 0x1A, 0xDE, 0xD9}};
 
 /* The Vorbis decoder is not part of Windows: it comes with the Store package Web Media Extensions (FFmpegAudioDecoder).
@@ -555,6 +598,7 @@ static int is_mf_fourcc_guid(const GUID *g) {         /* {xxxxxxxx-0000-0010-800
     static const unsigned char tail[8] = {0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71};
     return g->Data2 == 0 && g->Data3 == 0x10 && memcmp(g->Data4, tail, 8) == 0;
 }
+#endif
 #define FCC(a, b, c, d) ((uint32_t)(a) | ((uint32_t)(b) << 8) | ((uint32_t)(c) << 16) | ((uint32_t)(d) << 24))
 
 static void signal_event(Dec *d, int which) {
@@ -601,6 +645,7 @@ static void release_ahead(Ext *e, int track) {        /* track < 0: all */
     }
 }
 
+#ifndef SSBU_ANDROID
 #ifdef MOVIE_FFMPEG
 /* The FFmpeg fallback's reader over a copy of the file (e->bs and e->rd must be free). */
 static HRESULT ext_open_reader_ffmpeg(Ext *e, const unsigned char *data, size_t size) {
@@ -896,6 +941,263 @@ static int ext_fill(Ext *e) {
     return ST_OK;
 }
 
+#else
+/* ---------------------------------------------------------------- the extractor on the NDK (Android)
+ * The bytes go into a memfd that AMediaExtractor reads; SelectTrack makes the track's AMediaCodec (Android's software
+ * decoders first: their output layout is the same on every phone). ext_fill keeps the rule of the Windows version: each
+ * selected track is read ahead by one DECODED sample and the current sample is the one with the smallest time. The
+ * extractor hands out the samples of all selected tracks in file order, so a track's next decoded sample may need samples
+ * of the others to be fed first: every codec's output goes into its track's queue (q), drained without waiting. */
+#define Q_MAX ((int)(sizeof ((Track *)0)->q / sizeof ((Track *)0)->q[0]))
+static int fmt_i32(AMediaFormat *f, const char *k, int def) { int32_t v = 0; return f && AMediaFormat_getInt32(f, k, &v) ? v : def; }
+
+static void track_codec_free(Track *tr) {
+    if (tr->codec) { AMediaCodec_stop(tr->codec); AMediaCodec_delete(tr->codec); tr->codec = NULL; }
+    for (int k = 0; k < tr->qn; k++) movie_sample_free(tr->q[k].s);
+    tr->qn = 0; tr->in_eos = tr->out_eos = 0;
+}
+
+static int ext_open_bytes(Ext *e, unsigned char *data, size_t size) {
+    e->fd = memfd_create("movie", MFD_CLOEXEC);
+    if (e->fd < 0) { printf("movie: memfd_create failed (%zu bytes)\n", size); return 0; }
+    for (size_t off = 0; off < size; ) {
+        ssize_t n = write(e->fd, data + off, size - off);
+        if (n <= 0) { printf("movie: writing the movie into its memfd failed at %zu of %zu bytes\n", off, size); close(e->fd); e->fd = -1; return 0; }
+        off += (size_t)n;
+    }
+    e->rd = AMediaExtractor_new();
+    media_status_t st = e->rd ? AMediaExtractor_setDataSourceFd(e->rd, e->fd, 0, (off64_t)size) : AMEDIA_ERROR_UNKNOWN;
+    if (st != AMEDIA_OK) {
+        printf("movie: AMediaExtractor could not open %s (%d)\n", e->path, (int)st);
+        if (e->rd) AMediaExtractor_delete(e->rd);
+        e->rd = NULL; close(e->fd); e->fd = -1;
+        return 0;
+    }
+    size_t n = AMediaExtractor_getTrackCount(e->rd);
+    e->ntracks = 0; e->duration_us = 0; e->src_eos = 0;
+    for (size_t i = 0; i < n && e->ntracks < MAX_TRACKS; i++) {
+        AMediaFormat *f = AMediaExtractor_getTrackFormat(e->rd, i);
+        Track *tr = &e->tr[e->ntracks++];
+        memset(tr, 0, sizeof *tr);
+        const char *mime = NULL;
+        if (f) AMediaFormat_getString(f, AMEDIAFORMAT_KEY_MIME, &mime);
+        snprintf(tr->mime, sizeof tr->mime, "%s", mime ? mime : "application/octet-stream");
+        int64_t dur = 0;
+        if (f && AMediaFormat_getInt64(f, AMEDIAFORMAT_KEY_DURATION, &dur) && dur > e->duration_us) e->duration_us = dur;
+        if (!strncmp(tr->mime, "video/", 6)) {
+            float fr = 0;
+            tr->kind = 0;
+            tr->w = fmt_i32(f, AMEDIAFORMAT_KEY_WIDTH, 0); tr->h = fmt_i32(f, AMEDIAFORMAT_KEY_HEIGHT, 0);
+            tr->fps = f && AMediaFormat_getFloat(f, AMEDIAFORMAT_KEY_FRAME_RATE, &fr) ? fr : fmt_i32(f, AMEDIAFORMAT_KEY_FRAME_RATE, 0);
+        } else if (!strncmp(tr->mime, "audio/", 6)) {
+            tr->kind = 1;
+            tr->rate = fmt_i32(f, AMEDIAFORMAT_KEY_SAMPLE_RATE, 0); tr->ch = fmt_i32(f, AMEDIAFORMAT_KEY_CHANNEL_COUNT, 0);
+        } else tr->kind = 2;
+        if (f) AMediaFormat_delete(f);
+    }
+    printf("movie: opened %s: %zu bytes, %.1f s, %d tracks:", e->path, size, e->duration_us / 1e6, e->ntracks);
+    for (int i = 0; i < e->ntracks; i++) {
+        Track *tr = &e->tr[i];
+        if (tr->kind == 0) printf("  [%d] %s %dx%d %.2f fps", i, tr->mime, tr->w, tr->h, tr->fps);
+        else if (tr->kind == 1) printf("  [%d] %s %d Hz %d ch", i, tr->mime, tr->rate, tr->ch);
+        else printf("  [%d] %s", i, tr->mime);
+    }
+    printf("\n");
+    return 1;
+}
+
+static const char *sw_decoder(const char *mime) {     /* Android's own software decoders (Codec2) */
+    static const char *const map[][2] = {
+        {"video/x-vnd.on2.vp9", "c2.android.vp9.decoder"}, {"video/x-vnd.on2.vp8", "c2.android.vp8.decoder"},
+        {"video/avc", "c2.android.avc.decoder"}, {"audio/vorbis", "c2.android.vorbis.decoder"},
+        {"audio/opus", "c2.android.opus.decoder"}, {"audio/mp4a-latm", "c2.android.aac.decoder"},
+    };
+    for (unsigned i = 0; i < sizeof map / sizeof map[0]; i++) if (!strcmp(mime, map[i][0])) return map[i][1];
+    return NULL;
+}
+
+static int ext_select(Ext *e, int i, int on) {
+    if (!e->rd || i < 0 || i >= e->ntracks) return ST_INVALID;
+    Track *tr = &e->tr[i];
+    if (e->have_pending && e->pend_track == i) release_pending(e);
+    release_ahead(e, i);
+    track_codec_free(tr);
+    media_status_t st = on ? AMediaExtractor_selectTrack(e->rd, (size_t)i) : AMediaExtractor_unselectTrack(e->rd, (size_t)i);
+    int ok = st == AMEDIA_OK;
+    if (on && ok && tr->kind != 2) {
+        AMediaFormat *f = AMediaExtractor_getTrackFormat(e->rd, (size_t)i);
+        const char *name = sw_decoder(tr->mime);
+        AMediaCodec *cd = name ? AMediaCodec_createCodecByName(name) : NULL;
+        const char *used = name;
+        if (!cd) { cd = AMediaCodec_createDecoderByType(tr->mime); used = "the system's decoder"; }
+        if (tr->kind == 0 && f) AMediaFormat_setInt32(f, AMEDIAFORMAT_KEY_COLOR_FORMAT, 0x7F420888);     /* COLOR_FormatYUV420Flexible */
+        media_status_t cs = !cd || !f ? AMEDIA_ERROR_UNKNOWN : AMediaCodec_configure(cd, f, NULL, NULL, 0);
+        if (cs == AMEDIA_OK) cs = AMediaCodec_start(cd);
+        if (f) AMediaFormat_delete(f);
+        if (cs != AMEDIA_OK) {
+            printf("movie: track %d (%s): no decoder (%s: %d); track left unselected\n", i, tr->mime, used ? used : "none", (int)cs);
+            if (cd) AMediaCodec_delete(cd);
+            AMediaExtractor_unselectTrack(e->rd, (size_t)i);
+            return ST_UNSUPPORTED;
+        }
+        tr->codec = cd;
+        tr->color = 0x7F420888; tr->stride = tr->w; tr->slice_h = tr->h; tr->crop_l = tr->crop_t = 0;
+        printf("movie: track %d (%s): decoder %s\n", i, tr->mime, used);
+    }
+    tr->selected = on && ok;
+    tr->eos = 0;
+    printf("movie: %s track %d (%s)%s\n", on ? "selected" : "unselected", i, tr->mime, ok ? "" : " FAILED");
+    return ok ? ST_OK : ST_FAILED;
+}
+
+/* A decoded block -> what the game reads: tight NV12 of the track's size (Y rows, then interleaved UV rows of w bytes),
+ * or the PCM as it is. Planar layouts (I420, the software decoders' "flexible" one) are interleaved here. */
+static MovieSample *sample_from_codec(Track *tr, const uint8_t *p, size_t n) {
+    MovieSample *s = calloc(1, sizeof *s);
+    if (!s) return NULL;
+    if (tr->kind != 0) {
+        s->data = malloc(n ? n : 1);
+        if (!s->data) { free(s); return NULL; }
+        memcpy(s->data, p, n); s->len = n;
+        return s;
+    }
+    int w = tr->w, h = tr->h, stride = tr->stride > 0 ? tr->stride : w, sh = tr->slice_h > 0 ? tr->slice_h : h;
+    size_t uvrows = (size_t)((h + 1) / 2), need = (size_t)w * h + (size_t)w * uvrows;
+    s->data = malloc(need ? need : 1);
+    if (!s->data) { free(s); return NULL; }
+    s->len = need;
+    int semi = tr->color == 21 || tr->color == 0x7FA30C04;          /* NV12, and Qualcomm's 32-aligned NV12 */
+    const uint8_t *y0 = p + (size_t)tr->crop_t * stride + tr->crop_l, *end = p + n;
+    for (int y = 0; y < h; y++) { const uint8_t *r = y0 + (size_t)y * stride; if (r + w <= end) memcpy(s->data + (size_t)y * w, r, (size_t)w); }
+    uint8_t *uv = s->data + (size_t)w * h;
+    if (semi) {
+        const uint8_t *c0 = p + (size_t)stride * sh + (size_t)(tr->crop_t / 2) * stride + tr->crop_l;
+        for (size_t y = 0; y < uvrows; y++) { const uint8_t *r = c0 + y * stride; if (r + w <= end) memcpy(uv + y * w, r, (size_t)w); }
+    } else {
+        int cs = (stride + 1) / 2;
+        const uint8_t *u0 = p + (size_t)stride * sh, *v0 = u0 + (size_t)cs * ((sh + 1) / 2);
+        u0 += (size_t)(tr->crop_t / 2) * cs + tr->crop_l / 2; v0 += (size_t)(tr->crop_t / 2) * cs + tr->crop_l / 2;
+        for (size_t y = 0; y < uvrows; y++) {
+            const uint8_t *ur = u0 + y * cs, *vr = v0 + y * cs;
+            uint8_t *o = uv + y * w;
+            if (vr + (w + 1) / 2 > end) break;
+            for (int x = 0; x < w; x += 2) { o[x] = ur[x / 2]; if (x + 1 < w) o[x + 1] = vr[x / 2]; }
+        }
+    }
+    return s;
+}
+
+/* One output of track i's codec into its queue; 1 when something came out (a block, a format change, the end). */
+static int codec_drain(Track *tr, int64_t timeout_us) {
+    if (!tr->codec || tr->out_eos || tr->qn >= Q_MAX) return 0;
+    AMediaCodecBufferInfo info;
+    ssize_t ix = AMediaCodec_dequeueOutputBuffer(tr->codec, &info, timeout_us);
+    if (ix == AMEDIACODEC_INFO_OUTPUT_FORMAT_CHANGED) {
+        AMediaFormat *f = AMediaCodec_getOutputFormat(tr->codec);
+        if (tr->kind == 0) {
+            tr->color = fmt_i32(f, AMEDIAFORMAT_KEY_COLOR_FORMAT, tr->color);
+            tr->stride = fmt_i32(f, AMEDIAFORMAT_KEY_STRIDE, fmt_i32(f, AMEDIAFORMAT_KEY_WIDTH, tr->w));
+            tr->slice_h = fmt_i32(f, "slice-height", fmt_i32(f, AMEDIAFORMAT_KEY_HEIGHT, tr->h));
+            tr->crop_l = fmt_i32(f, "crop-left", 0); tr->crop_t = fmt_i32(f, "crop-top", 0);
+            printf("movie: video decoder output: color format 0x%x, stride %d, slice height %d, crop %d,%d (shown %dx%d)\n",
+                   tr->color, tr->stride, tr->slice_h, tr->crop_l, tr->crop_t, tr->w, tr->h);
+        } else {
+            int enc = fmt_i32(f, "pcm-encoding", 2);
+            if (enc != 2) printf("movie: WARNING audio decoder output encoding %d, the game takes 16-bit PCM\n", enc);
+        }
+        if (f) AMediaFormat_delete(f);
+        return 1;
+    }
+    if (ix == AMEDIACODEC_INFO_OUTPUT_BUFFERS_CHANGED) return 1;
+    if (ix < 0) return 0;
+    size_t cap = 0;
+    uint8_t *buf = AMediaCodec_getOutputBuffer(tr->codec, (size_t)ix, &cap);
+    if (buf && info.size > 0 && (size_t)info.offset + (size_t)info.size <= cap) {
+        MovieSample *s = sample_from_codec(tr, buf + info.offset, (size_t)info.size);
+        if (s) { tr->q[tr->qn].s = s; tr->q[tr->qn].us = info.presentationTimeUs; tr->qn++; }
+    }
+    AMediaCodec_releaseOutputBuffer(tr->codec, (size_t)ix, false);
+    if (info.flags & AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM) tr->out_eos = 1;
+    return 1;
+}
+
+/* One sample of the file into its track's codec (skipped for an unselected track), or, at the end of the file, the
+ * end of stream into every codec. 0 when nothing could be given (the codec's input buffers are all taken). */
+static int codec_feed(Ext *e) {
+    if (!e->src_eos) {
+        ssize_t t = AMediaExtractor_getSampleTrackIndex(e->rd);
+        if (t >= 0) {
+            Track *tr = t < e->ntracks ? &e->tr[t] : NULL;
+            if (!tr || !tr->selected || !tr->codec || tr->in_eos) { AMediaExtractor_advance(e->rd); return 1; }
+            ssize_t in = AMediaCodec_dequeueInputBuffer(tr->codec, 2000);
+            if (in < 0) return 0;
+            size_t cap = 0;
+            uint8_t *b = AMediaCodec_getInputBuffer(tr->codec, (size_t)in, &cap);
+            ssize_t n = b ? AMediaExtractor_readSampleData(e->rd, b, cap) : -1;
+            int64_t us = AMediaExtractor_getSampleTime(e->rd);
+            AMediaCodec_queueInputBuffer(tr->codec, (size_t)in, 0, n > 0 ? (size_t)n : 0, us > 0 ? (uint64_t)us : 0, 0);
+            AMediaExtractor_advance(e->rd);
+            return 1;
+        }
+        e->src_eos = 1;
+    }
+    int gave = 0;
+    for (int j = 0; j < e->ntracks; j++) {
+        Track *tr = &e->tr[j];
+        if (!tr->selected || !tr->codec || tr->in_eos) continue;
+        ssize_t in = AMediaCodec_dequeueInputBuffer(tr->codec, 2000);
+        if (in < 0) continue;
+        AMediaCodec_queueInputBuffer(tr->codec, (size_t)in, 0, 0, 0, AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM);
+        tr->in_eos = 1; gave = 1;
+    }
+    return gave;
+}
+
+/* Returns 0 with a pending sample, or ST_END (as the Windows version). Caller holds the lock. */
+static int ext_fill(Ext *e) {
+    if (e->have_pending) return ST_OK;
+    {   /* TEST ONLY, SSBU_SKIP_MOVIES (see the Windows version) */
+        static int skip = -1;
+        if (skip < 0) { const char *v = getenv("SSBU_SKIP_MOVIES"); skip = v && atoi(v) != 0; }
+        static unsigned long long keep = 0;
+        if (skip > 0 && !keep) { const char *v = getenv("SSBU_SKIP_MOVIES"); keep = atoi(v) > 1 ? (unsigned long long)atoi(v) : 12; }
+        if (skip && e->samples_read - e->seek_base >= keep) { if (!e->eos) printf("movie: SSBU_SKIP_MOVIES: end of stream after %llu samples%c", e->samples_read, 10); e->eos = 1; return ST_END; }
+    }
+    if (e->eos || !e->rd) return ST_END;
+    int best = -1;
+    for (int i = 0; i < e->ntracks; i++) {
+        Track *tr = &e->tr[i];
+        if (!tr->selected) continue;
+        int idle = 0;
+        while (!e->ahead[i].have && !tr->eos) {
+            if (tr->qn > 0) {                             /* the track's next decoded sample */
+                e->ahead[i].have = 1; e->ahead[i].s = tr->q[0].s; e->ahead[i].us = tr->q[0].us;
+                memmove(tr->q, tr->q + 1, (size_t)(tr->qn - 1) * sizeof tr->q[0]);
+                tr->qn--;
+                e->samples_read++;
+                break;
+            }
+            if (!tr->codec || tr->out_eos) { tr->eos = 1; break; }
+            int moved = 0;
+            for (int j = 0; j < e->ntracks; j++) while (e->tr[j].selected && codec_drain(&e->tr[j], 0)) moved = 1;
+            if (tr->qn > 0) continue;
+            moved |= codec_feed(e);
+            if (!moved) moved = codec_drain(tr, 5000);    /* the codec is working on what it has: wait for it a little */
+            if (moved) idle = 0;
+            else if (++idle > 400) {                      /* about 2 s without any progress: the codec is stuck */
+                tr->failed = 1; tr->eos = 1;
+                printf("movie: track %d (%s): the decoder gives nothing more after %llu samples: treating as its end\n", i, tr->mime, e->samples_read);
+                break;
+            }
+        }
+        if (e->ahead[i].have && (best < 0 || e->ahead[i].us < e->ahead[best].us)) best = i;
+    }
+    if (best < 0) { if (!e->eos) printf("movie: end of stream after %llu samples\n", e->samples_read); e->eos = 1; return ST_END; }
+    e->have_pending = 1; e->pending = e->ahead[best].s; e->pend_track = best; e->pend_us = e->ahead[best].us; e->pend_consumed = 0;
+    return ST_OK;
+}
+#endif
+
 /* ---------------------------------------------------------------- Extractor virtual functions */
 static void ext_dtor_common(Ctx *c, int deleting) {
     Ext *e = ext_of(A0);
@@ -903,9 +1205,16 @@ static void ext_dtor_common(Ctx *c, int deleting) {
         ext_lock(e);
         release_pending(e);
         release_ahead(e, -1);
+#ifdef SSBU_ANDROID
+        for (int i = 0; i < e->ntracks; i++) track_codec_free(&e->tr[i]);
+        if (e->rd) AMediaExtractor_delete(e->rd);
+        if (e->fd >= 0) close(e->fd);
+        e->rd = NULL; e->fd = -1;
+#else
         if (e->rd) IMFSourceReader_Release(e->rd);
         if (e->bs) IMFByteStream_Release(e->bs);
         e->rd = NULL; e->bs = NULL;
+#endif
         ext_unlock(e);
         DeleteCriticalSection(&e->cs);
         printf("movie: Extractor destroyed (%llu samples read)\n", e->samples_read);
@@ -1054,9 +1363,21 @@ static void ext_SeekTo(Ctx *c) {                      /* (int64 timeUs) */
     release_ahead(e, -1);
     e->gen++;
     e->seek_base = e->samples_read;
+#ifdef SSBU_ANDROID
+    /* the codecs keep nothing of before the seek: flushed, their queues emptied, the end of stream forgotten */
+    long hr = AMediaExtractor_seekTo(e->rd, (int64_t)A1, AMEDIAEXTRACTOR_SEEK_PREVIOUS_SYNC) == AMEDIA_OK ? 0 : -1;
+    for (int i = 0; i < e->ntracks; i++) {
+        Track *tr = &e->tr[i];
+        if (tr->codec) AMediaCodec_flush(tr->codec);
+        for (int k = 0; k < tr->qn; k++) movie_sample_free(tr->q[k].s);
+        tr->qn = 0; tr->in_eos = tr->out_eos = 0;
+    }
+    e->src_eos = 0;
+#else
     PROPVARIANT var; PropVariantInit(&var);
     var.vt = VT_I8; var.hVal.QuadPart = (LONGLONG)A1 * 10;
     HRESULT hr = IMFSourceReader_SetCurrentPosition(e->rd, &GUID_NULL, &var);
+#endif
     e->eos = 0;
     for (int i = 0; i < e->ntracks; i++) e->tr[i].eos = 0;
     ext_unlock(e);
@@ -1251,7 +1572,11 @@ static void dec_release_all(Dec *d) {
     if (d->h264) {                                    /* decoded but not handed out, and what the transform holds */
         for (int i = 0; i < d->pend_n; i++) if (d->pend[i].s) IMFSample_Release(d->pend[i].s);
         d->pend_n = 0;
+#ifdef SSBU_ANDROID
+        if (d->acodec) AMediaCodec_flush(d->acodec);
+#else
         if (d->mft) IMFTransform_ProcessMessage(d->mft, MFT_MESSAGE_COMMAND_FLUSH, 0);
+#endif
         d->csd_sent = 0;                              /* after a flush (a seek) the decoder needs the parameter sets again */
         d->eos_in = 0; d->parked_n = 0;               /* Start offers every input buffer again */
     }
@@ -1282,13 +1607,14 @@ static int dec_pump(Dec *d) {
 }
 static void dec_signal(Dec *d, int ev) { if (ev & 2) signal_event(d, 1); if (ev & 1) signal_event(d, 0); }
 
+static int h264_sps_dims(const uint8_t *sps, size_t len, int *width, int *height, double *fps);
+#ifndef SSBU_ANDROID
 /* ---------------------------------------------------------------- H.264 elementary streams (Media Foundation transform)
  * Every call below runs with the decoder locked. h264_open picks the first synchronous H.264 decoder transform Windows
  * registers (Microsoft's software decoder; asynchronous hardware transforms need an event loop and are left out).
  * Known cost, left for later: ProcessInput / ProcessOutput run under d->cs on the game's feed thread, and every
  * ProcessOutput attempt gets a new output buffer of one picture (about 1.4 MB at 720p) when the transform does not
  * provide its own. */
-static int h264_sps_dims(const uint8_t *sps, size_t len, int *width, int *height, double *fps);
 static UINT32 h264_enum(IMFActivate ***act) {         /* the transforms h264_open may use */
     MFT_REGISTER_TYPE_INFO in = {MFMediaType_Video, MFVideoFormat_H264};
     UINT32 n = 0;
@@ -1494,6 +1820,145 @@ static void h264_close(Dec *d) {
     if (d->save) { fclose(d->save); d->save = NULL; }
     free(d->csd); d->csd = NULL; d->csd_len = 0;
 }
+#else
+/* ---------------------------------------------------------------- H.264 elementary streams on AMediaCodec (Android)
+ * The same protocol as the transform above (every call with the decoder locked): the units the game writes are made
+ * Annex B (parameter sets in front of the first one, a start code where one is missing) and queued to the codec; what
+ * comes out waits in pend[] (tight NV12 as the WebM frames, sample_from_codec), with the same back-pressure. */
+static int h264_available(void) {
+    static volatile LONG known = -1;
+    if (known < 0) {
+        AMediaCodec *c = AMediaCodec_createCodecByName("c2.android.avc.decoder");
+        if (!c) c = AMediaCodec_createDecoderByType("video/avc");
+        if (c) AMediaCodec_delete(c);
+        else printf("movie: no H.264 decoder on this device: final smash movies stay unsupported\n");
+        InterlockedExchange(&known, c ? 1 : 0);
+    }
+    return known > 0;
+}
+static int h264_open(Dec *d) {
+    if (d->acodec) return 1;                          /* a second Configure (Windows checks d->mft, which stays NULL here) */
+    const char *used = "c2.android.avc.decoder";
+    AMediaCodec *cd = AMediaCodec_createCodecByName(used);
+    if (!cd) { cd = AMediaCodec_createDecoderByType("video/avc"); used = "the system's decoder"; }
+    if (!cd) { printf("movie: no H.264 decoder could be created\n"); return 0; }
+    AMediaFormat *f = AMediaFormat_new();
+    AMediaFormat_setString(f, AMEDIAFORMAT_KEY_MIME, "video/avc");
+    AMediaFormat_setInt32(f, AMEDIAFORMAT_KEY_WIDTH, d->w > 0 ? d->w : 1280);
+    AMediaFormat_setInt32(f, AMEDIAFORMAT_KEY_HEIGHT, d->h > 0 ? d->h : 720);
+    AMediaFormat_setInt32(f, AMEDIAFORMAT_KEY_COLOR_FORMAT, 0x7F420888);     /* COLOR_FormatYUV420Flexible */
+    AMediaFormat_setInt32(f, AMEDIAFORMAT_KEY_MAX_INPUT_SIZE, (int32_t)d->slot);
+    media_status_t st = AMediaCodec_configure(cd, f, NULL, NULL, 0);
+    if (st == AMEDIA_OK) st = AMediaCodec_start(cd);
+    AMediaFormat_delete(f);
+    if (st != AMEDIA_OK) { printf("movie: H.264 decoder refused the stream (%d)\n", (int)st); AMediaCodec_delete(cd); return 0; }
+    d->acodec = cd;
+    d->a_color = 0x7F420888; d->a_stride = d->w; d->a_slice = d->h; d->a_crop_l = d->a_crop_t = 0;
+    printf("movie: H.264 decoder: %s\n", used);
+    return 1;
+}
+/* Takes every frame the codec has ready into pend[]; waits up to timeout_us for the first one. Returns 1 when the
+ * codec's end of stream came out. */
+static int h264_collect(Dec *d, int64_t timeout_us) {
+    int eos = 0;
+    for (int guard = 0; guard < 4 * MAX_OUT && d->acodec; guard++) {
+        AMediaCodecBufferInfo info;
+        ssize_t ix = AMediaCodec_dequeueOutputBuffer(d->acodec, &info, guard ? 0 : timeout_us);
+        if (ix == AMEDIACODEC_INFO_OUTPUT_FORMAT_CHANGED) {
+            AMediaFormat *f = AMediaCodec_getOutputFormat(d->acodec);
+            d->a_color = fmt_i32(f, AMEDIAFORMAT_KEY_COLOR_FORMAT, d->a_color);
+            d->a_stride = fmt_i32(f, AMEDIAFORMAT_KEY_STRIDE, fmt_i32(f, AMEDIAFORMAT_KEY_WIDTH, d->w));
+            d->a_slice = fmt_i32(f, "slice-height", fmt_i32(f, AMEDIAFORMAT_KEY_HEIGHT, d->h));
+            d->a_crop_l = fmt_i32(f, "crop-left", 0); d->a_crop_t = fmt_i32(f, "crop-top", 0);
+            if (f) AMediaFormat_delete(f);
+            continue;
+        }
+        if (ix == AMEDIACODEC_INFO_OUTPUT_BUFFERS_CHANGED) continue;
+        if (ix < 0) break;
+        size_t cap = 0;
+        uint8_t *buf = AMediaCodec_getOutputBuffer(d->acodec, (size_t)ix, &cap);
+        if (buf && info.size > 0 && (size_t)info.offset + (size_t)info.size <= cap) {
+            Track t;                                      /* the layout sample_from_codec reads */
+            memset(&t, 0, sizeof t);
+            t.kind = 0; t.w = d->w; t.h = d->h; t.color = d->a_color; t.stride = d->a_stride; t.slice_h = d->a_slice; t.crop_l = d->a_crop_l; t.crop_t = d->a_crop_t;
+            MovieSample *ms = sample_from_codec(&t, buf + info.offset, (size_t)info.size);
+            if (ms && d->pend_n < MAX_OUT) { d->pend[d->pend_n].s = ms; d->pend[d->pend_n].ts = info.presentationTimeUs; d->pend[d->pend_n].flags = 0; d->pend_n++; }
+            else { movie_sample_free(ms); d->dropped++; }
+        }
+        AMediaCodec_releaseOutputBuffer(d->acodec, (size_t)ix, false);
+        if (info.flags & AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM) { eos = 1; break; }
+    }
+    return eos;
+}
+#define H264_PEND_LIMIT 4                             /* as the Windows path: see there */
+static int h264_pump(Dec *d) {
+    int ev = 0;
+    while (d->pend_n > 0) {
+        int o = -1;
+        for (int i = 0; i < d->nout; i++) if (d->out[i].state == OUT_FREE) { o = i; break; }
+        if (o < 0) break;
+        d->out[o].s = d->pend[0].s; d->out[o].ts = d->pend[0].ts; d->out[o].flags = d->pend[0].flags;
+        d->out[o].state = OUT_READY;
+        d->out_list[d->out_n++] = o;
+        memmove(d->pend, d->pend + 1, (size_t)(d->pend_n - 1) * sizeof d->pend[0]);
+        d->pend_n--;
+        ev |= 2;
+    }
+    while (!d->eos_in && d->pend_n < H264_PEND_LIMIT && d->parked_n > 0) {
+        int i = d->parked[--d->parked_n];
+        d->in_state[i] = IN_OFFERED;
+        d->in_list[d->in_n++] = i;
+        ev |= 1;
+    }
+    return ev;
+}
+static int h264_send(Dec *d, int i, int off, int size, int64_t ts, uint32_t flags) {
+    if (off < 0 || size < 0 || (size_t)off + (size_t)size > d->slot) { off = 0; size = 0; }
+    const unsigned char *data = d->mem + (size_t)i * d->slot + off;
+    if (d->save && size > 0) fwrite(data, 1, (size_t)size, d->save);
+    if (size > 0 && d->acodec) {
+        int sc = !(size >= 3 && data[0] == 0 && data[1] == 0 && (data[2] == 1 || (size >= 4 && data[2] == 0 && data[3] == 1)));
+        size_t pre = d->csd_sent ? 0 : d->csd_len, total = pre + (sc ? 4 : 0) + (size_t)size;
+        ssize_t in = AMediaCodec_dequeueInputBuffer(d->acodec, 10000);
+        for (int k = 0; in < 0 && k < 50; k++) { h264_collect(d, 2000); in = AMediaCodec_dequeueInputBuffer(d->acodec, 10000); }
+        size_t cap = 0;
+        uint8_t *p = in >= 0 ? AMediaCodec_getInputBuffer(d->acodec, (size_t)in, &cap) : NULL;
+        if (p && total <= cap) {
+            size_t o = 0;
+            if (pre) { memcpy(p, d->csd, pre); o = pre; }
+            if (sc) { static const unsigned char code[4] = {0, 0, 0, 1}; memcpy(p + o, code, 4); o += 4; }
+            memcpy(p + o, data, (size_t)size);
+            if (AMediaCodec_queueInputBuffer(d->acodec, (size_t)in, 0, total, ts > 0 ? (uint64_t)ts : 0, 0) == AMEDIA_OK) d->csd_sent = 1;
+        } else {
+            if (in >= 0) AMediaCodec_queueInputBuffer(d->acodec, (size_t)in, 0, 0, ts > 0 ? (uint64_t)ts : 0, 0);
+            if (!d->warned_h264) { d->warned_h264 = 1; printf("movie: H.264 decoder input refused (%zu bytes, buffer %zd of %zu)\n", total, in, cap); }
+        }
+        h264_collect(d, 0);
+    }
+    if (ts > d->last_ts) d->last_ts = ts;
+    if ((flags & FLAG_EOS) && !d->eos_in) {           /* the rest of the pictures, then one end-of-stream buffer */
+        d->eos_in = 1;
+        if (d->acodec) {
+            ssize_t in = AMediaCodec_dequeueInputBuffer(d->acodec, 20000);
+            if (in >= 0) AMediaCodec_queueInputBuffer(d->acodec, (size_t)in, 0, 0, 0, AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM);
+            for (int k = 0; k < 100 && d->pend_n < MAX_OUT - 1; k++) if (h264_collect(d, 10000)) break;
+        }
+        if (d->pend_n < MAX_OUT) { d->pend[d->pend_n].s = NULL; d->pend[d->pend_n].ts = d->last_ts; d->pend[d->pend_n].flags = FLAG_EOS; d->pend_n++; }
+        printf("movie: Decoder(video): H.264 end of stream after %llu inputs\n", d->in_count);
+    }
+    if (d->eos_in) d->in_state[i] = IN_CODEC;
+    else if (d->pend_n >= H264_PEND_LIMIT) { d->in_state[i] = IN_CODEC; d->parked[d->parked_n++] = i; }
+    else { d->in_state[i] = IN_OFFERED; d->in_list[d->in_n++] = i; }
+    return h264_pump(d) | (d->in_state[i] == IN_OFFERED ? 1 : 0);
+}
+static void h264_close(Dec *d) {
+    for (int i = 0; i < d->pend_n; i++) if (d->pend[i].s) IMFSample_Release(d->pend[i].s);
+    d->pend_n = 0;
+    if (d->acodec) { AMediaCodec_stop(d->acodec); AMediaCodec_delete(d->acodec); d->acodec = NULL; }
+    if (d->save) { fclose(d->save); d->save = NULL; }
+    free(d->csd); d->csd = NULL; d->csd_len = 0;
+}
+#endif
 
 static void dec_dtor_common(Ctx *c, int deleting) {
     Dec *d = dec_of(A0);
@@ -1846,6 +2311,21 @@ static void dec_AcquireOutputBufferIndex(Ctx *c) {    /* (int *index, int64 *tim
     RET(r);
 }
 
+#ifdef SSBU_ANDROID
+/* Copies the decoded sample of slot i into the game's buffer; returns the number of bytes written. The sample is already
+ * what the game reads (sample_from_codec: tight NV12 of the track's size, or 16-bit PCM). */
+static size_t copy_sample(Dec *d, OutBuf *s, unsigned char *dst, size_t cap) {
+    if (!s->s || !s->s->data) return 0;
+    if (d->is_video && cap < s->s->len) {
+        if (!d->warned_small) { d->warned_small = 1; printf("movie: game buffer of %zu bytes is smaller than a %dx%d NV12 frame (%zu)\n", cap, d->w, d->h, s->s->len); }
+        return 0;
+    }
+    size_t n = s->s->len < cap ? s->s->len : cap;
+    if (!d->is_video && s->s->len > cap && !d->warned_small) { d->warned_small = 1; printf("movie: game audio buffer of %zu bytes is smaller than a decoded block (%zu)\n", cap, s->s->len); }
+    memcpy(dst, s->s->data, n);
+    return n;
+}
+#else
 /* Copies the decoded sample of slot i into the game's buffer; returns the number of bytes written. */
 static size_t copy_sample(Dec *d, OutBuf *s, unsigned char *dst, size_t cap) {
     if (!s->s) return 0;
@@ -1885,6 +2365,7 @@ static size_t copy_sample(Dec *d, OutBuf *s, unsigned char *dst, size_t cap) {
     IMFMediaBuffer_Release(mb);
     return written;
 }
+#endif
 
 static void dec_GetOutputBuffer(Ctx *c) {             /* (int index, Buffer *out[, MediaData *format]) */
     Dec *d = dec_of(A0);
@@ -1985,10 +2466,16 @@ static void extractor_ctor(Ctx *c) {                  /* Extractor(ContainerType
     build_vtables();
     Ext *e = calloc(1, sizeof *e);
     InitializeCriticalSection(&e->cs);
+#ifdef SSBU_ANDROID
+    e->fd = -1;
+#define MOVIE_BACKEND "the NDK media library"
+#else
+#define MOVIE_BACKEND "Media Foundation"
+#endif
     wr64(A0, (uint64_t)(uintptr_t)g_ext_vtable);
     wr64(A0 + 8, (uint64_t)(uintptr_t)e);
     input_mark("movie");
-    printf("movie: Extractor created (container type %u: %s) on Media Foundation\n", (unsigned)A1, A1 == 1 ? "mp4" : A1 == 2 ? "mkv" : A1 == 3 ? "webm" : "?");
+    printf("movie: Extractor created (container type %u: %s) on " MOVIE_BACKEND "\n", (unsigned)A1, A1 == 1 ? "mp4" : A1 == 2 ? "mkv" : A1 == 3 ? "webm" : "?");
 }
 
 static void decoder_ctor(Ctx *c) {                    /* Decoder(DecoderType, DecoderOutputFormat, DecoderMode, int) */

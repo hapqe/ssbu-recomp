@@ -1,7 +1,9 @@
 package me.hapke.opensmash;
 
 import android.app.AlertDialog;
+import android.content.Context;
 import android.content.Intent;
+import android.hardware.input.InputManager;
 import android.os.Bundle;
 import android.system.Os;
 import android.text.InputFilter;
@@ -30,6 +32,7 @@ public class GameActivity extends SDLActivity {
     private String game, libdir;
     private ArrayList<String> env;
     private TouchControls touch;
+    private InputManager.InputDeviceListener padWatch;
 
     @Override
     protected void onCreate(Bundle saved) {
@@ -39,16 +42,34 @@ public class GameActivity extends SDLActivity {
         libdir = i.getStringExtra("libdir");
         env = i.getStringArrayListExtra("env");
         if (env == null) env = new ArrayList<>();
+        /* the on-screen pad exists from the start (android_main.c): it is player 1, the keyboard takes a later slot */
+        if (i.getBooleanExtra("touch", true)) env.add("SSBU_TOUCH_PAD=1");
         for (String kv : env) {
             int eq = kv.indexOf('=');
             if (eq > 0) try { Os.setenv(kv.substring(0, eq), kv.substring(eq + 1), true); } catch (Exception ignored) { }
         }
         super.onCreate(saved);
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
-        if (i.getBooleanExtra("touch", true) && mLayout != null) {
+        /* touch_mode (LauncherActivity): 0 auto = shown while no controller is connected, 1 on, 2 off. A controller that
+         * connects takes player 1 from the on-screen pad (nnpad_sdl.c); one that was there at the start left it out (touch) */
+        int mode = i.getIntExtra("touch_mode", i.getBooleanExtra("touch", true) ? 1 : 2);
+        if (mode != 2 && mLayout != null) {
             touch = new TouchControls(this);
             mLayout.addView(touch, new ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+            if (!i.getBooleanExtra("touch", true)) touch.setVisibility(View.GONE);
         }
+        if (mode == 0 && touch != null) {
+            padWatch = new InputManager.InputDeviceListener() {
+                @Override public void onInputDeviceAdded(int id) { padsChanged(); }
+                @Override public void onInputDeviceRemoved(int id) { padsChanged(); }
+                @Override public void onInputDeviceChanged(int id) { padsChanged(); }
+            };
+            ((InputManager) getSystemService(Context.INPUT_SERVICE)).registerInputDeviceListener(padWatch, null);
+        }
+    }
+
+    private void padsChanged() {
+        if (touch != null) touch.setVisibility(LauncherActivity.controllerName() == null ? View.VISIBLE : View.GONE);
     }
 
     @Override
@@ -72,6 +93,7 @@ public class GameActivity extends SDLActivity {
 
     @Override
     protected void onDestroy() {
+        if (padWatch != null) ((InputManager) getSystemService(Context.INPUT_SERVICE)).unregisterInputDeviceListener(padWatch);
         super.onDestroy();
         /* the runtime cannot be restarted inside a process: the game process ends with its activity */
         if (isFinishing()) android.os.Process.killProcess(android.os.Process.myPid());

@@ -592,7 +592,10 @@ int compat_stat(const char *path, struct stat *st);
 #define freopen(p, m, f) compat_freopen((p), (m), (f))
 #define remove(p) compat_remove(p)
 #define rename(a, b) compat_rename((a), (b))
+#define fread(p, s, n, f) compat_fread((p), (s), (n), (f))     /* the write watch: the pages it fills get their right first */
 #endif
+size_t compat_fread(void *p, size_t size, size_t n, FILE *f);
+void compat_ww_prepare(void *p, size_t n);
 #define _wfopen(p, m) compat_wfopen((p), (m))
 FILE *compat_wfopen(const WCHAR *p, const WCHAR *m);
 
@@ -1036,4 +1039,10 @@ void CoTaskMemFree(LPVOID p);
 #ifdef __cplusplus
 }
 #endif
+
+/* ---------------------------------------------------------------- upstream plat_ helpers (runtime/plat/windows.h) the shared
+ * runtime calls off Windows; the Android versions are in win32_compat.c */
+int plat_backtrace(uintptr_t *pcs, int max);                        /* return addresses of this thread, innermost first */
+void plat_print_build_identity(const char *exe, size_t dir_len);    /* boot.c: the log's "build:" lines */
+int plat_current_stack(uintptr_t *lo, uintptr_t *hi);                /* the stack this thread runs on now (a fiber's or its own) */
 #endif
