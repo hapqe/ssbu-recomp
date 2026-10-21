@@ -12,6 +12,10 @@
 #include <stdarg.h>
 #include <math.h>
 #include "tex_decode.h"
+static int g_targets_always_end;                 /* SSBU_VK_TARGETS_END (see g_targets_kept) */
+#ifdef SSBU_ANDROID
+#include <dlfcn.h>
+#endif
 static int have_targets_live(void);
 
 #define VKD(X) X(vkCreateBuffer) X(vkDestroyBuffer) X(vkGetBufferMemoryRequirements) X(vkAllocateMemory) X(vkFreeMemory) X(vkBindBufferMemory) X(vkMapMemory) \
@@ -97,6 +101,7 @@ static void vkd_device_info(VkDeviceCreateInfo *di, const VkExtensionProperties 
     vkGetPhysicalDeviceMemoryProperties = vk_sym("vkGetPhysicalDeviceMemoryProperties");
     vkGetDeviceProcAddr = vk_sym("vkGetDeviceProcAddr");
     D.debug = getenv("SSBU_VK_DEBUG") && atoi(getenv("SSBU_VK_DEBUG"));
+    g_targets_always_end = getenv("SSBU_VK_TARGETS_END") && atoi(getenv("SSBU_VK_TARGETS_END"));
     D.f2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2; D.f11.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES;
     D.f12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES; D.f13.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
     D.f2.pNext = &D.f11; D.f11.pNext = &D.f12; D.f12.pNext = &D.f13; tail = &D.f13.pNext;
@@ -294,7 +299,29 @@ static struct {
     LONG64 dispatches, cb_bytes, cb_syncs, cb_draws, cb_made, cb_waits, cb_wait_ticks, cb_guest_words, cb_conflict_words, readbacks;
 } R;
 
-static void pass_end(void) { if (R.in_pass) { vkCmdEndRendering(R.cmd); R.in_pass = 0; CKPT_OP("pass end (w, h)", 0, R.pass_w, R.pass_h, 0); } }
+/* SSBU_VK_SPLITLOG=1: what ends the big passes (a colour target of 1280 pixels or wider with depth) in frames with
+ * fighters, by source line and caller ("nvn_vk_split:" lines at exit). On a tiling GPU every end of such a pass that the
+ * frame later continues stores its targets to memory and the next pass loads them again. */
+static volatile LONG g_in_fight;
+static struct { int line; void *ra; LONG64 n; } g_pe[64];
+static int g_pe_on = -1, g_pe_nk;
+static void pass_end_at(int line, void *ra) {
+    if (!R.in_pass) return;
+    if (g_pe_on < 0) g_pe_on = getenv("SSBU_VK_SPLITLOG") && atoi(getenv("SSBU_VK_SPLITLOG"));
+    if (g_pe_on && g_in_fight && R.pass_w >= 1280 && R.depth.tex) {
+        int k;
+        for (k = 0; k < g_pe_nk && !(g_pe[k].line == line && g_pe[k].ra == ra); k++) ;
+        if (k == g_pe_nk && k < 64) { g_pe[k].line = line; g_pe[k].ra = ra; g_pe_nk++; }
+        if (k < 64) g_pe[k].n++;
+    }
+    vkCmdEndRendering(R.cmd); R.in_pass = 0; CKPT_OP("pass end (w, h)", 0, R.pass_w, R.pass_h, 0);
+}
+#define pass_end() pass_end_at(__LINE__, __builtin_return_address(0))
+/* The game sets the same render targets again many times a frame (a fight: 8.8 times per frame on the 1080p scene target,
+ * Marble 2026-10-22, SSBU_VK_SPLITLOG), and each time ended the pass: on a tiling GPU (Adreno) every end stores the
+ * colour and depth targets to memory and the next pass loads them again (the scene pass: 8.0 ms of GPU time per frame,
+ * 5.5 passes). The same targets now keep the pass open. SSBU_VK_TARGETS_END=1: every OP_TARGETS ends the pass, as before. */
+static LONG64 g_targets_kept;
 static LONG64 g_tm[12];                          /* ticks: 0 wait for a submission, 1 copy-back, 2 dispatch, 3 batch replay, 4 present, 5 pipelines, 6 modules, 7 copy-back wait at batch start, 8 draw preparation */
 static LONG64 tk(void) { LARGE_INTEGER t; QueryPerformanceCounter(&t); return t.QuadPart; }
 /* Session 5, SSBU_VK_GPUTIME=1: two timestamp queries per command buffer (written at its first and after its last command),
@@ -3111,6 +3138,14 @@ static void exec(const Cmd *m, int depth) {
     case OP_TARGETS: {
         const TargetRef *col = (const TargetRef *)blob, *dep = col + 8;
         int n = (int)a[0] < 8 ? (int)a[0] : 8;
+        if (R.in_pass && !g_targets_always_end) {      /* the targets of the open pass again: it goes on (see g_targets_always_end) */
+            TargetRef nc[8], nd;
+            int nn = 0;
+            memset(nc, 0, sizeof nc); memset(&nd, 0, sizeof nd);
+            for (int i = 0; i < n; i++) if (col[i].tex && !col[i].tex->dead) { nc[i] = col[i]; nn = i + 1; }
+            if (dep->tex && !dep->tex->dead) nd = *dep;
+            if (nn == R.ncol && !memcmp(nc, R.col, sizeof nc) && !memcmp(&nd, &R.depth, sizeof nd)) { R.dyn_dirty = 1; g_targets_kept++; break; }
+        }
         pass_end();
         for (int i = 0; i < R.ncol; i++) if (R.col[i].tex && R.col[i].tex->vk) ((VTex *)R.col[i].tex->vk)->feedback = 0;
         if (R.depth.tex && R.depth.tex->vk) ((VTex *)R.depth.tex->vk)->feedback = 0;
@@ -4202,6 +4237,15 @@ static void frstat_report(void) {
     {   LARGE_INTEGER fq; QueryPerformanceFrequency(&fq);
         printf("nvn_vk_first: %lld battle frames, %lld of them over 20 ms between presents | frames in which a pipeline was drawn for the first time: %lld (%lld pipelines: %lld linked at the draw from ready stage libraries, %lld compiled or waited for, %lld in a pass signature never seen; %.2f ms in all making them) | of those frames over 20 ms: %lld (%lld of them also made or read a texture at its use)\n",
                (long long)g_fu_fight_frames, (long long)g_fu_fight_slow, (long long)g_fu_frames, (long long)g_fu_total, (long long)g_fu_linked, (long long)g_fu_made, (long long)g_fu_newsig, (double)g_fu_tk * 1000.0 / (double)fq.QuadPart, (long long)g_fu_slow, (long long)g_fu_slow_tex);
+    }
+    if (g_pe_on > 0) printf("nvn_vk_split: %lld times the targets of the open pass were set again (the pass went on)\n", (long long)g_targets_kept);
+    if (g_pe_on > 0) for (int k = 0; k < g_pe_nk; k++) {      /* SSBU_VK_SPLITLOG */
+        const char *sym = "?"; long off = 0;
+#ifdef SSBU_ANDROID
+        Dl_info di;
+        if (dladdr(g_pe[k].ra, &di) && di.dli_sname) { sym = di.dli_sname; off = (long)((char *)g_pe[k].ra - (char *)di.dli_saddr); }
+#endif
+        printf("nvn_vk_split: %8lld big-pass ends in fights at line %d, called from %s+0x%lx\n", (long long)g_pe[k].n, g_pe[k].line, sym, off);
     }
     if (g_pt_on > 0 && g_pt_frames) {             /* SSBU_VK_PASSTIME */
         double tot = 0;

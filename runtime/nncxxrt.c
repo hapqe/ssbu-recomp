@@ -122,7 +122,33 @@ static int rd_bring_up_to_date(RdRecord *r, uint64_t p, size_t n) {      // PR #
     if (!ok) r->lo = r->hi = 0;
     return ok;
 }
+#ifdef SSBU_ANDROID
+#include <errno.h>
+#include <sys/uio.h>
+#include <unistd.h>
+/* Android: the kernel copies [p, p + n) for us or says EFAULT: one system call (~1 us), exact, for any address. VirtualQuery
+ * outside the runtime's own allocations parses /proc/self/maps, which a throw in a fight asked for every few frames
+ * (Marble, 2026-10-22, simpleperf off-CPU profile of the game thread: 5.9 % of its wall time in maps reading under
+ * eh_throw, and the reading holds the address-space lock against every other thread's page faults and mprotect calls).
+ * -1 = cannot tell (larger than the buffer, the call refused): ask VirtualQuery. */
+static int rd_probe(uint64_t p, size_t n) {
+    static int off = -1;
+    static pid_t pid;
+    if (off < 0) { pid = getpid(); off = getenv("SSBU_READABLE_VQ") != NULL; }
+    char buf[256];
+    if (off || n > sizeof buf || p + n < p) return -1;
+    struct iovec l = {buf, n}, r = {(void *)(uintptr_t)p, n};
+    ssize_t got = process_vm_readv(pid, &l, 1, &r, 1, 0);
+    if (got == (ssize_t)n) return 1;
+    if (got < 0 && errno != EFAULT) { off = 1; return -1; }
+    return 0;
+}
+#endif
 int cxxrt_readable(uint64_t p, size_t n) {
+#ifdef SSBU_ANDROID
+    if (p < 0x10000) return 0;
+    { int r = rd_probe(p, n); if (r >= 0) return r; }
+#endif
     static __declspec(thread) RdRecord t_ok[4];
     static __declspec(thread) unsigned t_next;
     MEMORY_BASIC_INFORMATION mi;
