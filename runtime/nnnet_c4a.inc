@@ -546,6 +546,22 @@ static void socket_Poll(Ctx *c) {                         /* (pollfd *, nfds, ti
     free(h); free(objs);
     if (e) so_fail(c, e); else RETI(ready);
 }
+#ifdef _WIN32
+#define HOST_SO(level, name) name                         /* Winsock uses the BSD option numbers the guest passes */
+#else
+/* Linux build: the guest's BSD SOL_SOCKET option numbers -> Linux's (TCP_NODELAY is 1 on both) */
+static int HOST_SO(int level, int name) {
+    if (level != 0xffff) return name;
+    switch (name) {
+    case 0x1: return SO_DEBUG;      case 0x2: return SO_ACCEPTCONN; case 0x4: return SO_REUSEADDR; case 0x8: return SO_KEEPALIVE;
+    case 0x10: return SO_DONTROUTE; case 0x20: return SO_BROADCAST; case 0x80: return SO_LINGER;   case 0x100: return SO_OOBINLINE;
+    case 0x200: return SO_REUSEPORT; case 0x1001: return SO_SNDBUF; case 0x1002: return SO_RCVBUF; case 0x1003: return SO_SNDLOWAT;
+    case 0x1004: return SO_RCVLOWAT; case 0x1005: return SO_SNDTIMEO; case 0x1006: return SO_RCVTIMEO; case 0x1007: return SO_ERROR;
+    case 0x1008: return SO_TYPE;
+    default: return -1;                                   /* unknown: the call fails with ENOPROTOOPT */
+    }
+}
+#endif
 static void socket_GetSockOpt(Ctx *c) {                   /* (fd, level, name, void *, socklen_t *) */
     uint64_t val = A3, lenp = A4;
     int level = (int)A1, name = (int)A2;
@@ -559,13 +575,17 @@ static void socket_GetSockOpt(Ctx *c) {                   /* (fd, level, name, v
         char tmp[64];
         int tl = sizeof tmp;
         if (name == 0x800 && level == 0xffff) { memset(tmp, 0, 4); tl = 4; }          /* SO_NOSIGPIPE: there are no signals */
-        else if (getsockopt(o->s, level == 0xffff ? SOL_SOCKET : IPPROTO_TCP, name, tmp, &tl) != 0) e = so_wsa_errno(WSAGetLastError(), 0);
+        else if (getsockopt(o->s, level == 0xffff ? SOL_SOCKET : IPPROTO_TCP, HOST_SO(level, name), tmp, &tl) != 0) e = so_wsa_errno(WSAGetLastError(), 0);
         if (!e) {
             uint8_t out[16] = {0};
             uint32_t ol = 4;
             if (level == 0xffff && name == 0x1007) { int v = so_wsa_errno(*(int *)tmp, 0); memcpy(out, &v, 4); }
             else if (level == 0xffff && name == 0x80) { LINGER *l = (LINGER *)tmp; int v[2] = {l->l_onoff, l->l_linger}; memcpy(out, v, 8); ol = 8; }
+#ifdef _WIN32
             else if (level == 0xffff && (name == 0x1005 || name == 0x1006)) { DWORD ms = *(DWORD *)tmp; int64_t tv[2] = {ms / 1000, (ms % 1000) * 1000}; memcpy(out, tv, 16); ol = 16; }
+#else
+            else if (level == 0xffff && (name == 0x1005 || name == 0x1006)) { struct timeval *t = (struct timeval *)tmp; int64_t tv[2] = {t->tv_sec, t->tv_usec}; memcpy(out, tv, 16); ol = 16; }
+#endif
             else { int v = tl >= 4 ? *(int *)tmp : (tl >= 1 ? tmp[0] != 0 : 0); memcpy(out, &v, 4); }
             if (ol > cap) ol = cap;
             memcpy((void *)(uintptr_t)val, out, ol);
@@ -589,11 +609,16 @@ static void socket_SetSockOpt(Ctx *c) {                   /* (fd, level, name, c
         else { LINGER l; l.l_onoff = (u_short)(M32(val) != 0); l.l_linger = (u_short)M32(val + 4); r = setsockopt(o->s, SOL_SOCKET, SO_LINGER, (char *)&l, sizeof l); }
     } else if (level == 0xffff && (name == 0x1005 || name == 0x1006)) {
         DWORD ms = len >= 16 ? (DWORD)(M64(val) * 1000 + M64(val + 8) / 1000) : len >= 4 ? M32(val) : 0;
+#ifdef _WIN32
         if (len < 4) e = 22; else r = setsockopt(o->s, SOL_SOCKET, name, (char *)&ms, sizeof ms);
+#else
+        struct timeval tv = {ms / 1000, (ms % 1000) * 1000};
+        if (len < 4) e = 22; else r = setsockopt(o->s, SOL_SOCKET, HOST_SO(level, name), &tv, sizeof tv);
+#endif
     } else if (level == 0xffff && name == 0x800) r = 0;   /* SO_NOSIGPIPE */
     else if (level == 0xffff || (level == 6 && name == 1)) {
         if (len < 4) e = 22;
-        else { int v = (int)M32(val); r = setsockopt(o->s, level == 0xffff ? SOL_SOCKET : IPPROTO_TCP, name, (char *)&v, sizeof v); }
+        else { int v = (int)M32(val); r = setsockopt(o->s, level == 0xffff ? SOL_SOCKET : IPPROTO_TCP, HOST_SO(level, name), (char *)&v, sizeof v); }
     }                                                     /* other levels: [suyu] SetSockOptImpl accepts and ignores */
     if (!e && r != 0) e = so_wsa_errno(WSAGetLastError(), 0);
     so_put(o);

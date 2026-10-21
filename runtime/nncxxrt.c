@@ -162,6 +162,7 @@ void cxxrt_guest_delete(Ctx *c, uint64_t p) {            /* the game's own opera
     c->x[0] = x0;
 }
 void cxxrt_print_guest_stack(void) {
+#ifdef _WIN32
     CONTEXT ctx;
     RtlCaptureContext(&ctx);
     printf("guest call stack (innermost first):\n");
@@ -176,6 +177,16 @@ void cxxrt_print_guest_stack(void) {
         RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, ctx.Rip, rf, &ctx, &hd, &est, NULL);
         if (!ctx.Rip) break;
     }
+#else
+    uintptr_t pcs[600];
+    int n = plat_backtrace(pcs, 600);
+    printf("guest call stack (innermost first):\n");
+    uint64_t last = 0;
+    for (int i = 0, shown = 0; i < n && shown < 48; i++) {
+        uint64_t g = guest_function_of(pcs[i]);
+        if (g && g != last) { printf("  f_%llx\n", (unsigned long long)g); trace_printf("  f_%llx\n", (unsigned long long)g); shown++; last = g; }
+    }
+#endif
 }
 static void fatal(Ctx *c, const char *fmt, ...) {
     char msg[768];
@@ -400,6 +411,17 @@ static EhState *eh_state(Ctx *c) {
     return s;
 }
 uint64_t eh_in_flight(Ctx *c) { return eh_state(c)->in_flight; }
+/* nnunwind.c, smashline's interpreter stub took exception `exc` (its landing code ran and returns to the interpreter's
+ * caller): the exception is over for this context. The stub's code never calls __cxa_begin_catch / __cxa_end_catch, so the
+ * context stayed "with an exception" for good (uncaught 1, never idle again, so never reused): HDR's script fibers throw
+ * L2CExceptionShutdown this way many times a minute. `uncaught_before` = the count before the landing code ran. */
+void eh_stub_done(Ctx *c, uint64_t exc, int uncaught_before) {
+    EhState *st = eh_state(c);
+    st->in_flight = 0;
+    if (st->uncaught == uncaught_before && st->uncaught > 0) st->uncaught--;
+    if (st->caught == exc) { ExcHeader *h = exc_header(exc); st->caught = h ? h->next : 0; }
+}
+int eh_uncaught_count(Ctx *c) { return eh_state(c)->uncaught; }
 
 /* ---- loaded images */
 typedef struct { uint64_t base, size, hdr, table; uint32_t count; } EhImage;

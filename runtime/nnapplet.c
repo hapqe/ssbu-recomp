@@ -60,6 +60,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <windows.h>
+#ifndef _WIN32
+#include <sys/wait.h>
+#endif
 #include "sdklift.h"
 
 #define A0 (c->x[0])
@@ -71,6 +74,7 @@
 #define P(v) ((uint64_t)(uintptr_t)(v))
 
 void os_init_event(uint64_t key, int autoclear);          /* os_threads.c */
+void os_signal_event(uint64_t key);
 
 /* ================================================================ nn::web */
 #define WEB_RESULT_TERMINATED 0x2d2u
@@ -189,7 +193,7 @@ typedef struct {
 
 #ifdef SSBU_ANDROID
 static int kbd_run_dialog(KbdDialog *k) { (void)k; return 0; }      /* Android: osk_run (android/runtime/osk_android.c) always answers */
-#else
+#elif defined(_WIN32)
 #define IDC_EDIT 1001
 #define IDC_INFO 1002
 static INT_PTR CALLBACK kbd_proc(HWND dlg, UINT msg, WPARAM wp, LPARAM lp) {
@@ -252,6 +256,42 @@ static int kbd_run_dialog(KbdDialog *k) {
     INT_PTR r = DialogBoxIndirectParamW(GetModuleHandleW(NULL), (DLGTEMPLATE *)buf, NULL, kbd_proc, (LPARAM)k);
     if (r == -1) { printf("nn::swkbd: the text dialog could not be created (error %lu); answered as cancelled\n", GetLastError()); return 0; }
     return (int)r;
+}
+#else
+/* Linux build: the desktop's own text prompt (kdialog, else zenity), run as a child process. No prompt program, or
+ * closed without OK: cancelled. */
+static int kbd_run_dialog(KbdDialog *k) {
+    char info[1800], init[1600], cmd[4096], out[2048];
+    char hdr[600], sub[600], guide[600];
+    WideCharToMultiByte(CP_UTF8, 0, k->header, -1, hdr, sizeof hdr, NULL, NULL);
+    WideCharToMultiByte(CP_UTF8, 0, k->sub, -1, sub, sizeof sub, NULL, NULL);
+    WideCharToMultiByte(CP_UTF8, 0, k->guide, -1, guide, sizeof guide, NULL, NULL);
+    WideCharToMultiByte(CP_UTF8, 0, k->initial, -1, init, sizeof init, NULL, NULL);
+    snprintf(info, sizeof info, "%s%s%s%s%s", hdr, hdr[0] && sub[0] ? "\n" : "", sub, (hdr[0] || sub[0]) && guide[0] ? "\n" : "", guide);
+    if (!info[0]) snprintf(info, sizeof info, "Enter text");
+    /* single quotes around each argument; a quote inside becomes '\'' */
+    char qi[3700], qt[3300];
+    char *d = qi; for (const char *p = info; *p && d < qi + sizeof qi - 6; p++) { if (*p == '\'') { memcpy(d, "'\\''", 4); d += 4; } else *d++ = *p; } *d = 0;
+    d = qt; for (const char *p = init; *p && d < qt + sizeof qt - 6; p++) { if (*p == '\'') { memcpy(d, "'\\''", 4); d += 4; } else *d++ = *p; } *d = 0;
+    int kd = system("command -v kdialog >/dev/null 2>&1") == 0, zn = !kd && system("command -v zenity >/dev/null 2>&1") == 0;
+    if (kd) snprintf(cmd, sizeof cmd, "kdialog --title 'Software keyboard (SSBU native)' %s '%s' '%s'", k->password ? "--password" : "--inputbox", qi, k->password ? "" : qt);
+    else if (zn) snprintf(cmd, sizeof cmd, "zenity --entry --title='Software keyboard (SSBU native)' --text='%s' --entry-text='%s' %s", qi, qt, k->password ? "--hide-text" : "");
+    if (kd || zn) for (;;) {
+        FILE *f = popen(cmd, "r");
+        if (!f) return 0;
+        size_t n = fread(out, 1, sizeof out - 1, f);
+        int st = pclose(f);
+        out[n] = 0;
+        if (n && out[n - 1] == '\n') out[--n] = 0;
+        if (st == -1 || !WIFEXITED(st) || WEXITSTATUS(st) != 0) return 0;      /* cancelled or closed */
+        k->text[0] = 0;
+        MultiByteToWideChar(CP_UTF8, 0, out, -1, k->text, SWKBD_MAX_CHARS + 1);
+        k->text[SWKBD_MAX_CHARS] = 0;
+        if (k->max_len > 0 && (int)wcslen(k->text) > k->max_len) k->text[k->max_len] = 0;
+        if ((int)wcslen(k->text) >= k->min_len) return 1;
+    }
+    printf("nn::swkbd: no text prompt program (kdialog or zenity): answered as cancelled (SSBU_SWKBD=text:<answer> answers without one)\n");
+    return 0;
 }
 #endif
 static void copy_w(wchar_t *dst, uint64_t src, int max) {
@@ -406,6 +446,122 @@ static void nfp_settings_applet(Ctx *c) {
     RET(NFP_SETTINGS_CLOSED);
 }
 
+/* ================================================================ nn::web for the Skyline plugins (skyline-web)
+ * Names the game never imports: the plugins build ShowOfflineHtmlPageArg with the C2 constructor and two more setters,
+ * read the return value back, and ARCropolis / hdr-launcher drive OfflineWebSession (a page that talks to the plugin
+ * through content messages). All of it answers "the page was opened and the user closed it at once"; every call logs
+ * the document path so the log shows what a plugin wanted to show.
+ * Layouts read in sdk.elf:
+ *   [sdk] 0x3bd980 ShowOfflineHtmlPageArg(const char *) (C1 == C2, same address): the default argument, then the
+ *   document path as TLV 6 of 0xc00 bytes. The argument TLV setters ([sdk] 0x3bdaf0 SetFooterEnabled, 0x3be1a0
+ *   SetBootLoadingIconEnabled, 0x3bfb90 SetBootMode) look for an entry of their type: same size -> overwritten, else a new
+ *   entry { u16 type, u16 size, u32 0, data } is appended at the end and the count at +0 incremented, provided it ends
+ *   within the 0x2000 bytes. SetBootLoadingIconEnabled = TLV 0x35 (u8), SetBootMode = TLV 0x41 (u32 WebSessionBootMode).
+ *   [sdk] 0x3be5e0 OfflineHtmlPageReturnValue::GetLastUrl = this + 8; 0x3be5f0 GetLastUrlSize = *(u64 *)(this + 0x1008);
+ *   0x3be5d0 GetOfflineExitReason = *(u32 *)this.
+ *   [sdk] 0x3bfc40 OfflineWebSession: one word, the work buffer; 0x3bfc60 GetWorkBufferSize = 0xd0; 0x3bfc70 Initialize
+ *   stores the buffer; 0x3bfca0 Start(SystemEventType **out, const ShowOfflineHtmlPageArg &) -> Result (library applet
+ *   0x17); 0x3bfe70 WaitForExit pops 0x1010 bytes into the return value -> Result (0x2d2 without one); Appear,
+ *   RequestExit, TrySendContentMessage, TryReceiveContentMessage are forwarded to the session (bool results).
+ * Here the session's applet ends at once: Start succeeds and hands out an exit event that is already signalled (key
+ * work + 0x40: the work buffer is only ever read by SDK code, so its contents are ours), sent messages are accepted and
+ * dropped (logged), and every receive returns an EMPTY message (size 1, just the NUL): skyline-web's recv() then yields
+ * "", recv_json() fails, and the plugins' `while let Ok(msg) = session.recv_json()` menu loops end; WaitForExit fills the
+ * return value as ShowOfflineHtmlPage does. NOT the console's behaviour for a page nobody closes; a plugin that waits
+ * for one specific message (hdr-launcher's request loop) would keep receiving empty ones. */
+static void web_tlv_set(uint64_t arg, uint16_t type, const void *data, uint16_t size) {
+    uint32_t count = rd16(arg), off = 8;
+    for (uint32_t i = 0; i < count; i++) {
+        uint16_t t = rd16(arg + off), s = rd16(arg + off + 2);
+        if (t == type) { if (s == size) memcpy((void *)(uintptr_t)(arg + off + 8), data, size); return; }
+        off += 8u + s;
+    }
+    if (off + 8u + size > 0x2000) return;
+    wr16(arg + off, type); wr16(arg + off + 2, size); wr32(arg + off + 4, 0);
+    memcpy((void *)(uintptr_t)(arg + off + 8), data, size);
+    wr16(arg, (uint16_t)(count + 1));
+}
+static void web_OfflineArg_ctor(Ctx *c) {                  /* (ShowOfflineHtmlPageArg *this, const char *documentPath) */
+    ImportFn lifted = sdk_lifted("_ZN2nn3web22ShowOfflineHtmlPageArgC1EPKc");
+    if (lifted) { lifted(c); return; }                      /* the SDK's own constructor (C1 and C2 are one function) */
+    uint64_t arg = A0;                                      /* no SDK image: the shape the log reads (shim kind 3 = offline, document path) */
+    char path[0xc00];
+    memset(path, 0, sizeof path);
+    if (A1) strncpy(path, (const char *)(uintptr_t)A1, sizeof path - 1);
+    memset((void *)(uintptr_t)arg, 0, 0x2000);
+    wr32(arg + 4, 3);
+    web_tlv_set(arg, 6, path, (uint16_t)sizeof path);
+}
+static void web_SetBootLoadingIconEnabled(Ctx *c) { uint8_t v = (uint8_t)(A1 & 1); web_tlv_set(A0, 0x35, &v, 1); }
+static void web_SetBootMode(Ctx *c) { uint32_t v = (uint32_t)A1; web_tlv_set(A0, 0x41, &v, 4); }
+static void web_ret_GetLastUrl(Ctx *c) { RET(A0 + 8); }
+static void web_ret_GetLastUrlSize(Ctx *c) { RET(rd64(A0 + 0x1008)); }
+static void web_ret_GetOfflineExitReason(Ctx *c) { RET(rd32(A0)); }
+
+#define WEB_WORK_SIZE 0xd0
+static uint8_t g_web_fallback_work[WEB_WORK_SIZE];         /* a session Start()ed without Initialize */
+static uint64_t web_session_work(uint64_t session) { uint64_t w = session ? rd64(session) : 0; return w ? w : P(g_web_fallback_work); }
+static void web_session_ctor(Ctx *c) { wr64(A0, 0); }
+static void web_session_GetWorkBufferSize(Ctx *c) { RET(WEB_WORK_SIZE); }
+static void web_session_Initialize(Ctx *c) {               /* (this, void *workBuffer, size_t size) */
+    wr64(A0, A1);
+    if (A1) memset((void *)(uintptr_t)A1, 0, A2 < WEB_WORK_SIZE ? (size_t)A2 : WEB_WORK_SIZE);
+}
+static void web_session_Start(Ctx *c) {                    /* (this, SystemEventType **outExitEvent, const ShowOfflineHtmlPageArg &) -> Result */
+    uint64_t work = web_session_work(A0), out = A1, ev = work + 0x40;
+    web_log(c, "nn::web::OfflineWebSession::Start", A2);
+    os_init_event(ev, 0);
+    os_signal_event(ev);                                    /* the applet has already ended */
+    wr32(work, 0);                                          /* receives logged for this session */
+    if (out) wr64(out, ev);
+    RET(0);
+}
+static void web_session_Appear(Ctx *c) { trace_printf("     nn::web::OfflineWebSession::Appear\n"); RET(1); }
+static void web_session_RequestExit(Ctx *c) { trace_printf("     nn::web::OfflineWebSession::RequestExit\n"); RET(1); }
+static volatile LONG g_web_sent;
+static void web_session_TrySend(Ctx *c) {                  /* (this, const char *message, size_t size) -> bool */
+    if (InterlockedIncrement(&g_web_sent) <= 40)
+        printf("nn::web::OfflineWebSession: message to the (closed) page dropped: \"%.*s\"\n", (int)(A2 > 200 ? 200 : A2), A1 ? (const char *)(uintptr_t)A1 : "");
+    RET(1);
+}
+static void web_session_TryReceive(Ctx *c) {               /* (this, size_t *outSize, char *buffer, size_t size) -> bool */
+    uint64_t work = web_session_work(A0);
+    if (!A2 || !A3) { RET(0); return; }
+    wr8(A2, 0);
+    if (A1) wr64(A1, 1);
+    uint32_t n = rd32(work) + 1;
+    wr32(work, n);
+    if (n <= 2) printf("nn::web::OfflineWebSession: the page is closed: empty message %u handed to the plugin (caller 0x%llx)\n", n, (unsigned long long)c->x[30] - 4);
+    RET(1);
+}
+static void web_session_WaitForExit(Ctx *c) {              /* (this, OfflineHtmlPageReturnValue *) -> Result */
+    trace_printf("     nn::web::OfflineWebSession::WaitForExit -> closed (EndButtonPressed)\n");
+    if (A1) web_fill_common(A1);
+    RET(0);
+}
+static void web_session_NeedsWaitForExit(Ctx *c) { RET(1); }
+static void web_session_Finalize(Ctx *c) { (void)c; }
+
+#define WEB(n) "_ZN2nn3web" n
+static const ImportDef applet_plugin_imports[] = {
+    {WEB("22ShowOfflineHtmlPageArgC2EPKc"), web_OfflineArg_ctor},
+    {WEB("22ShowOfflineHtmlPageArg25SetBootLoadingIconEnabledEb"), web_SetBootLoadingIconEnabled},
+    {WEB("11SetBootModeEPNS0_22ShowOfflineHtmlPageArgENS0_18WebSessionBootModeE"), web_SetBootMode},
+    {"_ZNK2nn3web26OfflineHtmlPageReturnValue10GetLastUrlEv", web_ret_GetLastUrl},
+    {"_ZNK2nn3web26OfflineHtmlPageReturnValue14GetLastUrlSizeEv", web_ret_GetLastUrlSize},
+    {"_ZNK2nn3web26OfflineHtmlPageReturnValue20GetOfflineExitReasonEv", web_ret_GetOfflineExitReason},
+    {WEB("17OfflineWebSessionC1Ev"), web_session_ctor}, {WEB("17OfflineWebSessionC2Ev"), web_session_ctor},
+    {WEB("17OfflineWebSession17GetWorkBufferSizeEv"), web_session_GetWorkBufferSize},
+    {WEB("17OfflineWebSession10InitializeEPvm"), web_session_Initialize},
+    {WEB("17OfflineWebSession5StartEPPNS_2os15SystemEventTypeERKNS0_22ShowOfflineHtmlPageArgE"), web_session_Start},
+    {WEB("17OfflineWebSession6AppearEv"), web_session_Appear}, {WEB("17OfflineWebSession11RequestExitEv"), web_session_RequestExit},
+    {WEB("17OfflineWebSession21TrySendContentMessageEPKcm"), web_session_TrySend},
+    {WEB("17OfflineWebSession24TryReceiveContentMessageEPmPcm"), web_session_TryReceive},
+    {WEB("17OfflineWebSession11WaitForExitEPNS0_26OfflineHtmlPageReturnValueE"), web_session_WaitForExit},
+    {"_ZNK2nn3web17OfflineWebSession16NeedsWaitForExitEv", web_session_NeedsWaitForExit},
+    {WEB("17OfflineWebSession8FinalizeEv"), web_session_Finalize},
+};
+
 /* ================================================================ registration */
 #define NFP(n) "_ZN2nn3nfp" n
 /* These replace the placeholders nnmisc.c used to hold for the same names (removed there). */
@@ -450,6 +606,7 @@ void register_nnapplet_imports(void) {
     for (int i = 0; i < n; i++)
         if (!import_data(applet_imports[i].name)) printf("nnapplet: \"%s\" is not an import of the game (typo?)\n", applet_imports[i].name);
     register_imports(applet_imports, n);
+    register_imports(applet_plugin_imports, (int)(sizeof applet_plugin_imports / sizeof applet_plugin_imports[0]));   /* not imports of the game: kept for nnro.c */
 }
 
 /* ================================================================ self-test */
@@ -459,6 +616,7 @@ static ImportFn h(const char *name) {
     return f;
 }
 static int guard_ok(const uint8_t *p, size_t from, size_t to, uint8_t v) { for (size_t i = from; i < to; i++) if (p[i] != v) return 0; return 1; }
+#ifdef _WIN32
 static volatile int g_kbd_test_initial_seen;
 static DWORD WINAPI kbd_test_driver(LPVOID arg) {
     (void)arg;
@@ -483,6 +641,7 @@ static DWORD WINAPI kbd_test_driver(LPVOID arg) {
     return 0;
 #endif
 }
+#endif
 int nnapplet_selftest(Ctx *c) {
     int bad = 0, ok;
     uint8_t *buf = malloc(0x8000), *buf2 = malloc(0x8000);
@@ -548,6 +707,7 @@ int nnapplet_selftest(Ctx *c) {
     _putenv("SSBU_SWKBD=cancel");
     c->x[0] = P(string); c->x[1] = P(buf); swkbd_ShowKeyboard(c);
     ok = ok && c->x[0] == SWKBD_RESULT_CANCELED;
+#ifdef _WIN32
     /* the real dialog: a helper thread types into it and presses OK, then a second run is cancelled */
     _putenv("SSBU_SWKBD=dialog");
     HANDLE helper = CreateThread(NULL, 0, kbd_test_driver, NULL, 0, NULL);
@@ -560,6 +720,7 @@ int nnapplet_selftest(Ctx *c) {
     CloseHandle(helper);
     printf("  swkbd: Win32 dialog shows the initial text \"Mario\", returns typed text \"Z\" + U+30BC on OK and 0x29f on Cancel: %s\n", dialog_ok ? "ok" : "FAILED");
     bad += !dialog_ok;
+#endif
     _putenv("SSBU_SWKBD=");
     printf("  swkbd: sizes work 0x%llx string 0x%llx; SetInitialText in the work buffer; scripted answer \"Kirby\" (UTF-16) and cancel (0x29f): %s\n",
            (unsigned long long)work_size, (unsigned long long)string_size, ok ? "ok" : "FAILED");

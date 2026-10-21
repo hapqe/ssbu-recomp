@@ -12,6 +12,39 @@
  * Check: at the end of the re-run the pages the first pass changed are compared with their first-pass end state
  * (SSBU_R1 report "verify"), next to the fighters' hash (SSBU_FIGHT_HASH) that the comparison script reads.
  * Nothing here runs without SSBU_R1. No game content in this file. */
+#ifndef _WIN32
+/* Linux build: not available yet. The save / restore is built on Windows' vectored exception handlers (the write marks)
+ * and on reading suspended threads' contexts; on Linux that would be signal handlers and ucontext. Off as when SSBU_R1 and
+ * runahead are not set: every entry answers "off", so the callers take their normal paths. */
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <windows.h>
+__declspec(dllexport) uint8_t *r1_m1, *r1_m2;
+__declspec(dllexport) uint64_t r1_lo1, r1_n1, r1_n2;
+int r1_on(void) {
+    static int said;
+    int gfx_runahead(void);
+    if (!said && ((getenv("SSBU_R1") && getenv("SSBU_R1")[0] != '0') || (getenv("SSBU_RUNAHEAD") ? getenv("SSBU_RUNAHEAD")[0] != '0' : gfx_runahead()))) {
+        said = 1;
+        printf("r1: state save / restore (SSBU_R1, run-ahead) is not available in the Linux build yet: off\n");
+    }
+    return 0;
+}
+int r1_ra_phase(void) { return 0; }
+int r1_ra_quiet(void) { return 0; }
+int r1_ra_present_mode(void) { return 0; }
+void r1_stats_report(void) {}
+int r1_poll(int ticks) { (void)ticks; return 0; }
+void r1_pad(uint64_t *b, int *lx, int *ly, int *rx, int *ry) { (void)b; (void)lx; (void)ly; (void)rx; (void)ry; }
+void r1_init(void) { r1_on(); }
+void r1_on_decommit(void *p, size_t n) { (void)p; (void)n; }
+void r1_on_commit(void *p, size_t n) { (void)p; (void)n; }
+void r1_wrote(uint64_t a, uint64_t n) { (void)a; (void)n; }
+void r1_nosim(uint64_t a, uint64_t n) { (void)a; (void)n; }
+void r1_read_retry_note(void) {}
+void r1_register_heap(void) { r1_on(); }
+#else
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -157,14 +190,34 @@ static void add_fighter_dlls(void) {
     CloseHandle(sn);
     if (g_cycle == 0 && g_phase == 0) LOG("r1: fighter DLLs: %d, writable sections %.1f KB\n", nmod, bytes / 1024.0);
 }
+/* (R3 hs13, tw1j) the full save's copy of every range (r->s, ~1.9 GB in a match) is page memory of its own, not CRT heap: the
+ * first save of the ring / run-ahead gives it back (decommits it) range by range while mark_setup moves it into the shadow,
+ * so the peak commit is ~one copy of the game's memory instead of two (tw1j: a failed malloc there, not checked, crashed in
+ * memcpy while the PC had 4-8 GB of free commit). Every allocation of that save is checked: on failure the save fails
+ * cleanly (g_save_failed = 2) and the caller turns rollback off for the match. */
+static void *rs_alloc(size_t n) { return n ? VirtualAlloc(NULL, n, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) : NULL; }
+static void rs_free(void *p) { if (p) VirtualFree(p, 0, MEM_RELEASE); }
+static void release(void);
+static int g_rs_drop;                                   /* set by the first save's callers (the ring, run-ahead): r->s given back during mark_setup */
+static int g_rb_test_nomem = -1;                        /* SSBU_RB_NET_TEST_NOMEM (test only): 1 = the commit check says no, 2 = an allocation of the full save fails, 3 = the ring's own allocations fail, 4 = the shadow's commit fails */
+static int rb_test_nomem(void) { if (g_rb_test_nomem < 0) { const char *e = getenv("SSBU_RB_NET_TEST_NOMEM"); g_rb_test_nomem = e ? atoi(e) : 0; } return g_rb_test_nomem; }
+static double g_save_need_mb, g_save_avail_mb;          /* the last commit check (MB) */
+static uint8_t *ls_pool_meta(size_t *n);              /* R4 (rb_learned.c) */
 static void collect(Ctx *c) {
-    for (int i = 0; i < g_nr; i++) { free(g_r[i].s); free(g_r[i].dirty); free(g_r[i].async); }
+    for (int i = 0; i < g_nr; i++) { rs_free(g_r[i].s); g_r[i].s = NULL; free(g_r[i].dirty); free(g_r[i].async); }
     g_nr = 0;
     if (!g_nheap) find_heaps();
     for (int i = 0; i < g_nheap; i++) add_alloc(g_heap_base[i]);
     add_span((uint8_t *)0x7100000000ull, (uint8_t *)0x7300000000ull);
     add_fighter_dlls();
-    if (g_catch_addr && !getenv("SSBU_R1_NO_CATCH")) add_span((uint8_t *)(uintptr_t)g_catch_addr, (uint8_t *)(uintptr_t)g_catch_addr + 8192 * 16);   /* nnunwind.c: the catch frames (guest CFA -> host jmp_buf) */
+    { size_t pmn; uint8_t *pm = ls_pool_meta(&pmn); if (pm && pmn) add_span(pm, pm + pmn); }      /* R4: the presentation pool's bookkeeping (rb_learned.c) */
+    if (g_catch_addr && !getenv("SSBU_R1_NO_CATCH")) {     /* nnunwind.c: the catch frames (guest CFA -> host jmp_buf) */
+        size_t before = 0, after = 0; for (int i = 0; i < g_nr; i++) before += g_r[i].n;
+        size_t cn = 8192 * 16; { const char *e = getenv("SSBU_R1_TEST_CATCH_KB"); if (e && atoi(e) > 0 && (size_t)atoi(e) * 1024 < cn) cn = (size_t)atoi(e) * 1024; }   /* (hs15, TEST ONLY) only that much of the table in the state: the pp3h crash on purpose */
+        add_span((uint8_t *)(uintptr_t)g_catch_addr, (uint8_t *)(uintptr_t)g_catch_addr + cn);
+        for (int i = 0; i < g_nr; i++) after += g_r[i].n;
+        static int said; if (!said++ || after - before < 8192 * 16) LOG("r1: the catch table (%u KB) is in the state with %.1f KB%s\n", 8192 * 16 / 1024, (after - before) / 1024.0, after - before < 8192 * 16 ? ": NOT ALL OF IT (pages never written are copy-on-write; hs15)" : "");
+    }
     if (g_ar) add_alloc(g_ar);
     add_alloc((void *)(uintptr_t)c->x[31]);
     add_alloc((void *)(uintptr_t)c->tpidr);
@@ -237,10 +290,14 @@ static void threads_report(const char *when) {
 
 
 /* ---------------------------------------------------------------- the other guest threads: held at a wait while memory is copied */
-typedef struct { HANDLE h; Ctx *c; const char *name; uint64_t from; const char *imp; Ctx regs; int held, parked, same; double wait_ms; } Th;
+typedef struct { HANDLE h; Ctx *c; const char *name; uint64_t from; const char *imp; Ctx regs; int held, parked, same; double wait_ms; uint64_t rsp, rip; int cok; } Th;
+/* (R3 hs16) cok: rsp / rip read by th_blocked while this thread is held (suspended by us ever since): live_rsps uses them
+ * instead of asking Windows again (GetThreadContext of a thread blocked in the kernel costs ~20 us: 0.5 ms per capture) */
 static int g_audio_free;
 static void async_add(uint8_t *a);
+static long long g_th_audio_other;                   /* (R3 hs11) ring loads that took an audio thread at another wait (ra_hold_restore) */
 static Th g_th[256]; static int g_nth, g_th_mismatch, g_ninfo, g_park_ms = 500;
+static int g_th_running;                              /* (R3 pub1) ra_hold_restore: threads still RUNNING (not blocked at a wait) after the 500 ms */
 static int waiting_import(const char *s) { return s && (strstr(s, "Wait") || strstr(s, "wait") || strstr(s, "Sleep") || strstr(s, "Receive") || strstr(s, "Fiber") || strstr(s, "Timed")); }
 /* restore_mode 0: hold every guest thread (except this one) once it is inside a waiting import, note where;
  * restore_mode 1: hold each once it waits at the SAME guest return address as at the save (500 ms at most) */
@@ -269,7 +326,7 @@ static void park(int restore_mode) {
             if (SuspendThread(t->h) == (DWORD)-1) break;
             const char *imp = t->c->in_import;
             int ok = waiting_import(imp) && (!restore_mode || (t->c->import_from == t->from && imp == t->imp));
-            if (ok || now_ms() - t0 > g_park_ms) { t->held = 1; t->parked = ok; if (!ok && tm) (*tm)++; t->wait_ms = now_ms() - t0; break; }
+            if (ok || now_ms() - t0 > g_park_ms) { t->held = 1; t->cok = 0; t->parked = ok; if (!ok && tm) (*tm)++; t->wait_ms = now_ms() - t0; break; }
             ResumeThread(t->h);
             SwitchToThread();
         }
@@ -321,15 +378,30 @@ extern DWORD g_r1_fls_idx;
  * saved / restored with the fiber. */
 static uint64_t g_fls_var;
 
-static uint64_t map_sym(const char *want) {      /* a static of this exe, by its linker map */
+/* (R3 pub1) The statics of other files that are part of the state (nnunwind.c's catch table, fighter_host.c's FLS index, nvn_gl.c's
+ * command-buffer save area) were found by name in the exe's linker map (<exe>.map beside it). The prebuilt runtime package (setup.py
+ * --rollback) ships ssbu_native_rb.exe WITHOUT its map (and an exe copied under another name has none either): every lookup gave 0,
+ * so the catch table was never captured nor restored by the ring and a load put a coroutine's host stack back without the
+ * record of its catch frame ("f_720052e2f0 handled an exception but was not entered through nro_catch_call", pub1h at frame 72).
+ * Now the files give the addresses themselves; the map is not read any more (SSBU_R1_MAPSYM=1: the old way, test only). */
+void *nnunwind_catch_table(size_t *bytes); void *fighter_host_fls_slot(void); void nvn_gl_r1_cb_area(void **cbs, void **ncbs, void **all);
+static uint64_t map_sym_file(const char *want) {      /* a static of this exe, by its linker map (the old way) */
     char path[MAX_PATH]; DWORD n = GetModuleFileNameA(NULL, path, MAX_PATH); if (n < 5) return 0;
     strcpy(path + n - 4, ".map");
-    FILE *f = fopen(path, "r"); if (!f) return 0;
+    FILE *f = fopen(path, "r"); if (!f) { LOG("r1: %s: NO linker map %s\n", want, path); return 0; }
     char line[512]; uint64_t r = 0;
     while (fgets(line, sizeof line, f)) { char sec[32], name[128]; unsigned long long va; if (sscanf(line, " %31s %127s %llx", sec, name, &va) == 3 && !strcmp(name, want)) { r = (uint64_t)(uintptr_t)GetModuleHandleA(NULL) + va - 0x140000000ull; break; } }
     fclose(f);
     LOG("r1: %s at %llx (linker map)\n", want, (unsigned long long)r);
     return r;
+}
+static uint64_t map_sym(const char *want) {
+    { const char *e = getenv("SSBU_R1_MAPSYM"); if (e && e[0] == '1') return map_sym_file(want); }
+    void *cbs, *ncbs, *all; nvn_gl_r1_cb_area(&cbs, &ncbs, &all);
+    void *p = !strcmp(want, "g_catch") ? nnunwind_catch_table(NULL) : !strcmp(want, "g_fs_fls") ? fighter_host_fls_slot() :
+              !strcmp(want, "g_cbs") ? cbs : !strcmp(want, "g_ncbs") ? ncbs : !strcmp(want, "g_all_cb") ? all : NULL;
+    LOG("r1: %s at %llx (from the code)\n", want, (unsigned long long)(uintptr_t)p);
+    return (uint64_t)(uintptr_t)p;
 }
 static void fls_index_find(void) {
     static int tried; if (!tried) { tried = 1; g_fls_var = map_sym("g_fs_fls"); g_catch_addr = map_sym("g_catch"); }
@@ -346,6 +418,58 @@ static int fib_host(void *fiber, uint64_t *rsp, uint64_t *base) {
     if (!(sl < sb && sp >= sl && sp < sb && sb - sp < (64u << 20))) return 0;
     *rsp = sp; *base = sb; return 1;
 }
+/* (R3 hs13, tl4 / nmr: c00000ff in ntdll's unwinder at a lua2cpp throw, rsp on one fiber's host stack while the thread's
+ * TEB names another fiber) a restore must never copy a saved host stack over a stack some thread is running on now: the
+ * stack pointers of every guest thread and of this thread are read first, and a switched-away fiber whose host stack
+ * holds one of them is not copied back (counted, logged). SSBU_R1_LIVESTK=0: copied anyway (the old way, test). */
+static long long g_fib_live_skip, g_fib_live_seen; static int g_fib_live_on = -1;
+static uint64_t g_live_rsp[512], g_live_rip[512], g_live_fib[512]; static const char *g_live_nm[512]; static HANDLE g_live_h[512]; static int g_nlive;
+static uint8_t *live_teb_addr(HANDLE h);
+int guest_thread_info(int i, Ctx **c, const char **name, HANDLE *h);
+static int g_live_cache = -1; static long long g_live_cached, g_live_asked;
+static void live_rsps(void) {
+    if (g_live_cache < 0) { const char *e = getenv("SSBU_R1_LIVECACHE"); g_live_cache = !(e && e[0] == '0'); }      /* (hs16) =0: every thread asked again (the old way) */
+    g_nlive = 0;
+    { volatile uint64_t here = (uint64_t)(uintptr_t)&here; g_live_rsp[g_nlive] = here; g_live_rip[g_nlive] = 0; g_live_nm[g_nlive] = "this thread"; g_live_h[g_nlive] = NULL; g_live_fib[g_nlive] = (uint64_t)(uintptr_t)GetCurrentFiber(); g_nlive++; }
+    Ctx *tc; const char *nm; HANDLE h;
+    for (int i = 0; guest_thread_info(i, &tc, &nm, &h) && g_nlive < 512; i++) {
+        if (!h || GetThreadId(h) == GetCurrentThreadId()) continue;
+        CONTEXT x; memset(&x, 0, sizeof x); x.ContextFlags = CONTEXT_CONTROL;
+        int got = 0;
+        if (g_live_cache) for (int j = 0; j < g_nth; j++) if (g_th[j].h == h) { if (g_th[j].held && g_th[j].cok) { x.Rsp = g_th[j].rsp; x.Rip = g_th[j].rip; got = 1; g_live_cached++; } break; }
+        if (!got) { got = GetThreadContext(h, &x) != 0; g_live_asked++; }
+        if (got) { uint8_t *t = live_teb_addr(h); g_live_rsp[g_nlive] = x.Rsp; g_live_rip[g_nlive] = x.Rip; g_live_nm[g_nlive] = nm ? nm : "?"; g_live_h[g_nlive] = h; g_live_fib[g_nlive] = t ? *(volatile uint64_t *)(t + 0x20) : 0; g_nlive++; }
+    }
+}
+static void live_teb(HANDLE h, uint64_t *fd, uint64_t *sb, uint64_t *sl) {     /* (diagnosis) that thread's TEB: FiberData, StackBase, StackLimit */
+    *fd = *sb = *sl = 0;
+    typedef LONG (WINAPI *QitFn)(HANDLE, int, void *, ULONG, ULONG *);
+    static QitFn qit; if (!qit) qit = (QitFn)(void *)GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtQueryInformationThread");
+    struct { LONG st; void *teb; void *pid, *tid; ULONG_PTR mask; LONG pri, bpri; } tb; memset(&tb, 0, sizeof tb);
+    HANDLE hh = h ? h : GetCurrentThread();
+    if (!qit || qit(hh, 0, &tb, sizeof tb, NULL) < 0 || !tb.teb) return;
+    uint8_t *t = tb.teb; *sb = *(uint64_t *)(t + 0x08); *sl = *(uint64_t *)(t + 0x10); *fd = *(uint64_t *)(t + 0x20);
+}
+static struct { HANDLE h; uint8_t *teb; } g_teb_cache[512]; static int g_nteb;
+static uint8_t *live_teb_addr(HANDLE h) {               /* a thread's TEB (cached: it never moves) */
+    for (int i = 0; i < g_nteb; i++) if (g_teb_cache[i].h == h) return g_teb_cache[i].teb;
+    typedef LONG (WINAPI *QitFn)(HANDLE, int, void *, ULONG, ULONG *);
+    static QitFn qit; if (!qit) qit = (QitFn)(void *)GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtQueryInformationThread");
+    struct { LONG st; void *teb; void *pid, *tid; ULONG_PTR mask; LONG pri, bpri; } tb; memset(&tb, 0, sizeof tb);
+    if (!qit || qit(h, 0, &tb, sizeof tb, NULL) < 0) return NULL;
+    if (g_nteb < 512) { g_teb_cache[g_nteb].h = h; g_teb_cache[g_nteb].teb = tb.teb; g_nteb++; }
+    return tb.teb;
+}
+static int live_running(void *fiber) {                 /* the host fiber is the current fiber of a thread (its TEB says so) */
+    for (int i = 0; i < g_nlive; i++) if (g_live_fib[i] && g_live_fib[i] == (uint64_t)(uintptr_t)fiber) return i + 1;
+    return 0;
+}
+static long long g_fib_teb_running;                     /* fibers taken as running at a capture because a thread's TEB names them (run tid said not) */
+static int live_on_stack(const uint8_t *blk) {          /* a fiber block (saved copy): +0x20 DeallocationStack, +0x10 StackBase */
+    uint64_t lo = *(const uint64_t *)(blk + 0x20), hi = *(const uint64_t *)(blk + 0x10);
+    for (int i = 0; i < g_nlive; i++) if (g_live_rsp[i] >= lo && g_live_rsp[i] < hi) return i + 1;
+    return 0;
+}
 static void fib_cb(uint64_t key, Ctx *c, uint64_t stack, uint64_t size, void *fiber) {
     DWORD tid = os_r1_fiber_tid(key);
     static int fiblog = -1; if (fiblog < 0) fiblog = getenv("SSBU_R1_FIBLOG") != NULL;
@@ -359,6 +483,7 @@ static void fib_cb(uint64_t key, Ctx *c, uint64_t stack, uint64_t size, void *fi
     f->key = key; f->c = c; f->fiber = fiber; f->susp = 0; f->stk = NULL; f->n = 0; f->imp = NULL; f->from = 0; f->sp = 0; os_r1_fiber_get(key, f->obj); f->fls = tid ? NULL : os_r1_fiber_fls(key); if (f->fls) memcpy(f->flsb, f->fls, sizeof f->flsb);
     if (!c) return;                                           /* initialised, never run */
     f->regs = *c; f->imp = c->in_import; f->from = c->import_from; f->sp = c->x[31];
+    if (!tid && g_fib_live_on && fiber && live_running(fiber)) { tid = GetThreadId(g_live_h[live_running(fiber) - 1] ? g_live_h[live_running(fiber) - 1] : GetCurrentThread()); g_fib_teb_running++; }   /* (hs13) running in truth: its stack is live, not saved */
     uint64_t rsp, base;
     if (!tid && fib_host(fiber, &rsp, &base)) {
         size_t n = (size_t)(base - rsp) + 64;
@@ -370,9 +495,17 @@ static void fib_cb(uint64_t key, Ctx *c, uint64_t stack, uint64_t size, void *fi
     } else if (!tid) g_fib_bad++;
     if (tid) g_fib_running++;
 }
+static uint64_t g_rest_lo[1024], g_rest_hi[1024]; static int g_nrest;     /* (hs13) the host stacks the last restore copied back */
+static int rest_stack(uint64_t a) { for (int i = 0; i < g_nrest; i++) if (a >= g_rest_lo[i] && a < g_rest_hi[i]) return 1; return 0; }
+void nnunwind_trace_note(const char *what, uint64_t cfa, uint64_t jb);      /* (hs15) nnunwind.c, SSBU_UNWIND_TRACE */
+static int g_r1_ctr = -1;
+#define R1_CTR(w, a, b) do { if (g_r1_ctr < 0) g_r1_ctr = getenv("SSBU_UNWIND_TRACE") != NULL; if (g_r1_ctr) nnunwind_trace_note(w, (uint64_t)(a), (uint64_t)(b)); } while (0)
 static void fibers_restore_all(void) {
+    g_nrest = 0;
     g_ncur = 0; g_fib_mode = 1; os_r1_fibers(fib_cb);
     g_fib_same = g_fib_diff = g_fib_new = 0;
+    if (g_fib_live_on < 0) { const char *e = getenv("SSBU_R1_LIVESTK"); g_fib_live_on = !(e && e[0] == '0'); }
+    live_rsps();
     for (int i = 0; i < g_nfib; i++) {
         Fib *f = &g_fib[i];
         int j; for (j = 0; j < g_ncur; j++) if (g_cur[j].key == f->key) break;
@@ -380,22 +513,38 @@ static void fibers_restore_all(void) {
         os_r1_fiber_put(f->key, f->obj);                     /* entry, argument, stack, host fiber, context as at the save */
         if (f->susp || !f->c) os_r1_fiber_put_fls(f->key, f->fiber, f->susp ? f->fls : NULL);   /* (R2) the block note of the host fiber put back; none for a fresh one */
         if (!f->c) {                                          /* never ran at the save: it must start from the beginning */
+            R1_CTR(cf != f->fiber || cc ? "restore: fiber never ran then: fresh host fiber (key, old fiber)" : "restore: fiber never ran then: same (key, fiber)", f->key, (uint64_t)(uintptr_t)cf);
             if (cf != f->fiber || cc) { os_r1_fiber_set(f->key, NULL, NULL, 1); g_fib_new++; } else g_fib_same++;
             continue;
         }
         int running_now = j < g_ncur && g_cur[j].tid != 0;
+        int live = f->susp && !running_now ? live_on_stack(f->blk) : 0;
+        if (live) {
+            g_fib_live_seen++;
+            if (g_fib_live_seen <= 20) {
+                uint64_t fd, sb, sl; live_teb(g_live_h[live - 1], &fd, &sb, &sl);
+                LOG("r1:   fiber %llx: its host stack %p [%llx..%llx] is IN USE now by %s (rsp %llx rip %llx; its TEB: fiber %llx stack %llx..%llx); saved rsp %llx + %zu, host fiber now %p, run tid now %lu: %s\n",
+                    (unsigned long long)f->key, f->fiber, (unsigned long long)*(uint64_t *)(f->blk + 0x20), (unsigned long long)*(uint64_t *)(f->blk + 0x10), g_live_nm[live - 1],
+                    (unsigned long long)g_live_rsp[live - 1], (unsigned long long)g_live_rip[live - 1], (unsigned long long)fd, (unsigned long long)sl, (unsigned long long)sb,
+                    (unsigned long long)f->rsp, f->n, cf, j < g_ncur ? (unsigned long)g_cur[j].tid : 0ul, g_fib_live_on ? "not copied back" : "copied back anyway (SSBU_R1_LIVESTK=0)");
+            }
+            if (g_fib_live_on) { g_fib_live_skip++; g_fib_diff++; R1_CTR("restore: fiber stack in use, not copied back (key, lo)", f->key, *(uint64_t *)(f->blk + 0x20)); continue; }
+        }
         if (f->susp && !running_now) {                        /* whole host + guest state back */
+            if (g_nrest < 1024) { g_rest_lo[g_nrest] = *(uint64_t *)(f->blk + 0x20); g_rest_hi[g_nrest] = *(uint64_t *)(f->blk + 0x10); g_nrest++; }
+            R1_CTR("restore: fiber stack copied back (key, lo)", f->key, *(uint64_t *)(f->blk + 0x20));
             memcpy((void *)(uintptr_t)f->rsp, f->stk, f->n);
             memcpy(f->fiber, f->blk, FIB_BLOCK);
             if (f->fls) memcpy(f->fls, f->flsb, sizeof f->flsb);
             *f->c = f->regs;
             g_fib_same++;
         } else if (!f->susp && cf == f->fiber && cc == f->c && cc->in_import == f->imp && cc->import_from == f->from && cc->x[31] == f->sp) {
+            R1_CTR("restore: fiber running at the save: registers only (key, fiber)", f->key, (uint64_t)(uintptr_t)f->fiber);
             for (int r = 19; r < 32; r++) cc->x[r] = f->regs.x[r];
             for (int r = 8; r < 16; r++) cc->v[r] = f->regs.v[r];
             g_fib_same++;
         } else {
-            g_fib_diff++;
+            g_fib_diff++; R1_CTR("restore: fiber NOT restored (key, fiber)", f->key, (uint64_t)(uintptr_t)f->fiber);
             LOG("r1:   fiber %llx NOT restored: now %s, at the save %s @%llx sp %llx (switched away then: %d, same host fiber: %d)\n", (unsigned long long)f->key,
                 running_now ? "running" : "?", f->imp ? f->imp : "guest code", (unsigned long long)f->from, (unsigned long long)f->sp, f->susp, cf == f->fiber);
         }
@@ -446,7 +595,7 @@ static void park_quiet(int restore_mode) {
         unpark(); SwitchToThread();
     }
 }
-static void fibers_save(void) { g_nfib = 0; g_fib_mode = 0; g_ncur = 0; g_fpool_used = 0; g_fib_bytes = 0; g_fib_bad = 0; g_fib_running = 0; os_r1_fibers(fib_cb); }
+static void fibers_save(void) { if (g_fib_live_on < 0) { const char *e = getenv("SSBU_R1_LIVESTK"); g_fib_live_on = !(e && e[0] == '0'); } if (g_fib_live_on) live_rsps(); g_nfib = 0; g_fib_mode = 0; g_ncur = 0; g_fpool_used = 0; g_fib_bytes = 0; g_fib_bad = 0; g_fib_running = 0; os_r1_fibers(fib_cb); }
 static void fibers_restore(void) {
     fibers_restore_all();
     int born = 0; for (int j = 0; j < g_ncur; j++) { int i; for (i = 0; i < g_nfib; i++) if (g_fib[i].key == g_cur[j].key) break; if (i == g_nfib) born++; }
@@ -466,7 +615,7 @@ static void fibers_report(void) {
 
 /* ---------------------------------------------------------------- save / restore */
 static const char *where(uint8_t *a);
-static int g_mark; static void mark_setup(void); static void blk1_init(void);
+static int g_mark; static int mark_setup(void); static void blk1_init(void);
 static int g_ra, g_save_failed; static int ra_hold_quiet(double limit);
 size_t nvn_r1_cb_save(void); void nvn_r1_cb_restore(void); static size_t g_ra_cb_bytes;      /* nvn_gl.c */
 static size_t g_saved_bytes;
@@ -475,14 +624,29 @@ static void save(Ctx *c) {
     collect(c);
     double t1 = now_ms();
     g_saved_bytes = 0;
-    for (int i = 0; i < g_nr; i++) {
-        Rng *r = &g_r[i];
-        r->s = malloc(r->n);
-        r->dirty = calloc(r->n / PG, 1);
-        r->async = calloc(r->n / PG, 1);
+    {   /* (hs13) the commit this needs, checked first: the copy below (decommitted again while the shadow takes it when
+         * g_rs_drop) + the shadow (as much again) + the ring's maps and pool; 1 GB more is left for the game and the driver */
+        size_t tot = 0; for (int i = 0; i < g_nr; i++) tot += g_r[i].n;
+        MEMORYSTATUSEX ms; ms.dwLength = sizeof ms;
+        double need = (g_rs_drop ? 1.0 : 2.0) * tot / 1048576.0 + 512.0, avail = GlobalMemoryStatusEx(&ms) ? ms.ullAvailPageFile / 1048576.0 : 1e12;
+        g_save_need_mb = need; g_save_avail_mb = avail;
+        if (rb_test_nomem() == 1 || avail < need + 1024.0) {
+            LOG("r1: FULL SAVE NOT MADE: not enough free commit memory: it needs %.0f MB (+ 1024 MB left for the game), %.0f MB free%s\n", need, avail, rb_test_nomem() == 1 ? " (TEST: SSBU_RB_NET_TEST_NOMEM=1)" : "");
+            g_save_failed = 2; return;
+        }
     }
-    if (!g_fpool) g_fpool = malloc(g_fpool_cap);
-    if (g_ecap < 65536) { g_ecap = 65536; g_e = realloc(g_e, g_ecap * sizeof *g_e); }   /* no allocation while threads are held */
+    {   int bad = 0;
+        for (int i = 0; i < g_nr && !bad; i++) {
+            Rng *r = &g_r[i];
+            r->s = (rb_test_nomem() == 2 && i == g_nr / 2) ? NULL : rs_alloc(r->n);
+            r->dirty = calloc(r->n / PG, 1);
+            r->async = calloc(r->n / PG, 1);
+            if (!r->s || !r->dirty || !r->async) { bad = 1; LOG("r1: FULL SAVE NOT MADE: allocation of %.1f MB for range %d of %d FAILED%s\n", r->n / 1048576.0, i, g_nr, rb_test_nomem() == 2 ? " (TEST: SSBU_RB_NET_TEST_NOMEM=2)" : ""); }
+        }
+        if (!bad && !g_fpool) { g_fpool = malloc(g_fpool_cap); if (!g_fpool) { bad = 1; LOG("r1: FULL SAVE NOT MADE: fiber pool allocation FAILED\n"); } }
+        if (!bad && g_ecap < 65536) { void *ne = realloc(g_e, 65536 * sizeof *g_e); if (ne) { g_e = ne; g_ecap = 65536; } else { bad = 1; LOG("r1: FULL SAVE NOT MADE: list allocation FAILED\n"); } }   /* no allocation while threads are held */
+        if (bad) { release(); g_save_failed = 2; return; }
+    }
     if (g_fast > 0 && g_cycle < g_learn) async_learn();
     double tp0 = now_ms();
     if (g_ra > 0) { if (!ra_hold_quiet(200)) { LOG("r1: RA: first save: no quiet moment within 200 ms: not now\n"); g_save_failed = 1; return; } } else park_quiet(0);
@@ -506,9 +670,11 @@ static void save(Ctx *c) {
                     }
             }
         }
-        if (g_mark > 0 && g_cycle == 0) { g_ctx_save = *c; mark_setup(); }     /* round 5: the marks start while the threads are still held (no unmarked gap after this full save) */
-        if (g_ra > 0) nvn_r1_cb_save();
+        int mfail = 0;
+        if (g_mark > 0 && g_cycle == 0) { g_ctx_save = *c; mfail = !mark_setup(); }     /* round 5: the marks start while the threads are still held (no unmarked gap after this full save) */
+        if (g_ra > 0 && !mfail) nvn_r1_cb_save();
         unpark();
+        if (mfail) { release(); g_save_failed = 2; return; }
         for (int i = 0; i < shown; i++) LOG("r1:   async page (written by host threads while main and the guest threads were held %d ms): %s\n", pause, where(g_e[i].a));
         LOG("r1: %zu pages written by host threads during a %d ms hold: left out of restore / verify; holding the guest threads took %.2f ms\n", np, pause, t1b - tp0);
     }
@@ -644,7 +810,7 @@ static void verify(void) {
         g_cycle, g_ff, bad, g_ne, extra, now_ms() - t0);
     os_compare("at the end of the re-run");
 }
-static void release(void) { for (int i = 0; i < g_nr; i++) { free(g_r[i].s); g_r[i].s = NULL; free(g_r[i].dirty); g_r[i].dirty = NULL; free(g_r[i].async); g_r[i].async = NULL; } }
+static void release(void) { for (int i = 0; i < g_nr; i++) { rs_free(g_r[i].s); g_r[i].s = NULL; free(g_r[i].dirty); g_r[i].dirty = NULL; free(g_r[i].async); g_r[i].async = NULL; } }
 
 /* ---------------------------------------------------------------- R1 round 2: the fast save (SSBU_R1_FAST=1)
  * The first SSBU_R1_LEARN cycles (default 5) are full ones (above): they learn the pages the simulation changes (union
@@ -774,7 +940,8 @@ static long long g_miss_total, g_miss_remarked, g_miss_remarked_last; static int
 static int win_index(uint8_t *a, uint8_t **map, size_t *pi);
 static int mark_bind(void) {
     const char *dn = getenv("SSBU_R1_GAMEDLL");
-    HMODULE m = GetModuleHandleA(dn && dn[0] ? dn : "ssbu_game_p15r1.dll");
+    HMODULE m = GetModuleHandleA(dn && dn[0] ? dn : "ssbu_game_r1.dll");          /* the players' rollback pair (scripts/setup.py --rollback) */
+    if (!m && !(dn && dn[0])) m = GetModuleHandleA("ssbu_game_p15r1.dll");      /* the study builds' name */
     if (!m) { LOG("r1: MARK: the game DLL with marks is not loaded: off\n"); return 0; }
     pm1 = (uint8_t **)GetProcAddress(m, "r1_m1"); pm2 = (uint8_t **)GetProcAddress(m, "r1_m2");
     plo1 = (uint64_t *)GetProcAddress(m, "r1_lo1"); pn1 = (uint64_t *)GetProcAddress(m, "r1_n1"); pn2 = (uint64_t *)GetProcAddress(m, "r1_n2");
@@ -786,14 +953,103 @@ static uint8_t *in_shadow(uint8_t *a, uint8_t **cmap, size_t *pi) {
     if ((uintptr_t)a >= WIN2 && (uintptr_t)a < WIN2 + WN2) { *pi = (size_t)((uintptr_t)a - WIN2) >> 12; *cmap = g_sh2c; return g_sh2 + ((uintptr_t)a - WIN2); }
     return NULL;
 }
-static void sh_commit(uint8_t *sh, uint8_t *cmap, size_t pi) {
-    if (cmap[pi]) return;
+static long long g_sh_fail;                             /* (hs13) shadow commits that failed */
+static int sh_commit(uint8_t *sh, uint8_t *cmap, size_t pi) {
+    if (cmap[pi]) return 1;
     size_t c0 = pi & ~(size_t)15;                         /* 64 KB at a time */
-    VirtualAlloc(sh - (pi - c0) * PG, 16 * PG, MEM_COMMIT, PAGE_READWRITE);
+    if (rb_test_nomem() == 4 || !VirtualAlloc(sh - (pi - c0) * PG, 16 * PG, MEM_COMMIT, PAGE_READWRITE)) { g_sh_fail++; return 0; }
     memset(cmap + c0, 1, 16);
+    return 1;
 }
-/* after the first (full) save: shadows, extras, maps on */
-static void mark_setup(void) {
+/* R3 (hs13 crash, 2026-10-20): window 2 (0x7100000000 + 8 GB) is the guest image + the script modules, but the OS may put HOST
+ * memory in its free parts: in hs13 the main thread's own Windows stack was at 0x72659f4000. Marked by instrumented code (a host
+ * local written through a pointer), its page went into the ring and a load copied the old page back over the live stack while
+ * main waited for the copy threads (cp_run): the return address read 0 -> c0000005 at rip 0 on main. Every host thread stack and
+ * every host fiber stack inside a window is "not simulation" (g_ns1 / g_ns2): never captured, loaded, restored or checked.
+ * SSBU_R1_HOST_STACKS=0: the old way (test only). */
+static long long g_hs_pages, g_hs_ranges, g_hs_fibers_later;
+static int g_hs_on = -1;
+static void hs_exclude(uint64_t lo, uint64_t hi, const char *what) {
+    if (!g_ns1 || !g_ns2 || hi <= lo || hi - lo > (1ull << 32)) return;
+    long long n = 0;
+    for (uint64_t p = lo & ~(uint64_t)(PG - 1); p < hi; p += PG) {
+        if (g_win1 && p >= (uint64_t)(uintptr_t)g_win1 && p < (uint64_t)(uintptr_t)g_win1 + g_wn1) { size_t i = (size_t)(p - (uint64_t)(uintptr_t)g_win1) >> 12; if (!g_ns1[i]) { g_ns1[i] = 1; n++; } }
+        else if (p >= WIN2 && p < WIN2 + WN2) { size_t i = (size_t)(p - WIN2) >> 12; if (!g_ns2[i]) { g_ns2[i] = 1; n++; } }
+    }
+    if (n) { g_hs_pages += n; g_hs_ranges++; LOG("r1: host stack inside a guest window left out of the state: %s %llx..%llx (%lld pages)\n", what, (unsigned long long)lo, (unsigned long long)hi, n); }
+}
+/* (hs15) every host fiber stack ever made (DeallocationStack .. StackBase): a catch record (nnunwind.c) on one that no guest
+ * fiber uses any more after a ring load is dead (r1_ring.c rgc_after drops it instead of keeping it for ever) */
+static uint64_t *g_bf_lo, *g_bf_hi; static size_t g_nbf, g_cbf; static SRWLOCK g_bf_lock = SRWLOCK_INIT;
+static void bf_add(void *fiber) {
+    uint64_t lo = *(uint64_t *)((uint8_t *)fiber + 0x20), hi = *(uint64_t *)((uint8_t *)fiber + 0x10);
+    if (!(lo < hi)) return;
+    AcquireSRWLockExclusive(&g_bf_lock);
+    size_t i; for (i = 0; i < g_nbf; i++) if (g_bf_lo[i] == lo) { g_bf_hi[i] = hi; break; }
+    if (i == g_nbf) {
+        if (g_nbf == g_cbf) { size_t nc = g_cbf ? g_cbf * 2 : 1024; uint64_t *a = realloc(g_bf_lo, nc * 8), *b = a ? realloc(g_bf_hi, nc * 8) : NULL;
+                              if (a) g_bf_lo = a; if (b) { g_bf_hi = b; g_cbf = nc; } }
+        if (g_nbf < g_cbf) { g_bf_lo[g_nbf] = lo; g_bf_hi[g_nbf] = hi; g_nbf++; }
+    }
+    ReleaseSRWLockExclusive(&g_bf_lock);
+}
+static void hs_fiber_cb(uint64_t key, Ctx *c, uint64_t stack, uint64_t size, void *fiber) {
+    (void)key; (void)c; (void)stack; (void)size;
+    if (fiber) bf_add(fiber);
+    if (fiber) hs_exclude(*(uint64_t *)((uint8_t *)fiber + 0x20), *(uint64_t *)((uint8_t *)fiber + 0x10), "fiber stack");
+}
+extern void (*g_r1_fiber_born)(void *fiber);           /* os_threads.c: a host fiber made later (fib_init, a fresh one at a restore) */
+static void hs_fiber_born(void *fiber) { if (fiber) { long long b = g_hs_pages; hs_fiber_cb(0, NULL, 0, 0, fiber); if (g_hs_pages != b) g_hs_fibers_later++; } }
+static uint64_t g_hs_note[16][2]; static int g_hs_nnote;     /* host stacks this exe makes itself (not threads, not guest fibers): noted, left out at the setup */
+static void r1_host_stack_note(uint64_t lo, uint64_t hi) { if (g_hs_nnote < 16) { g_hs_note[g_hs_nnote][0] = lo; g_hs_note[g_hs_nnote][1] = hi; g_hs_nnote++; } if (g_ns2 && (g_hs_on < 0 || g_hs_on)) hs_exclude(lo, hi, "host stack (noted)"); }
+typedef struct { LONG st; void *teb; void *pid, *tid; ULONG_PTR mask; LONG pri, bpri; } HsTbi;
+static void hs_exclude_all(void) {
+    if (g_hs_on < 0) { const char *e = getenv("SSBU_R1_HOST_STACKS"); g_hs_on = !(e && e[0] == '0'); }
+    if (!g_hs_on) return;
+    typedef LONG (WINAPI *QitFn)(HANDLE, int, void *, ULONG, ULONG *);
+    QitFn qit = (QitFn)(void *)GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtQueryInformationThread");
+    HANDLE sn = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    THREADENTRY32 te; te.dwSize = sizeof te; DWORD pid = GetCurrentProcessId(); int nth = 0;
+    for (BOOL ok = qit && sn != INVALID_HANDLE_VALUE && Thread32First(sn, &te); ok; ok = Thread32Next(sn, &te)) {
+        if (te.th32OwnerProcessID != pid) continue;
+        HANDLE h = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, te.th32ThreadID); if (!h) continue;
+        HsTbi tb; memset(&tb, 0, sizeof tb);
+        if (qit(h, 0, &tb, sizeof tb, NULL) >= 0 && tb.teb) {
+            uint8_t *teb = tb.teb; char nm[48]; snprintf(nm, sizeof nm, "thread %lu stack", (unsigned long)te.th32ThreadID);
+            hs_exclude(*(uint64_t *)(teb + 0x1478), *(uint64_t *)(teb + 0x08), nm);    /* DeallocationStack .. StackBase (the whole reservation) */
+            nth++;
+        }
+        CloseHandle(h);
+    }
+    if (sn != INVALID_HANDLE_VALUE) CloseHandle(sn);
+    os_r1_fibers(hs_fiber_cb);
+    for (int i = 0; i < g_hs_nnote; i++) hs_exclude(g_hs_note[i][0], g_hs_note[i][1], "host stack (noted)");
+    g_r1_fiber_born = hs_fiber_born;
+    {   /* what else lives in window 2 (a line per allocation that has committed read-write pages; diagnosis) */
+        MEMORY_BASIC_INFORMATION m; uint8_t *cur = NULL; size_t com = 0; int shown = 0;
+        for (uint8_t *p = (uint8_t *)(uintptr_t)WIN2; (uintptr_t)p < WIN2 + WN2 && VirtualQuery(p, &m, sizeof m); p = (uint8_t *)m.BaseAddress + m.RegionSize) {
+            if (m.AllocationBase != cur) {
+                if (cur && com && shown++ < 40) LOG("r1:   window 2 allocation %s: %.1f MB committed read-write\n", where(cur), com / 1048576.0);
+                cur = m.AllocationBase; com = 0;
+            }
+            if (m.State == MEM_COMMIT && rw(m.Protect)) com += m.RegionSize;
+        }
+        if (cur && com && shown++ < 40) LOG("r1:   window 2 allocation %s: %.1f MB committed read-write\n", where(cur), com / 1048576.0);
+    }
+    LOG("r1: host stacks: %d threads and the host fibers looked at; %lld pages in %lld ranges inside the guest windows left out\n", nth, g_hs_pages, g_hs_ranges);
+}
+/* (hs13) a mark_setup that could not finish: everything it made is given back, no mark map is set (marks stay off) */
+static void mark_undo(void) {
+    if (g_sh1) VirtualFree(g_sh1, 0, MEM_RELEASE);
+    if (g_sh2) VirtualFree(g_sh2, 0, MEM_RELEASE);
+    free(g_sh1c); free(g_sh2c); free(g_dc); free(g_ns1); free(g_ns2);
+    g_sh1 = g_sh2 = g_sh1c = g_sh2c = g_dc = g_ns1 = g_ns2 = NULL;
+    for (int i = 0; i < g_nx; i++) { free(g_x[i].b); g_x[i].b = NULL; }
+    g_nx = 0; g_xbytes = 0; g_win1 = NULL; g_wn1 = 0;
+}
+/* after the first (full) save: shadows, extras, maps on. 1 = done; 0 = out of memory (mark_undo done: no marks) */
+static void ls_after_setup(void);                      /* R4 (rb_learned.c) */
+static int mark_setup(void) {
     size_t big = 0; uint8_t *base = NULL;
     for (int i = 0; i < g_nheap; i++) {
         MEMORY_BASIC_INFORMATION m; uint8_t *p = g_heap_base[i];
@@ -806,25 +1062,46 @@ static void mark_setup(void) {
     g_sh1 = VirtualAlloc(NULL, g_wn1, MEM_RESERVE, PAGE_NOACCESS); g_sh1c = calloc(g_wn1 >> 12, 1);
     g_dc = calloc(g_wn1 >> 12, 1); g_ns1 = calloc(g_wn1 >> 12, 1); g_ns2 = calloc(WN2 >> 12, 1);
     g_sh2 = VirtualAlloc(NULL, WN2, MEM_RESERVE, PAGE_NOACCESS); g_sh2c = calloc(WN2 >> 12, 1);
+    if (!g_sh1 || !g_sh1c || !g_dc || !g_ns1 || !g_ns2 || !g_sh2 || !g_sh2c) { LOG("r1: MARK setup: allocation of the shadow / its maps FAILED: marks OFF\n"); mark_undo(); return 0; }
+    hs_exclude_all();
     g_nx = 0; g_xbytes = 0;
     size_t shb = 0;
-    for (int i = 0; i < g_nr; i++) {
+    for (int i = 0; i < g_nr; i++) {                    /* the extras: the runs of pages outside both windows */
         Rng *r = &g_r[i];
         for (size_t p = 0; p < r->n / PG; p++) {
-            uint8_t *cm; size_t pi; uint8_t *sh = in_shadow(r->a + p * PG, &cm, &pi);
-            if (sh) { sh_commit(sh, cm, pi); memcpy(sh, r->s + p * PG, PG); shb += PG; }
-            else if (g_nx < 8192) {                         /* an extra: the run of pages outside both windows */
+            uint8_t *cm; size_t pi;
+            if (in_shadow(r->a + p * PG, &cm, &pi)) continue;
+            if (g_nx < 8192) {
                 if (g_nx && g_x[g_nx - 1].a + g_x[g_nx - 1].n == r->a + p * PG) g_x[g_nx - 1].n += PG;
-                else { g_x[g_nx].a = r->a + p * PG; g_x[g_nx].n = PG; g_nx++; }
+                else { g_x[g_nx].a = r->a + p * PG; g_x[g_nx].n = PG; g_x[g_nx].b = NULL; g_nx++; }
             }
         }
     }
     for (int i = 0; i < g_nx; i++) {
         g_x[i].b = malloc(g_x[i].n); g_xbytes += g_x[i].n;
-        for (int k = 0; k < g_nr; k++) if (g_x[i].a >= g_r[k].a && g_x[i].a < g_r[k].a + g_r[k].n) { memcpy(g_x[i].b, g_r[k].s + (g_x[i].a - g_r[k].a), g_x[i].n); break; }   /* the save point's bytes */
+        if (!g_x[i].b) { LOG("r1: MARK setup: allocation of %.1f KB for an extra FAILED: marks OFF\n", g_x[i].n / 1024.0); mark_undo(); return 0; }
+    }
+    {   /* the bytes of the save point into the shadow and the extras; with g_rs_drop the copy of the full save is given back 1 MB at a time behind */
+        int cx = 0; size_t xo = 0; long long dropped = 0;
+        for (int i = 0; i < g_nr; i++) {
+            Rng *r = &g_r[i]; size_t np = r->n / PG, d0 = 0;
+            for (size_t p = 0; p < np; p++) {
+                uint8_t *a = r->a + p * PG, *cm; size_t pi; uint8_t *sh = in_shadow(a, &cm, &pi);
+                if (sh) {
+                    if (!sh_commit(sh, cm, pi)) { LOG("r1: MARK setup: commit of the shadow FAILED after %.1f MB%s: marks OFF\n", shb / 1048576.0, rb_test_nomem() == 4 ? " (TEST: SSBU_RB_NET_TEST_NOMEM=4)" : ""); mark_undo(); return 0; }
+                    memcpy(sh, r->s + p * PG, PG); shb += PG;
+                } else {
+                    if (cx < g_nx && xo == g_x[cx].n) { cx++; xo = 0; }
+                    if (cx < g_nx && g_x[cx].a + xo == a) { memcpy(g_x[cx].b + xo, r->s + p * PG, PG); xo += PG; }
+                }
+                if (g_rs_drop && (p + 1 - d0 == 256 || p + 1 == np)) { VirtualFree(r->s + d0 * PG, (p + 1 - d0) * PG, MEM_DECOMMIT); dropped += (long long)(p + 1 - d0); d0 = p + 1; }
+            }
+        }
+        if (g_rs_drop) LOG("r1: MARK setup: the copy of the full save given back while the shadow took it (%.1f MB): peak commit ~one copy\n", dropped * (double)PG / 1048576.0);
     }
     uint8_t *m1 = VirtualAlloc(NULL, g_wn1 >> 12, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
     uint8_t *m2 = VirtualAlloc(NULL, WN2 >> 12, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    if (!m1 || !m2) { if (m1) VirtualFree(m1, 0, MEM_RELEASE); if (m2) VirtualFree(m2, 0, MEM_RELEASE); LOG("r1: MARK setup: allocation of the mark maps FAILED: marks OFF\n"); mark_undo(); return 0; }
     *pm1 = m1; *pm2 = m2; *plo1 = (uint64_t)(uintptr_t)g_win1; MemoryBarrier(); *pn2 = WN2; *pn1 = g_wn1;
     r1_m1 = m1; r1_m2 = m2; r1_lo1 = (uint64_t)(uintptr_t)g_win1; MemoryBarrier(); r1_n2 = WN2; r1_n1 = g_wn1;
     {   int nmod = 0; char names[1500]; int o = 0;
@@ -845,6 +1122,8 @@ static void mark_setup(void) {
     for (int i = 0; i < g_nx; i++) if (g_x[i].n >= 65536) LOG("r1:   extra %s + %.0f KB\n", where(g_x[i].a), g_x[i].n / 1024.0);
     LOG("r1: MARK on: window 1 = region at %p, %.1f GB (map %.1f MB), window 2 = %llx + %.0f GB (map %.1f MB); shadow filled with %.1f MB; extras %d ranges %.1f MB copied whole each time\n",
         (void *)g_win1, g_wn1 / 1073741824.0, (g_wn1 >> 12) / 1048576.0, WIN2, WN2 / 1073741824.0, (WN2 >> 12) / 1048576.0, shb / 1048576.0, g_nx, g_xbytes / 1048576.0);
+    ls_after_setup();                                   /* R4: the learned-set save protects the windows (threads still held) */
+    return 1;
 }
 /* every marked page: dir 0 memory -> shadow (save), 1 shadow -> memory (restore); marks cleared. Returns pages. */
 /* Round 5 (cheaper sweep): window 1 is 62 GB (a 15.5 MB map) but the game commits only ~2 GB of it: the map is swept only
@@ -866,9 +1145,10 @@ static void blk1_init(void) {                           /* mark_setup, threads h
     if (g_full_sweep < 0) g_full_sweep = getenv("SSBU_R1_FULL_SWEEP") != NULL;
     if (g_full_sweep || g_blk1 || !g_win1) return;
     uint8_t *b = calloc((size_t)(g_wn1 >> 18) + 1, 1);
-    g_blk1 = b;
+    if (!b) return;                                     /* (hs13) out of memory: the whole map is swept (slower, the same pages) */
     {   /* window 2 (image + modules, 8 GB): the 64-page blocks of the first save's ranges there (nothing is committed there in a fight) */
         size_t nb2 = (size_t)(WN2 >> 18); uint8_t *b2 = calloc(nb2, 1); size_t k = 0;
+        if (!b2) { free(b); return; }
         for (int i = 0; i < g_nr; i++) {
             uintptr_t a = (uintptr_t)g_r[i].a;
             if (a < WIN2 || a >= WIN2 + WN2) continue;
@@ -876,6 +1156,8 @@ static void blk1_init(void) {                           /* mark_setup, threads h
         }
         for (size_t q = 0; q < nb2; q++) k += b2[q];
         g_blk2_list = malloc((k + 1) * sizeof *g_blk2_list); g_blk2_n = 0;
+        if (!g_blk2_list) { free(b2); free(b); return; }
+        g_blk1 = b;
         for (size_t q = 0; q < nb2; q++) if (b2[q]) g_blk2_list[g_blk2_n++] = (uint32_t)q;
         free(b2);
     }
@@ -890,7 +1172,13 @@ static HANDLE g_cp_go[8], g_cp_done[8];
 static void cp_add(uint8_t *d, const uint8_t *s) { if (g_ncj >= g_cjcap) { g_cjcap = g_cjcap ? g_cjcap * 2 : 65536; g_cj = realloc(g_cj, g_cjcap * sizeof *g_cj); } g_cj[g_ncj].d = d; g_cj[g_ncj].s = s; g_ncj++; }
 static void cp_add_range(uint8_t *d, const uint8_t *s, size_t n) { for (size_t o = 0; o < n; o += PG) cp_add(d + o, s + o); }
 static uint8_t *g_cp_cmp;                             /* (R2 round 3) set: the queued jobs are COMPARED (g_cp_cmp[i] = 1 if they differ), not copied */
-static void cp_part(int k) { size_t a = g_ncj * (size_t)k / (size_t)(g_ncp + 1), b = g_ncj * (size_t)(k + 1) / (size_t)(g_ncp + 1); if (g_cp_cmp) { for (size_t i = a; i < b; i++) g_cp_cmp[i] = memcmp(g_cj[i].d, g_cj[i].s, PG) != 0; } else for (size_t i = a; i < b; i++) memcpy(g_cj[i].d, g_cj[i].s, PG); }
+/* (R3 net3) g_cp_cond set: each queued page is copied only if it differs from its source (a ring load: most learned pages
+ * already hold the value being loaded; reading both is cheaper than writing the page); g_cp_wrote[k] counts the copies */
+static int g_cp_cond; static volatile long long g_cp_wrote[9];
+static void cp_part(int k) { size_t a = g_ncj * (size_t)k / (size_t)(g_ncp + 1), b = g_ncj * (size_t)(k + 1) / (size_t)(g_ncp + 1);
+    if (g_cp_cmp) { for (size_t i = a; i < b; i++) g_cp_cmp[i] = memcmp(g_cj[i].d, g_cj[i].s, PG) != 0; }
+    else if (g_cp_cond) { long long w = 0; for (size_t i = a; i < b; i++) if (memcmp(g_cj[i].d, g_cj[i].s, PG)) { memcpy(g_cj[i].d, g_cj[i].s, PG); w++; } g_cp_wrote[k < 9 ? k : 8] += w; }
+    else for (size_t i = a; i < b; i++) memcpy(g_cj[i].d, g_cj[i].s, PG); }
 static DWORD WINAPI cp_thread(void *p) { int k = (int)(intptr_t)p; for (;;) { WaitForSingleObject(g_cp_go[k], INFINITE); cp_part(k + 1); SetEvent(g_cp_done[k]); } return 0; }
 static void cp_init(void) {
     if (g_ncp >= 0) return;
@@ -937,7 +1225,7 @@ static size_t mark_sweep(int dir) {
 static void mark_save(Ctx *c) {
     if (g_mcheck) {                                     /* the full snapshot of the check is taken INSIDE the same hold (round 4) */
         collect(c);
-        for (int i = 0; i < g_nr; i++) g_r[i].s = malloc(g_r[i].n);
+        for (int i = 0; i < g_nr; i++) g_r[i].s = rs_alloc(g_r[i].n);
     }
     double t0 = now_ms();
     park(0);
@@ -1138,7 +1426,7 @@ static uint64_t g_ra_site;                                /* GA(13.0.4 0x7103749
 static double g_rap[3][4]; static long long g_rapn[3];  /* per pass kind (0 normal, 1 speculative, 2 real after a restore): pass start -> poll, poll -> frame end, frame end call, frame end -> next save point */
 static double g_ra_fe_end; static int g_ra_fe_kind; static double g_t_poll;
 static double g_ra_comp[2][5];static long long g_ra_ncomp[2];      /* save / restore: sweep + page copy, extras, fibers, command buffers, release */
-static volatile int g_ra_wd_pause;static int g_ra_submit_mode;
+static volatile int g_ra_wd_pause, g_ra_wd_base;   /* 1 = paused, 2 = long limit (R3 online match, rb_rollback.c) */static int g_ra_submit_mode;
 static int g_ra_skip = 1; static long long g_ra_skipped_kicks, g_ra_skipped_lines;      /* default 1: the preparation kicks of a speculative pass (pictures and hash checked identical); 2 (the render kick) changes 0.3 % of the picture */
 static long long g_ra_skip_why[4];                      /* holds that failed: task worker, audio, other thread, a job fiber running */
 static const char *g_ra_busy;
@@ -1168,9 +1456,12 @@ static int ra_fight_on(void) {
 /* a suspended thread is safe to keep held only if it is BLOCKED in a system call (its RIP right after a `syscall`
  * instruction): one that is suspended while it runs our import code may hold the os object table lock or an object's
  * critical section (seen: nus3::audio update held inside obj() -> the game's thread blocked on that lock for good) */
+static uint64_t g_tb_rsp, g_tb_rip;                     /* (hs16) the context th_blocked read last */
 static int th_blocked(HANDLE h) {
     CONTEXT x; memset(&x, 0, sizeof x); x.ContextFlags = CONTEXT_CONTROL;
+    g_tb_rsp = g_tb_rip = 0;
     if (!GetThreadContext(h, &x)) return 0;
+    g_tb_rsp = x.Rsp; g_tb_rip = x.Rip;
     const uint8_t *r = (const uint8_t *)(uintptr_t)x.Rip;
     static uintptr_t lo[8], hi[8]; static int nc;           /* (R2) executable regions already queried: system-call stubs stay put */
     uintptr_t a = (uintptr_t)(r - 2); int known = 0;
@@ -1185,8 +1476,24 @@ static int th_blocked(HANDLE h) {
 static int ra_audio(const char *n) { return strstr(n, "nus3::audio") || strstr(n, "sindou") || strstr(n, "AudioDevice"); }
 static int ra_free(const char *n) { return strstr(n, "nopus") != NULL; }      /* never in a waiting import; its pages (decoder state, output) are not simulation */
 /* save: every other guest thread held inside a waiting import (its place and registers noted); 0 = one was not there in time */
+/* (R3 hs16, TEST ONLY) SSBU_RB_HOLD_PROF=1: where a hold's time goes, per thread (suspend + context + retries), and the
+ * fiber check; printed in the rollback report */
+static int g_hp_on = -1; static struct { const char *n; double ms, mx; long long cnt, spins; } g_hp[64]; static int g_hp_n; static double g_hp_fib_ms; static long long g_hp_fib_n, g_hp_holds;
+static void hp_add(const char *n, double ms, int spins) {
+    if (g_ra_phase == 2 && ra_audio(n)) n = !strcmp(n, "nus3::audio update") ? "(re-run passes) nus3::audio update" : "(re-run passes) other sound thread";
+    int i; for (i = 0; i < g_hp_n; i++) if (g_hp[i].n == n || !strcmp(g_hp[i].n, n)) break;
+    if (i == g_hp_n) { if (g_hp_n >= 64) return; g_hp[g_hp_n++].n = n; }
+    g_hp[i].ms += ms; g_hp[i].cnt++; g_hp[i].spins += spins; if (ms > g_hp[i].mx) g_hp[i].mx = ms;
+}
+static void r1_hold_prof_report(void) {
+    if (g_hp_on <= 0) return;
+    LOG("r1: HOLD PROF: %lld holds; fiber checks %lld, %.4f ms each\n", g_hp_holds, g_hp_fib_n, g_hp_fib_n ? g_hp_fib_ms / g_hp_fib_n : 0.0);
+    for (int i = 0; i < g_hp_n; i++) LOG("r1: HOLD PROF thread %s: %lld times, mean %.4f ms, max %.3f ms, retries %lld\n", g_hp[i].n, g_hp[i].cnt, g_hp[i].ms / (g_hp[i].cnt ? g_hp[i].cnt : 1), g_hp[i].mx, g_hp[i].spins);
+}
 static int ra_hold_save(void) {
     DWORD me = GetCurrentThreadId(); Ctx *tc; const char *nm; HANDLE h;
+    if (g_hp_on < 0) g_hp_on = getenv("SSBU_RB_HOLD_PROF") && atoi(getenv("SSBU_RB_HOLD_PROF")) > 0;
+    if (g_hp_on) g_hp_holds++;
     g_nth = 0;
     for (int i = 0; guest_thread_info(i, &tc, &nm, &h) && g_nth < 256; i++) {
         if (!h || GetThreadId(h) == me) continue;
@@ -1202,15 +1509,17 @@ static int ra_hold_save(void) {
         double t0 = now_ms();
         if (all_first && pre[i]) {
             pre[i] = 0;
-            if (waiting_import(t->c->in_import) && th_blocked(t->h)) { t->held = 1; t->parked = 1; t->from = t->c->import_from; t->imp = t->c->in_import; t->regs = *t->c; continue; }
+            if (waiting_import(t->c->in_import) && th_blocked(t->h)) { t->held = 1; t->parked = 1; t->rsp = g_tb_rsp; t->rip = g_tb_rip; t->cok = 1; t->from = t->c->import_from; t->imp = t->c->in_import; t->regs = *t->c; continue; }
             ResumeThread(t->h);
             for (int j = i + 1; j < g_nth; j++) if (pre[j]) { ResumeThread(g_th[j].h); pre[j] = 0; }      /* a thread not at a wait: the others go too (it may wait for one of them) */
         }
+        int spins = 0;
         for (;;) {
             if (SuspendThread(t->h) == (DWORD)-1) break;
-            if (waiting_import(t->c->in_import) && th_blocked(t->h)) { t->held = 1; t->parked = 1; break; }
-            ResumeThread(t->h);
+            if (waiting_import(t->c->in_import) && th_blocked(t->h)) { t->held = 1; t->parked = 1; t->rsp = g_tb_rsp; t->rip = g_tb_rip; t->cok = 1; break; }
+            ResumeThread(t->h); spins++;
             if (now_ms() - t0 > g_ra_park_ms) {
+                if (g_hp_on) hp_add(t->name, now_ms() - t0, spins);
                 for (int j = 0; j < i; j++) if (g_th[j].held) { ResumeThread(g_th[j].h); g_th[j].held = 0; }
                 if (all_first) for (int j = i + 1; j < g_nth; j++) if (pre[j]) { ResumeThread(g_th[j].h); pre[j] = 0; }
                 g_ra_busy = t->name;
@@ -1219,6 +1528,7 @@ static int ra_hold_save(void) {
             }
             SwitchToThread();
         }
+        if (g_hp_on) hp_add(t->name, now_ms() - t0, spins);
         t->from = t->c->import_from; t->imp = t->c->in_import; t->regs = *t->c;
     }
     return 1;
@@ -1226,17 +1536,27 @@ static int ra_hold_save(void) {
 static void ra_release_save(void) { for (int i = 0; i < g_nth; i++) if (g_th[i].held && !ra_audio(g_th[i].name)) { ResumeThread(g_th[i].h); g_th[i].held = 0; } }
 /* restore: each thread at the SAME wait as at the save (the audio threads were never let go) */
 static void ra_hold_restore(void) {
-    g_th_mismatch = 0;
+    g_th_mismatch = 0; g_th_running = 0;
     for (int i = 0; i < g_nth; i++) {
         Th *t = &g_th[i];
         t->same = 0;
         if (t->held) { t->same = 1; continue; }
+        t->cok = 0;
         if (!t->parked) continue;
         double t0 = now_ms();
         for (;;) {
             if (SuspendThread(t->h) == (DWORD)-1) break;
-            if (t->c->import_from == t->from && t->c->in_import == t->imp && th_blocked(t->h)) { t->held = 1; t->same = 1; break; }
-            if (now_ms() - t0 > 500) { t->held = 1; g_th_mismatch++; break; }
+            if (t->c->import_from == t->from && t->c->in_import == t->imp && th_blocked(t->h)) { t->held = 1; t->same = 1; t->rsp = g_tb_rsp; t->rip = g_tb_rip; t->cok = 1; break; }
+            /* (R3 hs11) the sound thread sindou::update alternates SleepThread / WaitEvent; at a ring load it sometimes waits for an
+             * event no held thread signals, and this loop waited the whole 500 ms (a half-second freeze, 2 in 10 normal-speed runs).
+             * An audio thread blocked at another waiting import after 5 ms is taken as it is (what the 500 ms limit did anyway).
+             * SSBU_RB_AUDIO_WAIT=0: the old way. */
+            {   static int aw = -1; if (aw < 0) { const char *e = getenv("SSBU_RB_AUDIO_WAIT"); aw = !(e && e[0] == '0'); }
+                if (aw && rgs_wanted() && ra_audio(t->name) && now_ms() - t0 > 5 && waiting_import(t->c->in_import) && th_blocked(t->h)) { t->held = 1; t->rsp = g_tb_rsp; t->rip = g_tb_rip; t->cok = 1; g_th_audio_other++; break; } }
+            if (now_ms() - t0 > 500) { t->held = 1; g_th_mismatch++; if (!(waiting_import(t->c->in_import) && th_blocked(t->h))) g_th_running++;
+                static int said; if (said++ < 20) LOG("r1: hold for a load: thread %s not back at its wait after 500 ms: held at %s @%llx then, now %s @%llx, blocked %d\n", t->name ? t->name : "?",
+                    t->imp ? t->imp : "guest code", (unsigned long long)t->from, t->c->in_import ? t->c->in_import : "guest code", (unsigned long long)t->c->import_from, th_blocked(t->h));
+                break; }
             ResumeThread(t->h);
             SwitchToThread();
         }
@@ -1259,7 +1579,8 @@ static int ra_hold_quiet(double limit) {
     double t0 = now_ms(); int tries = 0;
     for (;;) {
         if (ra_hold_save()) {
-            if (ra_fibers_quiet()) { if (tries) { g_ra_fiber_waits++; g_ra_fiber_wait_ms += now_ms() - t0; } return 1; }
+            double tf = g_hp_on > 0 ? now_ms() : 0; int fq = ra_fibers_quiet(); if (g_hp_on > 0) { g_hp_fib_ms += now_ms() - tf; g_hp_fib_n++; }
+            if (fq) { if (tries) { g_ra_fiber_waits++; g_ra_fiber_wait_ms += now_ms() - t0; } return 1; }
             for (int i = 0; i < g_nth; i++) if (g_th[i].held) { ResumeThread(g_th[i].h); g_th[i].held = 0; }
             g_ra_busy = "a job fiber (task worker)"; g_ra_skip_why[3]++;
         }
@@ -1370,9 +1691,10 @@ static void ra_step(Ctx *c) {
     if (!g_ra_off && ra_fight_on()) {
         if (!g_ra_ready) {                               /* the first time: a full save, the shadow and the marks (one hitch) */
             double t0 = now_ms();
-            g_save_failed = 0; g_ra_wd_pause = 1;
-            save(c); release();
+            g_save_failed = 0; g_ra_wd_pause = 1; g_rs_drop = 1;
+            save(c); release(); g_rs_drop = 0;
             g_ra_wd_pause = 0;
+            if (g_save_failed == 2) { g_ra_off = 1; LOG("r1: RA: first save not made (out of memory): run-ahead OFF\n"); return; }
             if (g_save_failed) return;
             g_ra_ready = 1; g_cycle = 1; ok = 1;
             LOG("r1: RA: first save (full, shadow filled, marks on) at fight frame %lld in %.1f ms\n", g_ff, now_ms() - t0);
@@ -1411,8 +1733,10 @@ static DWORD WINAPI ra_watchdog(void *p) {
     (void)p;
     for (;;) {
         WaitForSingleObject(g_ra_wd_ev, INFINITE);
+        double t0 = now_ms();
         while (WaitForSingleObject(g_ra_wd_ev, 200) == WAIT_TIMEOUT) {
-            if (g_ra_wd_pause) continue;                 /* (the first, full save takes seconds) */
+            if (g_ra_wd_pause == 1) continue;            /* (the first, full save takes seconds; R3: the safe point's waits) */
+            if (g_ra_wd_pause == 2 && now_ms() - t0 < 10000) continue;      /* R3 online match: a slow pass must not let them go (10 s: H2 never came) */
             if (g_ra_wh_on) { g_ra_wd_fired++; ra_workers_release(); }
             break;
         }
@@ -1434,8 +1758,15 @@ static void ra_workers_hold(void) {
 static void ra_kick2(Ctx *c, void *user) {           /* hook on FUN 0x7103549170 (kick of a job group): points BEFORE the call */
     (void)user;
     uint64_t lr = c->x[30];
-    if (lr == GA(0x71037494fcull) && g_ra_site == GA(0x7103749b24ull) && !g_ra_off && (g_ra_phase || ra_fight_on())) ra_workers_hold();      /* H1 */
-    if (lr == g_ra_site) { ra_step(c); if (g_ra_wh_on) { ra_workers_release(); SetEvent(g_ra_wd_ev); } }      /* H2 */
+    if (lr == GA(0x71037494fcull) && g_ra_site == GA(0x7103749b24ull) && !g_ra_off && (g_ra_phase || ra_fight_on())) {
+        ra_workers_hold();      /* H1 */
+        {   /* (hs10, test only) SSBU_RB_NET_TEST_H1=<fight frame>,<ms>: a slow pass at the first H1 from that fight frame on (the hold watchdog's case) */
+            static long long tf = -2; static int tms;
+            if (tf == -2) { const char *e = getenv("SSBU_RB_NET_TEST_H1"); tf = -1; if (e && *e) sscanf(e, "%lld,%d", &tf, &tms); }
+            if (tf > 0 && g_ff >= tf && g_ra_phase == 0) { tf = -1; Sleep((DWORD)tms); LOG("r1: TEST: a slow pass of %d ms at fight frame %lld, after the workers' hold (watchdog releases so far %lld)\n", tms, g_ff, g_ra_wd_fired); }
+        }
+    }
+    if (lr == g_ra_site) { ra_step(c); if (g_ra_wh_on) { ra_workers_release(); SetEvent(g_ra_wd_ev); } g_ra_wd_pause = g_ra_wd_base; }      /* H2 (R3: rb_rollback.c pauses the watchdog while it runs here, and keeps the long limit during the match) */
     if ((g_ra_phase == 1 && g_ra_skip) || rgs_skip_now()) {      /* SSBU_RUNAHEAD_SKIP (experiment): job groups of the speculative pass whose result is thrown away (R2: SSBU_RB_SIM_SKIP, re-run passes but the last) */
         int prep = c->x[30] == GA(0x7103749b24ull) || c->x[30] == GA(0x710374b4f8ull) || c->x[30] == GA(0x710374b528ull) || c->x[30] == GA(0x710374b558ull), rend = c->x[30] == GA(0x710374c0d8ull);
         int logic = c->x[30] == GA(0x710374c398ull) || c->x[30] == GA(0x710374c5b8ull);
@@ -1457,12 +1788,12 @@ static void ra_line(Ctx *c, void *user) {           /* the fighters' frame line:
     if (g_ra_phase == 1 && (g_ra_skip & 8)) { g_ra_skipped_lines++; return; }      /* SSBU_RUNAHEAD_SKIP bit 8: a speculative pass's fighters do not run their frame (its result is thrown away) */
     g_orig_line(c);
 }
-static void ra_report(void);
+static void ra_report(void); static int rbg_noring_now(void);
 static void ra_frame_end(double te) {
     double fe = now_ms();
     if (g_ra_ready && g_t_poll > g_ra_t_mark && te > g_t_poll) { int k = g_ra_phase; g_rap[k][0] += g_t_poll - g_ra_t_mark; g_rap[k][1] += te - g_t_poll; g_rap[k][2] += fe - te; g_ra_fe_end = fe; g_ra_fe_kind = k + 1; }
     g_ra_fe++;
-    { static long long n; if (++n % 1200 == 0 && g_ra_ready) ra_report(); }
+    { static long long n; if (++n % 1200 == 0 && (g_ra_ready || rbg_noring_now())) ra_report(); }      /* (hs14: a match without the ring too) */
     if (InterlockedExchange(&g_ra_lines, 0) > 0) {      /* this iteration ran a fight frame: real or speculative (for tests\r1_ra_cmp.py) */
         if (g_ra_nkind >= g_ra_kcap) { g_ra_kcap = g_ra_kcap ? g_ra_kcap * 2 : 65536; g_ra_kind = realloc(g_ra_kind, (size_t)g_ra_kcap); }
         g_ra_kind[g_ra_nkind++] = g_ra_phase == 1 || (g_ra_phase == 2 && rgs_wanted()) ? 'S' : 'R';      /* (R2 simulation: a re-run pass = 'S') */
@@ -1487,6 +1818,7 @@ static void ra_report(void) {
     if (rgs_wanted()) rgs_report();
 }
 #include "r1_ring.c"                                  /* R2: the snapshot ring (rollback) */
+#include "rb_rollback.c"                              /* R3: online rollback on the ring (SSBU_RB_NET) */
 static void ra_init(void) {
     g_ra = 1;
     if (getenv("SSBU_RUNAHEAD_PARK_MS")) g_ra_park_ms = atof(getenv("SSBU_RUNAHEAD_PARK_MS"));
@@ -1497,12 +1829,18 @@ static void ra_init(void) {
     if (g_ra_submit_mode) LOG("r1: RUN-AHEAD mode submit (no speculative pass; the submission step 71037f0590 is called at the save point): hook %s\n", hook_install(GA(0x71037f0590ull), ra_submit_hook, NULL, &g_orig_submit) ? "installed" : "FAILED");
     g_ra_wd_ev = CreateEventA(NULL, FALSE, FALSE, NULL); CloseHandle(CreateThread(NULL, 0, ra_watchdog, NULL, 0, NULL));
     g_park_ms = 20;
-    g_mark = mark_bind();
+    g_mark = mark_bind(); if (!g_mark) g_mark = ls_bind();      /* R4: no marked DLL: the learned set (rb_learned.c) */
     int k = hook_install(GA(0x710354c720ull), ra_kick, NULL, &g_orig_kick) && hook_install(GA(0x7103549170ull), ra_kick2, NULL, &g_orig_kick2);
     int l = hook_install_name("_ZN7lua2cpp16L2CFighterCommon31sys_line_system_control_fighterEv", ra_line, NULL, &g_orig_line);
     LOG("r1: RUN-AHEAD on (one frame): marks %s; save point: the return of the job-counter wait 710354c720 called at 710374c028 (preparation done, before the render kick): %s; frame line counter: %s; park %.1f ms\n",
         g_mark > 0 ? "yes" : "NO (run-ahead will stay off)", k ? "installed" : "FAILED", l ? "installed or waiting" : "FAILED", g_ra_park_ms);
-    if (rgs_wanted()) { if (getenv("SSBU_RB_SIM_SKIP")) g_rgs_skip = atoi(getenv("SSBU_RB_SIM_SKIP"));
+    if (rgs_wanted() && rbg_on()) {                       /* R3: re-run passes but the last skip the preparation kicks + lists (49) and the presentation callees (127), proven exact in R2 round 3 */
+        g_rgs_skip = getenv("SSBU_RB_SIM_SKIP") ? atoi(getenv("SSBU_RB_SIM_SKIP")) : 49;
+        if (!getenv("SSBU_RB_SIM_LITE")) _putenv("SSBU_RB_SIM_LITE=127");
+        rbn_init();
+        LOG("r1: RB NET on (R3 online rollback on the snapshot ring): kick skip mask in re-run passes %d\n", g_rgs_skip);
+        rgs_lite_init(); }
+    else if (rgs_wanted()) { if (getenv("SSBU_RB_SIM_SKIP")) g_rgs_skip = atoi(getenv("SSBU_RB_SIM_SKIP"));
         LOG("r1: RB SIM on (R2 snapshot ring): a rollback every %d real passes, k = 1..%d rotating, after %d captures; kick skip mask in re-run passes %d\n", g_rgs_n, g_rgs_k, g_rgs_warm, g_rgs_skip);
         rgs_lite_init(); }
     atexit(ra_report);
@@ -1580,6 +1918,9 @@ int r1_poll(int ticks) {
     return g_phase == 2 && g_ipad < g_npad;
 }
 /* nnhid.c, player 1's values just before they are written: recorded in the first pass, replaced in the re-run */
+/* nnhid.c, port 2's values just before they are written (R3 online rollback only) */
+void r1_pad_id(int id, uint64_t *b, int *lx, int *ly, int *rx, int *ry) { if (g_ra > 0 && rgs_wanted() && rbg_on()) rbg_pad(id, b, lx, ly, rx, ry); }
+int r1_net_on(void) { return rbn_on() > 0; }
 void r1_pad(uint64_t *b, int *lx, int *ly, int *rx, int *ry) {
     if (g_ra > 0 && rgs_wanted()) { rgs_pad(b, lx, ly, rx, ry); return; }      /* R2 simulation: recorded per pass, given again in its re-run */
     if (g_ra > 0) {                                       /* run-ahead: the speculative pass gets player 1's last real values */
@@ -1600,6 +1941,7 @@ void r1_init(void) {
     g_prot = getenv("SSBU_R1_MARK_PROT") != NULL; if (g_prot) AddVectoredExceptionHandler(1, prot_veh); g_mcheck = getenv("SSBU_R1_MARK_CHECK") != NULL; if (g_mark && !mark_bind()) g_mark = 0;
     g_fast = getenv("SSBU_R1_FAST") != NULL; g_fcheck = getenv("SSBU_R1_FAST_CHECK") != NULL; if (getenv("SSBU_R1_LEARN")) g_learn = atoi(getenv("SSBU_R1_LEARN"));
     g_r1_keep_fibers = 1; g_wait_idle = getenv("SSBU_R1_WAIT_IDLE") != NULL; g_busy_log = g_wait_idle ? 3 : 0;
+    ls_init();                                          /* R4: the presentation pool of the learned-set save */
     if (ra_wanted()) ra_init(); else g_ra = 0;
     int id = hook_install(GA(0x710386fc30ull), r1_frame_end, NULL, &g_orig_frame_end);
     LOG("r1: SSBU_R1 save at fight frame %d, %d frames, every %d frames, %d cycles; hook on the frame end 710386fc30: %s\n", g_n, g_k, g_p, g_c, id ? "installed" : "FAILED");
@@ -1689,14 +2031,16 @@ static void dc_set(void *p, size_t n, int v) {
     if (i1 > (g_wn1 >> 12)) i1 = g_wn1 >> 12;
     memset(g_dc + i0, v, i1 - i0);
 }
-void r1_on_decommit(void *p, size_t n) { r1_mark_range((uint64_t)(uintptr_t)p, n); dc_set(p, n, 1); }
+void r1_on_decommit(void *p, size_t n) { r1_mark_range((uint64_t)(uintptr_t)p, n); ls_range((uint64_t)(uintptr_t)p, n, 1); dc_set(p, n, 1); }
 void r1_on_commit(void *p, size_t n) {
     dc_set(p, n, 0);
+    ls_range((uint64_t)(uintptr_t)p, n, 2);              /* R4: new pages of a fight read-only (their first write faults) */
     uint8_t *a = (uint8_t *)p;
     if (g_blk1 && n && a >= g_win1 && a < g_win1 + g_wn1) blk1_add((size_t)(a - g_win1) >> 12, ((size_t)(a - g_win1) + n + PG - 1) >> 12);      /* round 5: the sweep covers it */
 }
 static void prot_open(uint64_t a, uint64_t n);
-void r1_wrote(uint64_t a, uint64_t n) { r1_mark_range(a, n); if (g_prot_on) prot_open(a, n); }          /* host code that writes guest memory (nnhid.c, nnfs.c reads: the kernel's writes do not fault) */
+void r1_read_retry_note(void) { InterlockedIncrement64(&g_read_retry); }      /* (R4) nnfs.c read_at: a read repeated after ERROR_NOACCESS */
+void r1_wrote(uint64_t a, uint64_t n) { r1_mark_range(a, n); ls_range(a, n, 0); if (g_prot_on) prot_open(a, n); }          /* host code that writes guest memory (nnhid.c, nnfs.c reads: the kernel's writes do not fault) */
 /* "not simulation": pages written by audio decoding etc.: not rolled back, not checked */
 void r1_nosim(uint64_t a, uint64_t n) {
     if (!g_ns1 || !n) return;
@@ -1733,3 +2077,4 @@ void r1_register_heap(void) {
     register_imports(defs, (int)(sizeof defs / sizeof defs[0]));
     LOG("r1: guest malloc / new served from a 32 GB reservation at %p (inside the snapshot)\n", (void *)g_ar);
 }
+#endif

@@ -1,4 +1,4 @@
-# The installer window of the Super Smash Bros. Ultimate native PC port (GPL-3.0). `Install SSBU.bat` -> scripts\bootstrap.ps1
+﻿# The installer window of the Super Smash Bros. Ultimate native PC port (GPL-3.0). `Install SSBU.bat` -> scripts\bootstrap.ps1
 # puts a private Python into deps\python and then starts this file:
 #   powershell -NoProfile -ExecutionPolicy Bypass -STA -WindowStyle Hidden -File scripts\installer_window.ps1
 # Windows PowerShell 5.1 + System.Windows.Forms only; no modules, nothing is installed, nothing is sent anywhere.
@@ -204,11 +204,37 @@ $fontUi = New-Object System.Drawing.Font('Segoe UI', 9)
 $fontBold = New-Object System.Drawing.Font('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)
 $fontTitle = New-Object System.Drawing.Font('Segoe UI', 13, [System.Drawing.FontStyle]::Bold)
 $fontMono = New-Object System.Drawing.Font('Consolas', 9)
-$cOk = [System.Drawing.Color]::FromArgb(0, 128, 0)
-$cWarn = [System.Drawing.Color]::FromArgb(176, 96, 0)
-$cFail = [System.Drawing.Color]::FromArgb(200, 30, 30)
-$cInfo = [System.Drawing.Color]::FromArgb(0, 90, 180)
-$cDim = [System.Drawing.Color]::DimGray
+# dark mode: follows Windows (Settings > Personalisation > Colours > app mode); SSBU_INSTALLER_THEME=dark / light forces one
+$script:dark = $false
+try {
+    $tm = [string]$env:SSBU_INSTALLER_THEME
+    if ($tm -eq 'dark') { $script:dark = $true }
+    elseif ($tm -ne 'light') {
+        $v = Get-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize' -Name AppsUseLightTheme -ErrorAction Stop
+        $script:dark = ($v.AppsUseLightTheme -eq 0)
+    }
+} catch {}
+if ($script:dark) {
+    $cOk = [System.Drawing.Color]::FromArgb(110, 210, 110)
+    $cWarn = [System.Drawing.Color]::FromArgb(240, 175, 70)
+    $cFail = [System.Drawing.Color]::FromArgb(255, 110, 105)
+    $cInfo = [System.Drawing.Color]::FromArgb(110, 175, 255)
+    $cDim = [System.Drawing.Color]::FromArgb(160, 160, 160)
+    $cFg = [System.Drawing.Color]::FromArgb(232, 232, 232)
+    $cBg = [System.Drawing.Color]::FromArgb(32, 32, 32)
+    $cBgField = [System.Drawing.Color]::FromArgb(45, 45, 48)
+    $cBgButton = [System.Drawing.Color]::FromArgb(58, 58, 62)
+} else {
+    $cOk = [System.Drawing.Color]::FromArgb(0, 128, 0)
+    $cWarn = [System.Drawing.Color]::FromArgb(176, 96, 0)
+    $cFail = [System.Drawing.Color]::FromArgb(200, 30, 30)
+    $cInfo = [System.Drawing.Color]::FromArgb(0, 90, 180)
+    $cDim = [System.Drawing.Color]::DimGray
+    $cFg = [System.Drawing.SystemColors]::ControlText
+    $cBg = [System.Drawing.SystemColors]::Control
+    $cBgField = [System.Drawing.Color]::White
+    $cBgButton = [System.Drawing.SystemColors]::Control
+}
 
 $scale = 1.0
 try { $gx = [System.Drawing.Graphics]::FromHwnd([IntPtr]::Zero); $scale = [Math]::Max(1.0, $gx.DpiX / 96.0); $gx.Dispose() } catch {}
@@ -337,7 +363,7 @@ function Add-Field([string]$key, [string]$label, [string]$kind, [string]$hint) {
 Add-Field 'base' 'Base game' 'base' 'Your game: .xci / .nsp / .nsz / .nca, or a folder you already extracted (with exefs\ and romfs\). Looking...'
 Add-Field 'update' 'Update' 'update' '13.0.4 or 13.0.5 (.nsp / .nsz). Looking...'
 Add-Field 'prodkeys' 'prod.keys' 'keys' 'Your console keys: needed to read package files. Looking...'
-Add-Field 'firmware' 'Firmware (optional)' 'fw' 'Your own firmware fonts (folder with the firmware .nca files); otherwise open-source fonts are used. Looking...'
+Add-Field 'firmware' 'Firmware (optional)' 'fw' 'Only the fonts change. With your firmware: the console''s own fonts, Chinese / Japanese / Korean text included. Without: open-source fonts (same game, Latin text looks a little different, Asian characters missing). Looking...'
 
 # DLC list (optional)
 $dr = $tIn.RowCount
@@ -395,16 +421,25 @@ function New-Check([string]$text, [bool]$on) {
 }
 $script:cbShort = New-Check 'Create desktop and Start menu shortcuts' $true
 $script:cbUpd = New-Check 'Check for updates first' $true
-$script:cbRuntime = New-Check 'Use the prebuilt runtime (no Visual Studio needed)' $true
+$script:cbRuntime = New-Check 'Use the prebuilt runtime (recommended)' $true
+$script:tips = New-Object System.Windows.Forms.ToolTip
+$script:tips.AutoPopDelay = 20000
+$script:tips.SetToolTip($script:cbRuntime, 'No Visual Studio needed (about 3 GB less disk), some minutes shorter. The game you get is the same.')
+$script:cbFast = New-Check 'Shorter build, slower game (no inlining)' $false
+$script:tips.SetToolTip($script:cbFast, 'The game compiles in about half the time, but runs slower on the CPU (up to 25-30 % on the main thread). Leave it off unless the build takes too long on your PC.')
 $script:cbDry = New-Check 'Dry run (show what would happen, change nothing)' $false
 $fJobs = New-Object System.Windows.Forms.FlowLayoutPanel
 $fJobs.AutoSize = $true; $fJobs.WrapContents = $false
-[void]$fJobs.Controls.Add((New-Label 'Compiler jobs:'))
+$lblJ = New-Label 'Compiler jobs:'
+[void]$fJobs.Controls.Add($lblJ)
 $script:numJobs = New-Object System.Windows.Forms.NumericUpDown
 $script:numJobs.Minimum = 1; $script:numJobs.Maximum = 64; $script:numJobs.Width = (S 56)
 $script:numJobs.Value = [Math]::Max(1, [Math]::Min(24, [Environment]::ProcessorCount - 2))
 [void]$fJobs.Controls.Add($script:numJobs)
-[void]$fJobs.Controls.Add((New-Label '(fewer = the PC stays usable while it builds)' $cDim))
+$script:lblJobs = New-Label '(fewer = slower, PC stays usable)' $cDim
+[void]$fJobs.Controls.Add($script:lblJobs)
+$tJ = 'Compilers running at once. Each takes a CPU thread and about 1.5 GB of RAM: more than the safe number can run the PC out of memory. Fewer = slower, but the PC stays usable.'
+foreach ($c in @($lblJ, $script:numJobs, $script:lblJobs)) { $script:tips.SetToolTip($c, $tJ) }
 [void]$fOpt.Controls.Add($fJobs)
 $gOpt.Controls.Add($fOpt)
 $p2.Controls.Add($gOpt, 1, 0)
@@ -461,7 +496,7 @@ $page.Controls.Add($script:lblErr, 0, 5)
 # row 6: log
 $script:logBox = New-Object System.Windows.Forms.TextBox
 $script:logBox.Multiline = $true; $script:logBox.ReadOnly = $true; $script:logBox.ScrollBars = 'Both'; $script:logBox.WordWrap = $false
-$script:logBox.MinimumSize = New-Object System.Drawing.Size(0, (S 130)); $script:logBox.Font = $fontMono; $script:logBox.Dock = 'Fill'; $script:logBox.BackColor = [System.Drawing.Color]::White
+$script:logBox.MinimumSize = New-Object System.Drawing.Size(0, (S 130)); $script:logBox.Font = $fontMono; $script:logBox.Dock = 'Fill'; $script:logBox.BackColor = $cBgField; $script:logBox.ForeColor = $cFg
 $script:logBox.MaxLength = 0
 $page.Controls.Add($script:logBox, 0, 6)
 
@@ -594,7 +629,7 @@ function Update-FieldStatus {
     } else { Set-FieldStatus 'prodkeys' 'This file does not exist.' $cFail }
 
     $v = $script:F['firmware'].Box.Text.Trim().Trim('"')
-    if (-not $v) { Set-FieldStatus 'firmware' 'Optional: your own firmware fonts; otherwise open-source fonts are used.' $cWarn }
+    if (-not $v) { Set-FieldStatus 'firmware' 'Optional. Only the fonts change: without it open-source fonts are used (no Chinese / Japanese / Korean characters). The game is the same.' $cWarn }
     elseif (Is-Dir $v) {
         $it = if ($fd) { Find-Item $fd.firmware $v } else { $null }
         if ($it) { Set-FieldStatus 'firmware' (Strip-Desc $it) $cOk }
@@ -725,7 +760,7 @@ function Reset-Steps {
 }
 function Add-Step([string]$id, [string]$title, [double]$est) {
     if ($est -le 0) { $est = 10 }
-    $s = @{ id = $id; title = $title; est = $est; state = 'wait'; secs = 0.0; done = 0.0; total = 0.0; t0 = $null; msg = ''; item = $null }
+    $s = @{ id = $id; title = $title; est = $est; state = 'wait'; secs = 0.0; done = 0.0; total = 0.0; estp = $false; t0 = $null; msg = ''; item = $null }
     $item = New-Object System.Windows.Forms.ListViewItem($title)
     [void]$item.SubItems.Add('waiting'); [void]$item.SubItems.Add(''); [void]$item.SubItems.Add('')
     $item.ImageKey = 'wait'
@@ -744,14 +779,14 @@ function Show-Step($s) {
     elseif ($s.secs -gt 0) { $t = Fmt-Dur $s.secs }
     $it.SubItems[2].Text = $t
     $note = $s.msg
-    if ($s.state -eq 'run' -and $s.total -gt 0) { $note = ('{0} / {1}  {2}' -f [int]$s.done, [int]$s.total, $s.msg).Trim() }
+    if ($s.state -eq 'run' -and $s.total -gt 0 -and -not $s.estp) { $note = ('{0} / {1} files  {2}' -f [int]$s.done, [int]$s.total, $s.msg).Trim() }   # (estimated seconds: no numbers)
     $it.SubItems[3].Text = $note
     switch ($s.state) {
         'fail' { $it.ForeColor = $cFail }
         'skip' { $it.ForeColor = $cDim }
         'wait' { $it.ForeColor = $cDim }
-        'run'  { $it.ForeColor = [System.Drawing.SystemColors]::ControlText }
-        default { $it.ForeColor = [System.Drawing.SystemColors]::ControlText }
+        'run'  { $it.ForeColor = $cFg }
+        default { $it.ForeColor = $cFg }
     }
 }
 function Get-StepById([string]$id) {
@@ -853,6 +888,7 @@ function Handle-Event($e) {
             if ($s) {
                 if ($null -ne $e.done) { $s.done = [double]$e.done }
                 if ($null -ne $e.total) { $s.total = [double]$e.total }
+                $s.estp = [bool]$e.est
                 if ($s.state -eq 'wait') { Set-StepState $s 'run' $null '' }
                 if ($e.msg) { $s.msg = [string]$e.msg }
             }
@@ -923,7 +959,7 @@ function Set-Buttons {
     $script:btnUpdate.Enabled = (-not $run) -and $ok
     foreach ($k in $script:F.Keys) { $script:F[$k].Box.Enabled = -not $run; foreach ($b in $script:F[$k].Buttons) { $b.Enabled = -not $run } }
     $script:dlcList.Enabled = -not $run; $script:btnDlcAdd.Enabled = -not $run; $script:btnDlcDel.Enabled = -not $run; $script:btnDlcClr.Enabled = -not $run
-    foreach ($c in @($script:cbShort, $script:cbUpd, $script:cbRuntime, $script:cbDry, $script:numJobs)) { $c.Enabled = -not $run }
+    foreach ($c in @($script:cbShort, $script:cbUpd, $script:cbRuntime, $script:cbFast, $script:cbDry, $script:numJobs)) { $c.Enabled = -not $run }
     $script:btnMsvc.Enabled = -not $run
     $loc = Get-ChosenBuild                # Play and Resume follow the install location shown in the window
     $script:btnPlay.Enabled = (-not $run) -and (Test-Path -LiteralPath ([IO.Path]::Combine($loc, 'work\ssbu_native.exe'))) -and (Same-Path $loc $buildDir)
@@ -955,6 +991,7 @@ function Build-InstallArgs([bool]$forceDry) {
     if ($forceDry -or $script:cbDry.Checked) { [void]$a.Add('--dry-run') }
     if (-not $script:cbRuntime.Checked) { [void]$a.Add('--no-runtime') }
     if (-not $script:cbShort.Checked) { [void]$a.Add('--no-shortcuts') }
+    if ($script:cbFast.Checked) { [void]$a.Add('--no-inline') }
     if (-not $script:cbUpd.Checked) { [void]$a.Add('--no-self-update') }
     return ($a -join ' ')
 }
@@ -1164,7 +1201,8 @@ function Apply-Precheck {
             $script:buildGb = [double]$c.build_gb; $script:dumpGb = [double]$c.dump_gb; Update-LocStatus
         }
         if ($c.what -eq 'Memory' -and ([string]$c.msg) -match '--jobs (\d+)') {
-            $j = [int]$Matches[1]; if ($j -ge 1 -and $j -le 64) { $script:numJobs.Value = $j }
+            $j = [int]$Matches[1]; if ($j -ge 1 -and $j -le 64) { $script:numJobs.Value = $j
+                $script:lblJobs.Text = ('(safe here: 1 to {0})' -f $j) }
         }
     }
 }
@@ -1367,6 +1405,41 @@ if (-not $testMode) {
 $script:btnPlay.Enabled = $false
 Update-FieldStatus
 [System.Windows.Forms.Application]::add_ThreadException({ param($s, $e) Log-Add ('window error: ' + $e.Exception.Message) })
+function Set-DarkTheme($c) {
+    # every control once, before the window shows: fields and lists a shade lighter than the background, flat buttons;
+    # a label keeps a colour of its own (status lines: green / orange / red / dim)
+    $t = $c.GetType().Name
+    if ($t -in 'TextBox', 'ListView', 'ListBox', 'RichTextBox', 'NumericUpDown', 'ComboBox') {
+        $c.BackColor = $cBgField; $c.ForeColor = $cFg
+        if ($t -eq 'ListView') {    # the column headers are drawn by Windows in light colours: drawn here instead
+            $c.OwnerDraw = $true
+            $c.Add_DrawColumnHeader({ param($s, $e)
+                $e.Graphics.FillRectangle((New-Object System.Drawing.SolidBrush($cBgButton)), $e.Bounds)
+                [System.Windows.Forms.TextRenderer]::DrawText($e.Graphics, $e.Header.Text, $s.Font, $e.Bounds, $cFg, [System.Windows.Forms.TextFormatFlags]::VerticalCenter -bor [System.Windows.Forms.TextFormatFlags]::Left) })
+            $c.Add_DrawItem({ param($s, $e) $e.DrawDefault = $true })
+            $c.Add_DrawSubItem({ param($s, $e) $e.DrawDefault = $true })
+        }
+    }
+    elseif ($t -eq 'GroupBox') { $c.BackColor = $cBg; $c.ForeColor = $cFg }
+    elseif ($t -eq 'Button') { $c.FlatStyle = 'Flat'; $c.BackColor = $cBgButton; $c.ForeColor = $cFg; $c.FlatAppearance.BorderColor = [System.Drawing.Color]::FromArgb(90, 90, 96) }
+    else {
+        $c.BackColor = $cBg
+        if ($c.ForeColor.ToArgb() -eq [System.Drawing.SystemColors]::ControlText.ToArgb() -or $c.ForeColor.ToArgb() -eq [System.Drawing.SystemColors]::WindowText.ToArgb()) { $c.ForeColor = $cFg }
+    }
+    foreach ($k in $c.Controls) { Set-DarkTheme $k }
+}
+if ($script:dark) {
+    Set-DarkTheme $form
+    try {    # the title bar too (Windows 10 2004+ / 11: DWMWA_USE_IMMERSIVE_DARK_MODE)
+        Add-Type -Namespace SsbuInst -Name Dwm -MemberDefinition '[DllImport("dwmapi.dll")] public static extern int DwmSetWindowAttribute(IntPtr h, int a, ref int v, int s);' -ErrorAction Stop
+        $form.Add_HandleCreated({ $one = 1; [void][SsbuInst.Dwm]::DwmSetWindowAttribute($form.Handle, 20, [ref]$one, 4) })
+    } catch {}
+}
+if ($env:SSBU_INSTALLER_SNAPSHOT) {      # test only: a picture of the window 3 s after it shows (theme checks)
+    $snapT = New-Object System.Windows.Forms.Timer; $snapT.Interval = 3000
+    $snapT.Add_Tick({ $snapT.Stop(); try { $bm = New-Object System.Drawing.Bitmap($form.Width, $form.Height); $form.DrawToBitmap($bm, (New-Object System.Drawing.Rectangle(0, 0, $form.Width, $form.Height))); $bm.Save($env:SSBU_INSTALLER_SNAPSHOT) } catch {} })
+    $form.Add_Shown({ $snapT.Start() })
+}
 [System.Windows.Forms.Application]::Run($form)
 Flush-Log
 

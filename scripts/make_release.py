@@ -41,7 +41,7 @@ setup = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(setup)
 
 EXE = 'ssbu_native.exe'
-PACKAGE_FILES = [EXE, 'SDL3.dll', 'ssbu_glslang.dll']
+PACKAGE_FILES = [EXE, 'SDL3.dll', 'ssbu_glslang.dll']      # (R4: no rollback exe any more: rollback runs on the normal build)
 OPTIONAL_FILES = ['opus.dll']
 # what may be in the zip besides PACKAGE_FILES / OPTIONAL_FILES
 PACKAGE_EXTRA = re.compile(r'^(manifest\.json|README\.txt|LICENSE-[A-Za-z0-9_.-]+\.txt)$')
@@ -259,6 +259,13 @@ def main():
                GLSLANG_ROOT=tools['glslang'], SUYU_ROOT=tools['suyu'], RECOMP_EXE=EXE)
     env['IMGUI_ROOT'] = imgui or os.path.join(build, 'no-imgui')     # build.py would otherwise look beside the study tree
     os.environ['IMGUI_ROOT'] = env['IMGUI_ROOT']                     # the audit imports the staged build.py in this process
+    # the movie fallback (mf_ffmpeg.c) is compiled with FFmpeg's headers; a package exe without it would leave players whose
+    # Windows cannot play WebM on a black screen, so they are required (python scripts/fetch_media.py puts them in deps\ffmpeg)
+    ffmpeg = find([os.environ.get('FFMPEG_ROOT'), os.path.join(deps, 'ffmpeg')],
+                  lambda d: os.path.exists(os.path.join(d, 'include', 'libavcodec', 'avcodec.h')))
+    if not ffmpeg:
+        sys.exit('not found: FFmpeg headers (deps\\ffmpeg\\include): run python scripts/fetch_media.py, or set FFMPEG_ROOT')
+    env['FFMPEG_ROOT'] = os.environ['FFMPEG_ROOT'] = ffmpeg
 
     def run(argv, what):
         r = subprocess.run(argv, cwd=work, env=env, capture_output=True, text=True, errors='replace')
@@ -299,6 +306,10 @@ def main():
     if a.opus:
         shutil.copy2(a.opus, os.path.join(pkg, 'opus.dll'))
         files.append('opus.dll')
+        lic = os.path.join(os.path.dirname(os.path.abspath(a.opus)), 'LICENSE-opus.txt')     # BSD: its notice goes with it
+        if os.path.isfile(lic):
+            shutil.copy2(lic, os.path.join(pkg, 'LICENSE-opus.txt'))
+            files.append('LICENSE-opus.txt')
     licences = [(os.path.join(REPO, 'LICENSE'), 'LICENSE-ssbu-native.txt'),
                 (next((os.path.join(tools['sdl3'], n) for n in ('LICENSE.txt', 'COPYING.txt') if os.path.exists(os.path.join(tools['sdl3'], n))), None), 'LICENSE-SDL3.txt'),
                 (next((os.path.join(tools['glslang'], n) for n in ('LICENSE.txt', 'LICENSE') if os.path.exists(os.path.join(tools['glslang'], n))), None), 'LICENSE-glslang.txt')]

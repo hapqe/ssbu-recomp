@@ -78,6 +78,7 @@ typedef struct {
 static int g_fs_offline;                           /* SSBU_FIGHTER_OFFLINE: modules are loaded by fighter_offline, the game never starts */
 
 static DWORD g_fs_fls = FLS_OUT_OF_INDEXES;
+void *fighter_host_fls_slot(void) { return (void *)&g_fs_fls; }      /* (R3 pub1) r1_state.c: this index's address, without a linker map */
 static volatile LONG g_fs_recording;               /* recordings in flight (fast test in nro_import_host) */
 static FsMod *g_fs_mods[128];
 static int g_fs_mod_count;
@@ -725,6 +726,7 @@ static void __declspec(noinline) fs_compare(Ctx *c, FsFiber *ff, int partial) {
  * abandoned frames are lifted code or source without resources): during the ORIGINAL's run the function cannot be
  * tested on the made-up agent (reported as such), during the SOURCE's run it is a difference. */
 static FsFiber *g_fs_guard_ff; static int g_fs_guard_phase;      /* 1 = the original runs, 2 = the source runs */
+#ifdef _WIN32      /* Linux build: no fault guard; a fault in the offline test ends the run */
 static void fs_guard_resume(CONTEXT *x, jmp_buf jb, int value) {
 #ifdef SSBU_ANDROID
     (void)x; (void)jb; (void)value;                  /* Android: no resumable fault guard (fs_guard declines, the fault is a crash) */
@@ -748,10 +750,13 @@ static LONG CALLBACK fs_guard(EXCEPTION_POINTERS *ep) {
     else { if (!ff->bad) snprintf(ff->why, sizeof ff->why, "the source faults (reads or writes address %llx) where the original does not", (unsigned long long)ep->ExceptionRecord->ExceptionInformation[1]); ff->bad = 1; fs_guard_resume(ep->ContextRecord, ff->jb, 1); }
     return EXCEPTION_CONTINUE_EXECUTION;
 }
+#endif
 
 static void fighter_synth(Ctx *c, NroModule *m, FsMod *fm, FsFiber *ff) {
     Ctx saved = *c;
+#ifdef _WIN32
     if (g_fs_offline && !g_fs_guard_ff) { g_fs_guard_ff = ff; AddVectoredExceptionHandler(1, fs_guard); }
+#endif
     if (!ff->ev) ff->ev = malloc(sizeof(FsEvent) * FS_MAX_EVENTS);
     for (int i = 0; i < fm->ovr_count; i++) {
         ImportFn lifted = fs_lifted(m, m->info->base + fm->ovr[i].off);
@@ -1162,6 +1167,7 @@ static void fd_hook(Ctx *c, void *user) {
  * SSBU_DETERMINISTIC=1: see plan\phases\R0_determinism.md. Here: the 9 generators are set to a fixed state at the
  * first battle frame (SSBU_DET_OFF=1 leaves them alone, for diagnosis). */
 void input_mark(const char *what);                      /* nnhid.c */
+int rbn_handshake_wanted(void); uint64_t rbn_match_seed(void);   /* rb_net.c (R3: 0 / 0 without SSBU_RB_NET) */
 static ImportFn g_fh_orig;
 static struct { uint64_t boma; int entry; long long frame; } g_fh_f[8];
 static int g_fh_n, g_fh_det, g_fh_detoff;
@@ -1193,12 +1199,24 @@ static void fh_hook(Ctx *c, void *user) {
                 uint64_t rb = fh_rng_base();
                 printf("[fight] first battle frame (fighter entry %d); input mark \"fight\" raised; script random generators at %llx\n", g_fh_f[k].entry, (unsigned long long)rb);
                 if (rb) { printf("[fight] generators before:"); for (int i = 0; i < 9; i++) printf(" %08x.%u", rd32(rb + 0x14ull * i + 12), rd32(rb + 0x14ull * i + 16)); printf("\n"); }
-                if (g_fh_det && !(g_fh_detoff & 1) && rb) {
+                int rbn_match_cancelled(void);
+                if (g_fh_det && !(g_fh_detoff & 1) && rb && !(rbn_match_cancelled() == 2 && !getenv("SSBU_DETERMINISTIC"))) {      /* (R3 pub2) a room fight with only rollback mode on: the game's own generators */
+                    uint64_t ms = rbn_match_seed();    /* R3: the seed of the online match handshake (0 without one: the fixed state below) */
+                    if (ms) {
+                        for (int i = 0; i < 9; i++) {
+                            uint64_t z = ms + 0x9E3779B97F4A7C15ull * (uint64_t)(i + 1); z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull; z = (z ^ (z >> 27)) * 0x94D049BB133111EBull; z ^= z >> 31;
+                            uint64_t y = z * 0xD1342543DE82EF95ull + 1;
+                            wr32(rb + 0x14ull * i, (uint32_t)z | 1u); wr32(rb + 0x14ull * i + 4, (uint32_t)(z >> 32)); wr32(rb + 0x14ull * i + 8, (uint32_t)y); wr32(rb + 0x14ull * i + 12, (uint32_t)(y >> 32)); wr32(rb + 0x14ull * i + 16, 0);
+                        }
+                        printf("[fight] SSBU_RB_NET: the 9 script random generators set from the agreed match seed %016llx, counters 0\n", (unsigned long long)ms);
+                        if (getenv("SSBU_RB_NET_WATCH")) { void debug_watch(const uint64_t *a, int n); uint64_t w[2] = {rb, GA(0x71052c41b0ull) + 0x98}; debug_watch(w, 2); }   /* research: who writes the generators / match block + 0x98 next */
+                    } else {
                     for (int i = 0; i < 9; i++) {
                         wr32(rb + 0x14ull * i, 0x12345678u + 0x9E3779B9u * (unsigned)i); wr32(rb + 0x14ull * i + 4, 0x2468ACE1u ^ (unsigned)i);
                         wr32(rb + 0x14ull * i + 8, 0x0F1E2D3Cu + (unsigned)i); wr32(rb + 0x14ull * i + 12, 0x89ABCDEFu - (unsigned)i); wr32(rb + 0x14ull * i + 16, 0);
                     }
                     printf("[fight] SSBU_DETERMINISTIC: the 9 script random generators set to a fixed state, counters 0\n");
+                    }
                 }
                 if (getenv("SSBU_WORK_RESEARCH")) {        /* S11 part 4: where the work module keeps its variables */
                     uint64_t wm = rd64(boma + 0x50), vt = wm ? rd64(wm) : 0;
@@ -1233,6 +1251,8 @@ static void fh_hook(Ctx *c, void *user) {
             memset(&rec, 0, sizeof rec);
             rec.f = f; rec.k = g_fh_f[k].entry; rec.st = st; rec.mot = mot; rec.mf = mf; rec.x = x; rec.y = y; rec.dmg = dmg; rec.rh = rh;
             g_fh_run = fh_fnv(g_fh_run, &rec, sizeof rec);
+            { void rbn_hash_add(const void *p, size_t n); struct { int k, st; uint64_t mot; float mf, x, y, dmg; uint64_t rh; } r3 = {rec.k, rec.st, rec.mot, rec.mf, rec.x, rec.y, rec.dmg, rec.rh};
+              rbn_hash_add(&r3, sizeof r3); }      /* R3 (rb_net.c, SSBU_RB_NET only): the frame's checksum, without the per-process frame count */
             uint32_t bx, by, bm, bd; memcpy(&bx, &x, 4); memcpy(&by, &y, 4); memcpy(&bm, &mf, 4); memcpy(&bd, &dmg, 4);
             /* N12: SSBU_FIGHT_HASH_WORK=<int work id, hex or constant name>: that int variable of each fighter at the end of
              * the line ("w <value>"); not part of H (the hash stays comparable with runs without it) */
@@ -1274,10 +1294,22 @@ static void fh_frame_end(Ctx *c, void *user) {
  * fighter since the last poll, so that the sequence position is a function of the fight frame alone (measured S11:
  * the fighters' frame line ran 510 times in one run and 605 times in another during the same 462 polls after the
  * first battle frame). SSBU_DET_OFF=2 keeps poll counting. Nothing after the fight (no fight frames, no steps). */
+uint64_t hook_address(const char *name);
 int fight_seq_ticks(void) {
     static long long last;
     if (!g_fh_det || (g_fh_detoff & 2) || !g_fh_n) return 1;
     long long f = g_fh_f[0].frame, n = f - last;
+    {   /* (R3 hs12, test sequences of two matches) after a fight has ended (the game's ready-go cleared) the sequence counts
+         * polls again until the next fight's ready-go; a new fight's frame count starting lower than the last one is a
+         * new start, not "no step" (before: nothing after the fight, so a sequence could not reach a second match) */
+        static uint64_t inst; static int was_on, ended;
+        if (!inst) inst = hook_address("_ZN3lib9SingletonIN3app14FighterManagerEE9instance_E");
+        uint64_t mgr = inst ? rd64(inst) : 0, impl = mgr ? rd64(mgr) : 0;
+        int on = impl && rd8(impl + 0xd2);
+        if (on) { was_on = 1; ended = 0; } else if (was_on) ended = 1;
+        if (n < 0 && was_on) { last = f; return ended ? 1 : 0; }
+        if (ended) { last = f; return 1; }
+    }
     last = f;
     g_fh_poll_hist[n < 0 ? 0 : n > 3 ? 3 : n]++; g_fh_poll_tid = GetCurrentThreadId();
     return n < 0 ? 0 : n > 100000 ? 100000 : (int)n;
@@ -1285,7 +1317,7 @@ int fight_seq_ticks(void) {
 static void fh_exit(void) { if (g_fh_out) { fflush(g_fh_out); if (g_fh_out != stdout) fclose(g_fh_out); g_fh_out = NULL; } }
 static void fight_hash_start(void) {
     const char *h = getenv("SSBU_FIGHT_HASH"), *d = getenv("SSBU_DETERMINISTIC"), *o = getenv("SSBU_DET_OFF");
-    g_fh_det = d && d[0] && d[0] != '0';
+    g_fh_det = (d && d[0] && d[0] != '0') || rbn_handshake_wanted();      /* R3: a match between online players needs it (no extra logic frames; generators from the agreed seed) */
     g_fh_detoff = o ? atoi(o) : 0;
     if ((!h || !h[0] || h[0] == '0') && !g_fh_det) return;
     if (h && h[0] && h[0] != '0') g_fh_out = strcmp(h, "1") == 0 ? stdout : fopen(h, "w");

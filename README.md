@@ -9,7 +9,7 @@ One-click installer, Vulkan renderer, in-game settings, fighters as readable C++
 
 [![Discord](https://img.shields.io/badge/Discord-join-5865F2?logo=discord&logoColor=white)](https://discord.gg/RyZpx3u2t4)
 [![Website](https://img.shields.io/badge/website-denkishi.github.io-informational)](https://denkishi.github.io/opensmash-site/)
-[![Release](https://img.shields.io/github/v/release/Denkishi/ssbu-recomp?label=prebuilt%20runtime&color=brightgreen)](https://github.com/Denkishi/ssbu-recomp/releases/latest)
+[![Download](https://img.shields.io/badge/download-ZIP-brightgreen?logo=github)](https://github.com/Denkishi/ssbu-recomp/archive/refs/heads/main.zip)
 [![License: GPL-3.0](https://img.shields.io/badge/license-GPL--3.0-blue)](LICENSE)
 ![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11%20x64-lightgrey)
 ![Game versions](https://img.shields.io/badge/game-13.0.4%20%7C%2013.0.5-green)
@@ -55,11 +55,13 @@ We learned from many open-source projects (see [Credits](#credits)) and respect 
 
 You need **your own game dump and keys**. That is all: the installer fetches everything else.
 
-1. **Download** this repository (green *Code* button, *Download ZIP*) and unpack it, or `git clone` it.
+1. **Download** the game's ZIP: **[ssbu-recomp-main.zip](https://github.com/Denkishi/ssbu-recomp/archive/refs/heads/main.zip)** (the same as the green
+   *Code* button > *Download ZIP*), and unpack it, or `git clone` it. **Not** the files under *Releases*: those are build
+   tools the installer downloads by itself.
 2. **Double-click `Install SSBU.bat`.** It sets up a private Python inside the folder (nothing is installed on your
    system), checks your PC, and **finds your keys and games by itself** in the folders of yuzu, Ryujinx, suyu, sudachi
    and eden. Check what it found and press **Install**: it applies the update and DLC, uses the **prebuilt runtime** from
-   the [GitHub Release](https://github.com/Denkishi/ssbu-recomp/releases/latest) (so **no Visual Studio**),
+   a GitHub Release, downloaded by itself (so **no Visual Studio**),
    and builds the game files on your PC. **No firmware is needed**: open-source fonts are included. It makes
    shortcuts, updates itself, and if it stops, double-click it again and it resumes.
 3. **Double-click `Play SSBU.bat`** (or the desktop shortcut). Your saves go to `build\saves`.
@@ -76,7 +78,7 @@ by default; **In progress**; **Planned**.
 | Native x64 program by static recompilation (AArch64 to C), game versions 13.0.4 and 13.0.5 | Done |
 | One-click installer: private Python, PC check, finds keys and games in emulator folders, update + DLC, prebuilt runtime (no Visual Studio), no firmware needed, shortcuts, self-update, resume | Done |
 | Vulkan renderer (OpenGL fallback), shaders loaded at start, 16:9 window, F11 borderless | Done |
-| In-game settings menu (F1 or controller Home, on by default): graphics, window / fullscreen / borderless, volume, full key and button remapping for keyboard and controllers per player, log viewer and export, F2 stats overlay | Done |
+| In-game settings menu (F1, controller Home, or − and + held 1 s; on by default): graphics, window / fullscreen / borderless, volume, full key and button remapping for keyboard and controllers per player, log viewer and export, F2 stats overlay | Done |
 | On-screen keyboard for controllers (no Windows dialogs) | Done |
 | Any controller through SDL3 (hot-plug, up to 8 players, rumble, gyro) | Done in automated tests with virtual devices; physical pads not yet confirmed |
 | Online play through the game's Local Wireless over a LAN, a room code or a lobby server ([docs/ONLINE.md](docs/ONLINE.md)) | Experimental |
@@ -89,7 +91,7 @@ by default; **In progress**; **Planned**.
 | Freeze watchdog: a report with the stack of every thread | Done |
 | Fixed 60 fps in every mode | In progress |
 | Items and stages as source | Planned |
-| Linux / Steam Deck | Planned |
+| Native Linux build ([BUILDING_LINUX.md](BUILDING_LINUX.md)): movies, menus, a whole match at 60 fps with sound on one PC (CachyOS, NVIDIA, Wayland); F1 menu built (not yet tried on Linux), no online play there yet; Steam Deck not tested | In progress |
 
 ### Game modes (measured on the development PC)
 
@@ -139,6 +141,7 @@ your dump --> tools/extract --> main executable, SDK, script modules, data
           nvn_vk*.c, nvn_gl.c            the console's graphics API (NVN) on Vulkan / OpenGL
           mx_translate.c                 the game's GPU shader machine code -> GLSL -> SPIR-V
           nnpad_sdl.c                    controllers through SDL3
+          nnpad_gca.c                    GameCube controller adapter over WinUSB (shown to SDL as virtual gamepads)
 ```
 
 - **Game code** is recompiled, not emulated: a mechanical translation, complete and exact, but not readable source.
@@ -180,7 +183,7 @@ per-frame logs against the lifted version (2,010 fight frames each). More: [docs
 | 5 | Fixed 60 fps in every mode; every mode playable start to end | In progress |
 | 6 | Single-file fighter packages (drop one file in the characters folder) | In progress |
 | 7 | Controllers confirmed on physical pads | In progress |
-| 8 | Linux / Steam Deck (the runtime is Windows-only today) | Planned |
+| 8 | Linux / Steam Deck (a native Linux build runs on one tested PC: [BUILDING_LINUX.md](BUILDING_LINUX.md)) | In progress |
 
 ## FAQ
 
@@ -193,8 +196,8 @@ tools, or an existing dump you made legally. This project cannot do that step fo
 **Does it include the game?** No. Not the game, not the keys, not the firmware, and no links to them.
 
 **Which GPU do I need?** Any GPU with a Vulkan 1.3 driver. An integrated Intel Raptor Lake GPU played a whole match at
-59-60 fps in our tests. Windows 10/11 x64. The movies need the free VP9 Video Extensions and Web Media Extensions from
-the Microsoft Store.
+59-60 fps in our tests. Windows 10/11 x64. The movies play with Windows' own VP9 Video Extensions and Web Media
+Extensions (free, Microsoft Store) when they work, otherwise with FFmpeg, which the installer downloads.
 
 **Can I play online?** Experimental. The game's Local Wireless mode works over a LAN, a room code or a lobby server:
 [docs/ONLINE.md](docs/ONLINE.md). Rollback netcode is in progress and is not available yet.
@@ -209,6 +212,8 @@ with JKSV or Checkpoint, from yuzu / Eden / suyu (right-click the game, "Open Sa
 empty `build\saves\save` and copy your `save_data` folder into it (you should have
 `build\saves\save\save_data\system_data.bin`), then start the game. Folders named `save.work.<number>` are temporary
 session files: leave them or delete them while the game is closed.
+
+**"ssbu_game_eh_o1.dll is missing" when I start the game?** The game DLL (about 500 MB, built on your PC and not signed) was removed after the installation, usually by an antivirus, or the installation stopped before the end. Open Windows Security > Virus & threat protection > Protection history and restore/allow the file if it is there (adding your install folder to the exclusions stops it happening again), then double-click `Install SSBU.bat` and press **Resume**: it links the missing files again in a few minutes, without compiling everything again.
 
 **Mods and new fighters?** Mods through the function hook table and C++ fighter source work today; new fighters are in
 progress ([docs/NEW_FIGHTER.md](docs/NEW_FIGHTER.md)).

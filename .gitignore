@@ -63,6 +63,8 @@ trace_*.txt
 
 # everything scripts/setup.py produces from your dump, and tools you put in deps/
 build/
+build-linux/
+build-macos/
 deps/
 # scripts/make_release.py: its scratch folder and the runtime package (a Release asset, never committed)
 build_release/
@@ -77,3 +79,6 @@ __pycache__/
 android/build/
 *.apk
 *.idsig
+
+# an SD card folder with Skyline plugins and mods you installed (docs/SKYLINE.md)
+/sd/

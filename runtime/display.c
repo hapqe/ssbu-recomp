@@ -20,6 +20,9 @@ void os_init_event(uint64_t key, int autoclear);      /* os_threads.c */
 void os_signal_event(uint64_t key);
 
 static HWND g_hwnd;
+#ifdef _WIN32
+static HICON g_icon_small, g_icon_big;                /* the title bar's small icon (opensmash.ico), set after the window is made */
+#endif
 static volatile LONG g_ready;
 static volatile LONG64 g_frames;
 volatile LONG64 g_prof15_frame;                       /* presented frames, read by prof15.c (SSBU_PROF15, test only; included by boot.c) */
@@ -70,8 +73,10 @@ static void vsync_test_key(void);
  *     its present and the next frame's (0 = replaced before it was shown). Histogram in the report and per 600 frames
  *     with SSBU_PACESTAT=1. This is the compositor model "the last picture presented before a vblank is what the next
  *     refresh shows" on MEASURED vblank times; it is not a camera. */
+#ifdef _WIN32
 typedef struct { HDC hDc; UINT hAdapter; LUID AdapterLuid; UINT VidPnSourceId; } KmtOpenAdapterFromHdc;
 typedef struct { UINT hAdapter; UINT hDevice; UINT VidPnSourceId; } KmtWaitVblank;
+#endif
 static SRWLOCK g_vb_lock = SRWLOCK_INIT;
 static CONDITION_VARIABLE g_vb_cv = CONDITION_VARIABLE_INIT;
 static volatile LONG64 g_vb_count, g_vb_qpc;           /* vblanks seen, time of the last one (under g_vb_lock for a consistent pair) */
@@ -105,6 +110,7 @@ static ULONG g_pc_ids[128];
 static int g_pc_n = -1, g_pc_on = 1;
 static uint8_t g_cpu_class[256], g_class_max;
 static volatile LONG64 g_pc_frames, g_pc_frames_slow;
+#ifdef _WIN32
 static void pcore_init(void) {
     ULONG len = 0;
     const char *e = getenv("SSBU_PCORES");
@@ -136,10 +142,16 @@ static void pcore_init(void) {
         SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &st, sizeof st);
     }
 }
+#else
+/* Linux build: CPU sets and ProcessPowerThrottling are Windows calls; the scheduler is left to choose the cores */
+static void pcore_init(void) { g_pc_n = 0; printf("display: CPU: the cores are left to the system (performance-core pinning is a Windows feature of this build)%c", 10); }
+#endif
 /* the calling thread: performance cores only (once per thread is enough; cheap to repeat) */
 void display_perf_thread(void) {
     if (g_pc_n < 0) pcore_init();
+#ifdef _WIN32
     if (g_pc_on && g_pc_n > 0) SetThreadSelectedCpuSets(GetCurrentThread(), g_pc_ids, (ULONG)g_pc_n);
+#endif
 }
 static void precise_wait_until(LONGLONG target, HANDLE timer) {
     LARGE_INTEGER now, due;
@@ -195,6 +207,13 @@ static DWORD WINAPI vblank_thread(LPVOID arg) {
     InterlockedExchange(&g_vb_state, 1);
     AChoreographer_postFrameCallback64(cg, vblank_frame, NULL);
     for (;;) ALooper_pollOnce(-1, NULL, NULL, NULL);
+#elif !defined(_WIN32)
+/* Linux build: no vblank source yet (D3DKMT is Windows); vsync = auto / display then run on our own 60 Hz clock, as on a
+ * Windows PC without one */
+static DWORD WINAPI vblank_thread(LPVOID arg) {
+    (void)arg;
+    printf("display: no vblank source in the Linux build: the refresh clock stays our own 60 Hz clock, on-screen times are not measured%c", 10);
+    InterlockedExchange(&g_vb_state, -1);
     return 0;
 }
 #else
@@ -333,7 +352,7 @@ static DWORD WINAPI window_thread(LPVOID arg) {
     return 0;
 }
 
-#else
+#elif defined(_WIN32)
 static void sizing_keep_aspect(HWND h, WPARAM edge, RECT *r) {
     RECT frame = {0, 0, 0, 0};
     AdjustWindowRectEx(&frame, (DWORD)GetWindowLongPtrA(h, GWL_STYLE), FALSE, (DWORD)GetWindowLongPtrA(h, GWL_EXSTYLE));
@@ -402,8 +421,21 @@ static HWND g_hwnd_menu;                               /* g_hwnd, for the functi
 void display_set_window_mode(int mode) { if (g_hwnd_menu) PostMessageA(g_hwnd_menu, WM_APP + 0x51, (WPARAM)mode, 0); }
 void display_set_client_size(int w, int h) { if (g_hwnd_menu) PostMessageA(g_hwnd_menu, WM_APP + 0x52, (WPARAM)w, (LPARAM)h); }
 int display_window_mode(void) { return g_full ? (g_topmost ? 2 : 1) : 0; }
+#include "loading_anim.c"                            /* U3: the loading animation until the game's first present */
+/* closing the window: a game that does not end within 4 s (an exit handler or a thread that never returns: testers saw the
+ * window freeze after the X while closing the console window worked) is ended here, its log flushed first */
+static DWORD WINAPI close_watchdog(LPVOID arg) {
+    (void)arg;
+    Sleep(4000);
+    printf("\nwindow closed but the game did not end within 4 s: ended now\n");
+    fflush(stdout);
+    TerminateProcess(GetCurrentProcess(), 0);
+    return 0;
+}
 static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    if (la_wndproc(h, m, w)) return 0;
     if (m == WM_CLOSE) {                             /* the exit request: nn::oe decides (nnmisc.c oe_exit_request) whether the game ends now or after its exit-request handling section */
+        { static LONG once; if (!InterlockedExchange(&once, 1)) CloseHandle(CreateThread(NULL, 0, close_watchdog, NULL, 0, NULL)); }
         printf("\nwindow closed by the user after %lld frames\n", (long long)g_frames);
         { extern volatile LONG g_display_close; InterlockedExchange(&g_display_close, 1); }      /* session 14: a hold of ours (the first-run shader preparation) ends at once */
         if (!oe_exit_request()) report_and_exit(0);
@@ -445,6 +477,16 @@ static DWORD WINAPI window_thread(LPVOID arg) {
     wc.lpszClassName = "ssbu_native_window";
     wc.style = CS_OWNDC;
     wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+    {   /* the project's logo (media/opensmash.ico, copied beside the exe by scripts/setup.py): the window's and taskbar's icon */
+        char ico[MAX_PATH]; DWORD n = GetModuleFileNameA(NULL, ico, MAX_PATH);
+        while (n && ico[n - 1] != '\\' && ico[n - 1] != '/') n--;
+        if (n && n + 16 < MAX_PATH) {
+            strcpy(ico + n, "opensmash.ico");
+            wc.hIcon = (HICON)LoadImageA(NULL, ico, IMAGE_ICON, 0, 0, LR_LOADFROMFILE | LR_DEFAULTSIZE);
+            g_icon_small = (HICON)LoadImageA(NULL, ico, IMAGE_ICON, GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), LR_LOADFROMFILE);
+            g_icon_big = (HICON)LoadImageA(NULL, ico, IMAGE_ICON, 256, 256, LR_LOADFROMFILE);
+        }
+    }
     RegisterClassA(&wc);
     /* Track O: window mode and size from config\graphics.ini (gfx_options.c). borderless / fullscreen: a frameless window
      * over the primary monitor (fullscreen: also topmost). */
@@ -467,23 +509,109 @@ static DWORD WINAPI window_thread(LPVOID arg) {
     char exe[MAX_PATH] = "";
     GetModuleFileNameA(NULL, exe, sizeof exe);
     const char *base = strrchr(exe, '\\') ? strrchr(exe, '\\') + 1 : exe, *show = getenv("SSBU_SHOW");
-    int visible = show ? atoi(show) != 0 : (!_stricmp(base, "ssbu_native.exe") || !_stricmp(base, "ssbu_user.exe"));
+    int visible = show ? atoi(show) != 0 : (!_stricmp(base, "ssbu_native.exe") || !_stricmp(base, "ssbu_user.exe") || !_stricmp(base, "ssbu_native_rb.exe"));      /* (_rb: the rollback pair a player starts) */
     snprintf(g_title, sizeof g_title, "%s", getenv("SSBU_TITLE") ? getenv("SSBU_TITLE") : "SSBU native (study build)");
-    if (visible)
+    if (visible) {
         g_hwnd = CreateWindowExA(go->window_mode == 2 ? WS_EX_TOPMOST : 0, wc.lpszClassName, g_title, style | WS_VISIBLE, px, py, r.right - r.left,
                                  r.bottom - r.top, NULL, NULL, wc.hInstance, NULL);
-    else {
+        if (g_hwnd && g_icon_small) SendMessageA(g_hwnd, WM_SETICON, ICON_SMALL, (LPARAM)g_icon_small);
+        if (g_hwnd && g_icon_big) SendMessageA(g_hwnd, WM_SETICON, ICON_BIG, (LPARAM)g_icon_big);      /* the 256 px image: the taskbar / Alt+Tab scale it down sharp (the class icon is only 32 px: blurry on a high-DPI screen) */
+    } else {
         g_hwnd = CreateWindowExA(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, wc.lpszClassName, g_title, style, -32000, -32000,
                                  r.right - r.left, r.bottom - r.top, NULL, NULL, wc.hInstance, NULL);
         ShowWindow(g_hwnd, SW_SHOWNOACTIVATE);
     }
     g_hwnd_menu = g_hwnd; g_topmost = go->window_mode == 2;      /* U1 (settings menu) */
+    la_start(g_hwnd, visible);                                   /* U3: the loading animation (loading_anim.c) */
     InterlockedExchange(&g_ready, 1);
     MSG msg;
     while (GetMessageA(&msg, NULL, 0, 0) > 0) { TranslateMessage(&msg); DispatchMessageA(&msg); }
     return 0;
 }
 
+#else
+/* Linux build: an SDL3 window (X11 or Wayland) made and serviced by its own thread, as the Win32 one is. Vulkan draws
+ * into it (nvn_vk.c makes the surface with SDL). The keyboard state that nnhid.c reads (GetAsyncKeyState, plat_posix.c)
+ * is SDL's, which this thread's event pumping keeps current; nnpad_sdl.c flushes the queue on its own thread, so the
+ * close request is caught by an event watch rather than read from the queue. */
+#include <SDL3/SDL.h>
+/* U3: no loading animation in the SDL window yet (the Windows one is loading_anim.c) */
+static volatile LONG g_la_first = 1;
+static void la_stop(void) {}
+static void la_note(const char *note) { (void)note; }
+int oe_exit_request(void);                            /* nnmisc.c */
+static char g_title[96];
+static bool SDLCALL close_watch(void *user, SDL_Event *e) {
+    (void)user;
+    if (e->type == SDL_EVENT_WINDOW_CLOSE_REQUESTED || e->type == SDL_EVENT_QUIT) {
+        static volatile LONG once;
+        if (InterlockedExchange(&once, 1)) return true;
+        printf("\nwindow closed by the user after %lld frames\n", (long long)g_frames);
+        if (!oe_exit_request()) report_and_exit(0);
+    }
+    return true;
+}
+/* U2, the settings menu (menu.cpp, render thread) asks; the window thread does it (window_mode_service), as WM_APP + 0x51 /
+ * 0x52 on Windows. mode: 0 windowed, 1 borderless over the screen, 2 the desktop's fullscreen (graphics.ini window). */
+static volatile LONG g_mode_req = -1, g_size_req, g_size_w, g_size_h, g_mode_now;
+static int g_win_w, g_win_h;                          /* the windowed size, for the way back from borderless / fullscreen */
+void display_set_window_mode(int mode) { InterlockedExchange(&g_mode_req, mode < 0 ? 0 : mode > 2 ? 2 : mode); }
+void display_set_client_size(int w, int h) { InterlockedExchange(&g_size_w, w); InterlockedExchange(&g_size_h, h); InterlockedExchange(&g_size_req, 1); }
+int display_window_mode(void) { return g_mode_now; }
+static void window_mode_service(SDL_Window *w) {
+    LONG m = InterlockedExchange(&g_mode_req, -1);
+    if (m >= 0) {
+        if (m == 2) { SDL_SetWindowFullscreenMode(w, NULL); SDL_SetWindowFullscreen(w, true); }      /* NULL: the desktop's mode, no mode change */
+        else {
+            SDL_SetWindowFullscreen(w, false);
+            SDL_SetWindowBordered(w, m == 0);
+            SDL_Rect r;
+            if (m == 1 && SDL_GetDisplayBounds(SDL_GetDisplayForWindow(w), &r)) { SDL_SetWindowPosition(w, r.x, r.y); SDL_SetWindowSize(w, r.w, r.h); }
+            else if (m == 0) { SDL_SetWindowSize(w, g_win_w, g_win_h); SDL_SetWindowPosition(w, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED); }
+        }
+        InterlockedExchange(&g_mode_now, m);
+        printf("display: window mode %s (settings menu)\n", m == 2 ? "fullscreen" : m ? "borderless" : "windowed"); fflush(stdout);
+    }
+    if (InterlockedExchange(&g_size_req, 0)) {
+        g_win_w = g_size_w; g_win_h = g_size_h;
+        if (g_mode_now) printf("display: window size %dx%d kept for the windowed mode (settings menu)\n", g_win_w, g_win_h);
+        else { SDL_SetWindowSize(w, g_win_w, g_win_h); printf("display: window client %dx%d (settings menu)\n", g_win_w, g_win_h); }
+        fflush(stdout);
+    }
+}
+void menu_sdl_attach(void *window); void menu_sdl_service(void);      /* menu.cpp (or menu_stub.c): the settings menu's input */
+static DWORD WINAPI window_thread(LPVOID arg) {
+    (void)arg;
+    SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS, "1");
+    SDL_SetHint(SDL_HINT_VIDEO_ALLOW_SCREENSAVER, "1");
+    if (!SDL_InitSubSystem(SDL_INIT_VIDEO)) { printf("display: SDL video cannot start: %s\n", SDL_GetError()); fflush(stdout); ExitProcess(5); }
+    const GfxOptions *go = gfx_options();
+    int cw = go->width, ch = go->height;
+    SDL_WindowFlags flags = SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE;
+    if (go->window_mode) {
+        const SDL_DisplayMode *dm = SDL_GetDesktopDisplayMode(SDL_GetPrimaryDisplay());
+        if (dm) { cw = dm->w; ch = dm->h; }
+        flags |= go->window_mode == 2 ? SDL_WINDOW_FULLSCREEN : SDL_WINDOW_BORDERLESS;
+    }
+    printf("display: window %s, client %dx%d (graphics.ini), SDL video driver %s\n", go->window_mode == 2 ? "fullscreen" : go->window_mode ? "borderless" : "windowed", cw, ch, SDL_GetCurrentVideoDriver());
+    snprintf(g_title, sizeof g_title, "%s", getenv("SSBU_TITLE") ? getenv("SSBU_TITLE") : "SSBU native (study build)");
+    SDL_Window *w = SDL_CreateWindow(g_title, cw, ch, flags);
+    if (!w) { printf("display: SDL_CreateWindow failed: %s\n", SDL_GetError()); fflush(stdout); ExitProcess(5); }
+    SDL_AddEventWatch(close_watch, NULL);
+    g_win_w = go->width; g_win_h = go->height; g_mode_now = go->window_mode;
+    menu_sdl_attach(w);
+    g_hwnd = (HWND)w;
+    plat_game_window = (HWND)w;
+    InterlockedExchange(&g_ready, 1);
+    for (;;) {
+        SDL_Event e;
+        if (SDL_WaitEventTimeout(&e, 8)) { while (SDL_PollEvent(&e)) {} }       /* the watch saw them; the keyboard state is current */
+        plat_window_service();
+        window_mode_service(w);
+        menu_sdl_service();
+    }
+    return 0;
+}
 #endif
 /* Signals the guest's vsync event 60 times per second. */
 static DWORD WINAPI vsync_thread(LPVOID arg) {
@@ -558,6 +686,10 @@ static DWORD WINAPI vsync_thread(LPVOID arg) {
     }
 }
 static void vsync_test_key(void) {
+#ifndef _WIN32
+    {   static int said; if (!said && getenv("SSBU_AUTOKEY")) { said = 1; printf("display: SSBU_AUTOKEY is not available in the Linux build (use SSBU_SEQ)\n"); } }
+    return;
+#endif
     {
         /* Test aid: SSBU_AUTOKEY=<letter>,<first second>,<every n seconds> presses a key now and then, so a run without a person can get
          * past "press any button". Only while this window is the foreground window, so the key never reaches another program. */
@@ -858,6 +990,7 @@ static void l1_report(FILE *out) {
  * the refresh that shows this frame, by the same rule as frame_queued, and whether the present is held for it. A frame
  * queued before the tick it is due at (on time) is held until that tick; a late one is presented at once. */
 void display_present_plan(int vulkan) {
+    if (!g_la_first) la_stop();                            /* U3: the first present: the loading animation stops before it (loading_anim.c) */
     if (!vulkan || old_pacing()) return;
     pace_options();
     LONG64 now_n = g_vsync_n, iv = g_interval, prev = g_latch, at = now_n + 1;
@@ -1028,6 +1161,7 @@ int display_wait_refresh(void) {
 /* Before a present: a frame queued earlier that nobody waited for (a caller that does not wait on the window sync). */
 void display_before_present(void) {
     static int said;
+    if (!g_la_first) la_stop();
     if (old_pacing() || !g_latch_pending) return;
     if (!said) { said = 1; printf("display: a present without a wait on the window texture's sync: held at the next present instead%c", 10); }
     display_wait_refresh();
@@ -1036,6 +1170,7 @@ void display_pace(void) {
     static LARGE_INTEGER next, second_start;
     static LONG64 second_frames;
     LARGE_INTEGER now;
+    if (!g_la_first) la_stop();                            /* (a present that came by neither call above) */
     if (!old_pacing()) { frame_queued(); return; }
     QueryPerformanceCounter(&now);
     if (!next.QuadPart) { next = now; second_start = now; }
@@ -1110,4 +1245,25 @@ static const ImportDef vi_imports[] = {
 
 void register_display_imports(void) {
     register_imports(vi_imports, (int)(sizeof vi_imports / sizeof vi_imports[0]));
+}
+
+/* menu.cpp (F1 > Display): the measured refresh rate (0 = not measured) and the display lock's refreshes per game frame
+ * (0 = our own 60 Hz clock: a panel that is not k x 60 Hz, where frames cannot all stay on screen equally long) */
+void display_refresh_info(double *hz, int *lock_k) {
+    *hz = g_vb_period > 0 && g_freq.QuadPart ? (double)g_freq.QuadPart / g_vb_period : 0;
+    *lock_k = (int)g_lock_k;
+}
+
+/* nvn_vk_store.c: a note in the window's title while the first start reads the game data (minutes on a slow disk, before
+ * the game shows any frame: issue #57 looked like a black screen); NULL puts the normal title back */
+void display_title_note(const char *note) {
+    la_note(note);                                         /* U3: the line beside the loading animation */
+#ifdef _WIN32
+    if (!g_hwnd) return;
+    char t[400];
+    if (note && note[0]) snprintf(t, sizeof t, "%s - %s", g_title, note); else snprintf(t, sizeof t, "%s", g_title);
+    SetWindowTextA(g_hwnd, t);
+#else
+    (void)note;
+#endif
 }

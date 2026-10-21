@@ -21,6 +21,11 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 RO = os.path.join(HERE, 'ro_study')
 CLANG = os.environ.get('RECOMP_CLANG', r'C:\llvm-8.0.0\bin\clang.exe')
+TARGET_LINUX = os.environ.get('RECOMP_TARGET') == 'linux'      # see build.py
+TARGET_MACOS = os.environ.get('RECOMP_TARGET') == 'macos'
+PLAT_FLAGS = (['-fPIC', '-fvisibility=hidden', '-include', os.path.join(HERE, 'plat', 'plat_pre.h')] + (['-mmacosx-version-min=14.4'] if TARGET_MACOS else ['-mcx16'])
+              if TARGET_LINUX or TARGET_MACOS else [])
+LIB_EXT = '.dylib' if TARGET_MACOS else '.so' if TARGET_LINUX else '.dll'     # nnro.c asks for <name>.dll; plat_posix.c maps it
 GEN_HEADERS = ['runtime.h', 'neon.h', 'fpexact.h']
 LIFTER = os.path.join(RO, 'recomp_nro.py')
 
@@ -53,6 +58,9 @@ def write_registry(entries):
 # 937 s at 12 jobs, of which 226 s lifting and the rest mostly the tail of each module).
 _cc_slots = None
 _lift_slots = threading.BoundedSemaphore(2)
+# Linux / macOS (scripts/setup.py sets it): the lifters' worker processes, which hold memory the compilers' sharing
+# (build_opt.py MEM_BUDGET) does not count, follow the RAM rule rather than the compiler job count
+LIFT_JOBS = int(os.environ.get('RECOMP_LIFT_JOBS') or 0) if (TARGET_LINUX or TARGET_MACOS) else 0
 
 
 def _in_slot(job):
@@ -73,7 +81,7 @@ def build_module(e, jobs, relift, opt):
     name = e['name']
     nro = os.path.join(RO, 'nro', e['file'])
     suffix = os.environ.get('RECOMP_NRO_SUFFIX', '_eh')     # e.g. _eh: gen_nro_eh, obj_nro_eh, nro_bin_eh (run with SSBU_NRO_BIN=nro_bin_eh)
-    gen = os.path.join(HERE, 'gen_nro' + suffix, name)
+    gen = os.path.join(HERE, 'gen_nro' + os.environ.get('RECOMP_NRO_GEN_SUFFIX', suffix), name)   # RECOMP_NRO_GEN_SUFFIX: another build's lifted code (setup.py --rollback: _eh_o2 compiled again with marks)
     obj = os.path.join(HERE, 'obj_nro' + suffix, name)
     bindir = os.path.join(HERE, 'nro_bin' + suffix)
     for d in (gen, obj, bindir):
@@ -87,7 +95,7 @@ def build_module(e, jobs, relift, opt):
     deps = [nro, LIFTER, os.path.join(RO, 'nro_eh.py')] + ([extra] if os.path.exists(extra) else [])
     if relift or not os.path.exists(stamp) or os.path.getmtime(stamp) < max(os.path.getmtime(p) for p in deps):
         with _lift_slots:
-            r = subprocess.run([sys.executable, LIFTER, 'full', nro, gen, str(min(jobs, 16)), e['base']], capture_output=True, text=True)
+            r = subprocess.run([sys.executable, LIFTER, 'full', nro, gen, str(min(LIFT_JOBS or jobs, 16)), e['base']], capture_output=True, text=True)
         tail = [l for l in r.stdout.splitlines() if l.startswith('functions:')]
         if r.returncode or not tail:
             print('%s: LIFT FAILED\n%s\n%s' % (name, r.stdout[-3000:], r.stderr[-3000:]))
@@ -100,7 +108,7 @@ def build_module(e, jobs, relift, opt):
     newest_header = max(os.path.getmtime(os.path.join(HERE, h)) for h in GEN_HEADERS)
     sources = sorted(n for n in os.listdir(gen) if n.endswith('.c'))
     import build                                            # NOCRT_FLAGS / link_dll: RECOMP_NOCRT (build.py)
-    flags = ['-c', opt, '-w', '-fno-strict-aliasing', '-I', HERE, '-I', gen] + build.NOCRT_FLAGS
+    flags = ['-c', opt, '-w', '-fno-strict-aliasing', '-I', HERE, '-I', gen] + build.NOCRT_FLAGS + PLAT_FLAGS
     todo = []
     for n in sources:
         src, o = os.path.join(gen, n), os.path.join(obj, n[:-2] + '.obj')
@@ -126,7 +134,7 @@ def build_module(e, jobs, relift, opt):
 
     # 3. link the DLL
     t0 = time.time()
-    dll = os.path.join(bindir, name + '.dll')
+    dll = os.path.join(bindir, name + LIB_EXT)
     objs = sorted(os.path.join(obj, n) for n in os.listdir(obj) if n.endswith('.obj'))
     linked = False
     if not os.path.exists(dll) or os.path.getmtime(dll) < max(os.path.getmtime(o) for o in objs):
@@ -136,7 +144,7 @@ def build_module(e, jobs, relift, opt):
             print('could not link %s (is a game exe still running and holding it open?)' % dll)
             return 1
         linked = True
-        for ext in ('.lib', '.exp'):                        # nothing links against a module DLL
+        for ext in ('.lib', '.exp') if LIB_EXT == '.dll' else ():      # nothing links against a module DLL
             p = dll[:-4] + ext
             if os.path.exists(p):
                 os.remove(p)

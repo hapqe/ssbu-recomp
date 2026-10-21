@@ -63,6 +63,13 @@
 #include <string.h>
 #include <math.h>
 #include <windows.h>
+#if !defined(_WIN32) && !defined(SSBU_ANDROID)
+/* Linux build: the outlines come from FreeType instead of GDI (same unhinted outlines in font units, same flattening). */
+#include <ft2build.h>
+#include FT_FREETYPE_H
+#include FT_OUTLINE_H
+#define LF_FACESIZE 32
+#endif
 #ifndef FONTLL_TEST
 #include "runtime.h"
 #include "hostrt.h"
@@ -96,9 +103,12 @@ typedef struct {
     const uint8_t *head, *hhea, *os2, *hmtx, *cmap, *sub, *kern, *gpos, *nametab;
     uint32_t kern_len, gpos_len, cmap_len, name_len;
     int sub_format;
+#ifdef _WIN32
     HFONT hfont;
-#ifdef SSBU_ANDROID
+#elif defined(SSBU_ANDROID)
     void *stb;                                    /* Android: stbtt_fontinfo of this face (outlines from stb_truetype, not GDI) */
+#else
+    FT_Face ftface;
 #endif
     int gdi;                                      /* 0 not tried, 1 usable, -1 unusable */
     int no_alt;                                   /* the cmap has no U+25A1 (a replacement font): see ALT_CHAR */
@@ -137,9 +147,11 @@ static Engine g_engines[MAX_ENGINES];
 static FontData g_fontdata[MAX_FONTDATA];
 static int g_fontdata_count;
 static CRITICAL_SECTION g_lock;                   /* GDI, the font list and the engine table */
+#ifdef _WIN32
 static HDC g_dc;
-#ifndef SSBU_ANDROID
 static const MAT2 identity = {{0, 1}, {0, 0}, {0, 0}, {0, 1}};
+#elif !defined(SSBU_ANDROID)
+static FT_Library g_ft;
 #endif
 
 static uint32_t be16(const uint8_t *p) { return (uint32_t)p[0] << 8 | p[1]; }
@@ -341,9 +353,8 @@ static void path_close(Path *path) {
     if (path->contours == path->ccap) { path->ccap = path->ccap ? path->ccap * 2 : 16; path->end = realloc(path->end, (size_t)path->ccap * sizeof(int)); }
     path->end[path->contours++] = path->n;
 }
-#ifndef SSBU_ANDROID
+#ifdef _WIN32
 static double fx(FIXED v) { return v.value + v.fract / 65536.0; }
-#endif
 
 /* Whether `face` is one of the font's Windows family names (name ID 1) in any language. GetTextFace answers with the
  * name in the user's display language when the font has one: on a Chinese Windows "DFHeiGB Std W12" is reported as
@@ -371,72 +382,6 @@ static int has_family_name(const FontData *f, const WCHAR *face) {
     return 0;
 }
 
-#ifdef SSBU_ANDROID
-/* Android has no GDI: the outlines come from the font file itself through stb_truetype (public domain, Sean Barrett),
- * in font units like GetGlyphOutline at an em of upem pixels, with the same transform and curve subdivision below. */
-#define STBTT_STATIC
-#define STB_TRUETYPE_IMPLEMENTATION
-#include "stb_truetype.h"
-static int gdi_prepare(FontData *f) {             /* callers hold g_lock */
-    if (f->gdi) return f->gdi > 0;
-    f->gdi = -1;
-    int off = stbtt_GetFontOffsetForIndex(f->data, (int)f->face_index);
-    stbtt_fontinfo *info = calloc(1, sizeof *info);
-    if (off < 0 || !info || !stbtt_InitFont(info, f->data, off)) { free(info); printf("nn::fontll: font \"%s\" REJECTED BY stb_truetype: its glyphs will be blank\n", f->name); return 0; }
-    f->stb = info;
-    f->gdi = 1;
-    return 1;
-}
-static void glyph_path(FontData *f, uint32_t glyph, const int32_t *m, Path *path) {
-    EnterCriticalSection(&g_lock);
-    if (gdi_prepare(f)) {
-        stbtt_vertex *v = NULL;
-        int nv = stbtt_GetGlyphShape((stbtt_fontinfo *)f->stb, (int)glyph, &v);
-        double a = m[0] / 65536.0 / f->upem, b = m[1] / 65536.0 / f->upem, c2 = m[2] / 65536.0 / f->upem, d = m[3] / 65536.0 / f->upem;
-        double pixels = fabs(a) > fabs(d) ? fabs(a) : fabs(d);
-#define TX(px, py) ((px) * a + (py) * b)
-#define TY(px, py) ((px) * c2 + (py) * d)
-        double x0 = 0, y0 = 0;
-        int open = 0;
-        for (int i = 0; i < nv; i++) {
-            double x = v[i].x, y = v[i].y;
-            if (v[i].type == STBTT_vmove) {
-                if (open) path_close(path);
-                path_point(path, TX(x, y), TY(x, y));
-                open = 1;
-            } else if (v[i].type == STBTT_vline) {
-                path_point(path, TX(x, y), TY(x, y));
-            } else if (v[i].type == STBTT_vcurve) {               /* quadratic: control (cx, cy) */
-                double x1 = v[i].cx, y1 = v[i].cy;
-                double len = (fabs(x1 - x0) + fabs(y1 - y0) + fabs(x - x1) + fabs(y - y1)) * pixels;
-                int steps = 2 + (int)(len / 3.0);
-                if (steps > 32) steps = 32;
-                for (int k = 1; k <= steps; k++) {
-                    double t = (double)k / steps, u = 1 - t, px = u * u * x0 + 2 * u * t * x1 + t * t * x, py = u * u * y0 + 2 * u * t * y1 + t * t * y;
-                    path_point(path, TX(px, py), TY(px, py));
-                }
-            } else if (v[i].type == STBTT_vcubic) {               /* CFF: controls (cx, cy), (cx1, cy1) */
-                double x1 = v[i].cx, y1 = v[i].cy, x2 = v[i].cx1, y2 = v[i].cy1;
-                double len = (fabs(x1 - x0) + fabs(y1 - y0) + fabs(x2 - x1) + fabs(y2 - y1) + fabs(x - x2) + fabs(y - y2)) * pixels;
-                int steps = 2 + (int)(len / 3.0);
-                if (steps > 32) steps = 32;
-                for (int k = 1; k <= steps; k++) {
-                    double t = (double)k / steps, u = 1 - t;
-                    double px = u * u * u * x0 + 3 * u * u * t * x1 + 3 * u * t * t * x2 + t * t * t * x;
-                    double py = u * u * u * y0 + 3 * u * u * t * y1 + 3 * u * t * t * y2 + t * t * t * y;
-                    path_point(path, TX(px, py), TY(px, py));
-                }
-            }
-            x0 = x; y0 = y;
-        }
-        if (open) path_close(path);
-#undef TX
-#undef TY
-        if (v) stbtt_FreeShape((stbtt_fontinfo *)f->stb, v);
-    }
-    LeaveCriticalSection(&g_lock);
-}
-#else
 /* Makes GDI able to draw from this font file; verifies that the face GDI selects really is this file. */
 static int gdi_prepare(FontData *f) {             /* callers hold g_lock */
     if (f->gdi) return f->gdi > 0;
@@ -534,6 +479,140 @@ static void glyph_path(FontData *f, uint32_t glyph, const int32_t *m, Path *path
     }
     LeaveCriticalSection(&g_lock);
 }
+#elif defined(SSBU_ANDROID)
+/* Android has no GDI: the outlines come from the font file itself through stb_truetype (public domain, Sean Barrett),
+ * in font units like GetGlyphOutline at an em of upem pixels, with the same transform and curve subdivision below. */
+#define STBTT_STATIC
+#define STB_TRUETYPE_IMPLEMENTATION
+#include "stb_truetype.h"
+static int gdi_prepare(FontData *f) {             /* callers hold g_lock */
+    if (f->gdi) return f->gdi > 0;
+    f->gdi = -1;
+    int off = stbtt_GetFontOffsetForIndex(f->data, (int)f->face_index);
+    stbtt_fontinfo *info = calloc(1, sizeof *info);
+    if (off < 0 || !info || !stbtt_InitFont(info, f->data, off)) { free(info); printf("nn::fontll: font \"%s\" REJECTED BY stb_truetype: its glyphs will be blank\n", f->name); return 0; }
+    f->stb = info;
+    f->gdi = 1;
+    return 1;
+}
+static void glyph_path(FontData *f, uint32_t glyph, const int32_t *m, Path *path) {
+    EnterCriticalSection(&g_lock);
+    if (gdi_prepare(f)) {
+        stbtt_vertex *v = NULL;
+        int nv = stbtt_GetGlyphShape((stbtt_fontinfo *)f->stb, (int)glyph, &v);
+        double a = m[0] / 65536.0 / f->upem, b = m[1] / 65536.0 / f->upem, c2 = m[2] / 65536.0 / f->upem, d = m[3] / 65536.0 / f->upem;
+        double pixels = fabs(a) > fabs(d) ? fabs(a) : fabs(d);
+#define TX(px, py) ((px) * a + (py) * b)
+#define TY(px, py) ((px) * c2 + (py) * d)
+        double x0 = 0, y0 = 0;
+        int open = 0;
+        for (int i = 0; i < nv; i++) {
+            double x = v[i].x, y = v[i].y;
+            if (v[i].type == STBTT_vmove) {
+                if (open) path_close(path);
+                path_point(path, TX(x, y), TY(x, y));
+                open = 1;
+            } else if (v[i].type == STBTT_vline) {
+                path_point(path, TX(x, y), TY(x, y));
+            } else if (v[i].type == STBTT_vcurve) {               /* quadratic: control (cx, cy) */
+                double x1 = v[i].cx, y1 = v[i].cy;
+                double len = (fabs(x1 - x0) + fabs(y1 - y0) + fabs(x - x1) + fabs(y - y1)) * pixels;
+                int steps = 2 + (int)(len / 3.0);
+                if (steps > 32) steps = 32;
+                for (int k = 1; k <= steps; k++) {
+                    double t = (double)k / steps, u = 1 - t, px = u * u * x0 + 2 * u * t * x1 + t * t * x, py = u * u * y0 + 2 * u * t * y1 + t * t * y;
+                    path_point(path, TX(px, py), TY(px, py));
+                }
+            } else if (v[i].type == STBTT_vcubic) {               /* CFF: controls (cx, cy), (cx1, cy1) */
+                double x1 = v[i].cx, y1 = v[i].cy, x2 = v[i].cx1, y2 = v[i].cy1;
+                double len = (fabs(x1 - x0) + fabs(y1 - y0) + fabs(x2 - x1) + fabs(y2 - y1) + fabs(x - x2) + fabs(y - y2)) * pixels;
+                int steps = 2 + (int)(len / 3.0);
+                if (steps > 32) steps = 32;
+                for (int k = 1; k <= steps; k++) {
+                    double t = (double)k / steps, u = 1 - t;
+                    double px = u * u * u * x0 + 3 * u * u * t * x1 + 3 * u * t * t * x2 + t * t * t * x;
+                    double py = u * u * u * y0 + 3 * u * u * t * y1 + 3 * u * t * t * y2 + t * t * t * y;
+                    path_point(path, TX(px, py), TY(px, py));
+                }
+            }
+            x0 = x; y0 = y;
+        }
+        if (open) path_close(path);
+#undef TX
+#undef TY
+        if (v) stbtt_FreeShape((stbtt_fontinfo *)f->stb, v);
+    }
+    LeaveCriticalSection(&g_lock);
+}
+#else
+/* Linux build: FreeType reads the font from our copy of its bytes. */
+static int gdi_prepare(FontData *f) {             /* callers hold g_lock */
+    if (f->gdi) return f->gdi > 0;
+    f->gdi = -1;
+    if (!g_ft && FT_Init_FreeType(&g_ft)) { printf("nn::fontll: FreeType cannot start: glyphs will be blank\n"); return 0; }
+    if (FT_New_Memory_Face(g_ft, f->data, (FT_Long)f->size, (FT_Long)f->face_index, &f->ftface)) { printf("nn::fontll: font \"%s\" REJECTED BY FREETYPE: its glyphs will be blank\n", f->name); return 0; }
+    f->gdi = 1;
+    return 1;
+}
+typedef struct { Path *path; double a, b, c2, d, pixels, x0, y0; int open; } FtWalk;
+#define FTX(w, px, py) ((px) * (w)->a + (py) * (w)->b)
+#define FTY(w, px, py) ((px) * (w)->c2 + (py) * (w)->d)
+static int ft_move(const FT_Vector *to, void *u) {
+    FtWalk *w = u;
+    if (w->open) path_close(w->path);
+    w->open = 1; w->x0 = (double)to->x; w->y0 = (double)to->y;
+    path_point(w->path, FTX(w, w->x0, w->y0), FTY(w, w->x0, w->y0));
+    return 0;
+}
+static int ft_line(const FT_Vector *to, void *u) {
+    FtWalk *w = u;
+    w->x0 = (double)to->x; w->y0 = (double)to->y;
+    path_point(w->path, FTX(w, w->x0, w->y0), FTY(w, w->x0, w->y0));
+    return 0;
+}
+static int ft_conic(const FT_Vector *c, const FT_Vector *to, void *u) {
+    FtWalk *w = u;
+    double x0 = w->x0, y0 = w->y0, x1 = (double)c->x, y1 = (double)c->y, x2 = (double)to->x, y2 = (double)to->y;
+    double len = (fabs(x1 - x0) + fabs(y1 - y0) + fabs(x2 - x1) + fabs(y2 - y1)) * w->pixels;
+    int steps = 2 + (int)(len / 3.0);
+    if (steps > 32) steps = 32;
+    for (int k = 1; k <= steps; k++) {
+        double t = (double)k / steps, v = 1 - t, px = v * v * x0 + 2 * v * t * x1 + t * t * x2, py = v * v * y0 + 2 * v * t * y1 + t * t * y2;
+        path_point(w->path, FTX(w, px, py), FTY(w, px, py));
+    }
+    w->x0 = x2; w->y0 = y2;
+    return 0;
+}
+static int ft_cubic(const FT_Vector *c1, const FT_Vector *c2, const FT_Vector *to, void *u) {
+    FtWalk *w = u;
+    double x0 = w->x0, y0 = w->y0, x1 = (double)c1->x, y1 = (double)c1->y, x2 = (double)c2->x, y2 = (double)c2->y, x3 = (double)to->x, y3 = (double)to->y;
+    double len = (fabs(x1 - x0) + fabs(y1 - y0) + fabs(x2 - x1) + fabs(y2 - y1) + fabs(x3 - x2) + fabs(y3 - y2)) * w->pixels;
+    int steps = 2 + (int)(len / 3.0);
+    if (steps > 32) steps = 32;
+    for (int k = 1; k <= steps; k++) {
+        double t = (double)k / steps, v = 1 - t;
+        double px = v * v * v * x0 + 3 * v * v * t * x1 + 3 * v * t * t * x2 + t * t * t * x3;
+        double py = v * v * v * y0 + 3 * v * v * t * y1 + 3 * v * t * t * y2 + t * t * t * y3;
+        path_point(w->path, FTX(w, px, py), FTY(w, px, py));
+    }
+    w->x0 = x3; w->y0 = y3;
+    return 0;
+}
+static void glyph_path(FontData *f, uint32_t glyph, const int32_t *m, Path *path) {
+    EnterCriticalSection(&g_lock);
+    if (gdi_prepare(f) && !FT_Load_Glyph(f->ftface, glyph, FT_LOAD_NO_SCALE | FT_LOAD_NO_HINTING | FT_LOAD_NO_BITMAP) && f->ftface->glyph->format == FT_GLYPH_FORMAT_OUTLINE) {
+        FtWalk w;
+        w.path = path; w.open = 0; w.x0 = w.y0 = 0;
+        w.a = m[0] / 65536.0 / f->upem; w.b = m[1] / 65536.0 / f->upem; w.c2 = m[2] / 65536.0 / f->upem; w.d = m[3] / 65536.0 / f->upem;
+        w.pixels = fabs(w.a) > fabs(w.d) ? fabs(w.a) : fabs(w.d);
+        static const FT_Outline_Funcs funcs = {ft_move, ft_line, ft_conic, ft_cubic, 0, 0};
+        FT_Outline_Decompose(&f->ftface->glyph->outline, &funcs, &w);
+        if (w.open) path_close(path);
+    }
+    LeaveCriticalSection(&g_lock);
+}
+#undef FTX
+#undef FTY
 #endif
 
 /* ---------------------------------------------------------------- scan conversion (exact area coverage) */
@@ -1243,7 +1322,7 @@ static const ImportDef fontll_imports[] = {
 
 void register_fontll_imports(void) {
     InitializeCriticalSection(&g_lock);
-#ifndef SSBU_ANDROID
+#ifdef _WIN32
     g_dc = CreateCompatibleDC(NULL);
 #endif
     register_imports(fontll_imports, (int)(sizeof fontll_imports / sizeof fontll_imports[0]));

@@ -29,12 +29,16 @@ ecomp_nro.py) gives
  * Environment: SSBU_UNWIND_LOG=1 prints every frame of every throw (the first 3 throws are always summarised). */
 #include <windows.h>
 #include <setjmp.h>
+#include <intrin.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include "runtime.h"
 #include "hostrt.h"
 #include "eh_runtime.h"
+#ifndef _WIN32
+#define _AddressOfReturnAddress() __builtin_frame_address(0)     /* POSIX builds: a position in the current frame (only compared with stack positions) */
+#endif
 
 typedef struct { uint64_t lp; void (*fn)(Ctx *, uint64_t); } NroResume;
 int nro_unwind_module(uint64_t pc, uint64_t *base, uint64_t *size, const NroResume **tab, int *count, const char **name);   /* nnro.c */
@@ -178,32 +182,130 @@ static int step(const Fde *f, Regs *r, uint64_t *cfa_out) {
 typedef struct { uint64_t cfa; jmp_buf *jb; } CatchSlot;
 #define CATCH_SLOTS 8192
 static CatchSlot g_catch[CATCH_SLOTS];
+/* (R3 pub1) r1_state.c: where the table is and how big (it is part of the rollback state). r1_state.c used to find it in the exe's
+ * linker map, which the prebuilt runtime package does not ship: the table was then never captured nor restored. */
+void *nnunwind_catch_table(size_t *bytes) { if (bytes) *bytes = sizeof g_catch; return g_catch; }
 static SRWLOCK g_catch_lock = SRWLOCK_INIT;
 
-static void catch_put(uint64_t cfa, jmp_buf *jb) {
-    unsigned h = (unsigned)((cfa >> 4) * 2654435761u) & (CATCH_SLOTS - 1), first_free = CATCH_SLOTS;
-    AcquireSRWLockExclusive(&g_catch_lock);
-    for (unsigned n = 0; n < 64; n++) {
+/* (R3 hs13) A record belongs to the HOST stack its jmp_buf is on: two coroutines can use the same guest stack (the same CFA)
+ * on two host fibers (a coroutine object made again, a fiber given a new host fiber; with the rollback ring both stay
+ * reachable), and a throw must come back to the frame on the stack it runs on, never longjmp across stacks (that ended in
+ * ntdll's unwinder with 0xC00000FF: tl4 / lh4 / li). Records of the same CFA on other stacks are left alone. */
+static int catch_here(const jmp_buf *jb) {            /* jb is on the stack this thread runs on now (TEB DeallocationStack .. StackBase) */
+#ifdef _WIN32
+    NT_TIB *tib = (NT_TIB *)NtCurrentTeb();
+    uint64_t a = (uint64_t)(uintptr_t)jb, lo = *(uint64_t *)((uint8_t *)tib + 0x1478), hi = (uint64_t)(uintptr_t)tib->StackBase;
+#else                                                 /* POSIX builds: the running fiber's stack, else the thread's (plat_posix.c) */
+    uintptr_t slo = 0, shi = UINTPTR_MAX; plat_current_stack(&slo, &shi);
+    uint64_t a = (uint64_t)(uintptr_t)jb, lo = slo, hi = shi;
+#endif
+    return a >= lo && a < hi;
+}
+/* (R3 hs15, pp3h: "f_720052e2f0 handled an exception but was not entered through nro_catch_call" after a rollback) the old
+ * hash used bits 4..16 of the CFA only, and every lua2cpp coroutine's entry frame sits at the same offset below the top of
+ * its 64 KB-aligned guest stack: all of them fell into one or two buckets and shared ONE 64-slot probe window. Records of
+ * host stacks a rollback abandoned (the coroutine made again on a new host fiber) stay in the table; once the window was
+ * full a new record overwrote the slot at the bucket, i.e. a live record of another coroutine: its throw later found no
+ * frame. Now (SSBU_UNWIND_CATCHFIX=0 = the old way, test): a mixing hash, the whole table is probed, a removed record next
+ * to an empty slot becomes empty again (chains do not grow for ever), and a live record is never overwritten.
+ * SSBU_UNWIND_TEST_PROBES=<n> (test only): the probe window is n slots (the old way's crowding, reached sooner). */
+static int g_cfix = 1, g_cprobes;
+static volatile LONG g_c_crowded, g_c_full, g_c_maxprobe;
+static unsigned catch_hash(uint64_t cfa) {
+    if (!g_cfix) return (unsigned)((cfa >> 4) * 2654435761u) & (CATCH_SLOTS - 1);
+    uint64_t x = cfa >> 4; x ^= x >> 33; x *= 0xff51afd7ed558ccdull; x ^= x >> 33; x *= 0xc4ceb9fe1a85ec53ull; x ^= x >> 33;
+    return (unsigned)x & (CATCH_SLOTS - 1);
+}
+static unsigned catch_window(void) { return g_cprobes > 0 ? (unsigned)g_cprobes : g_cfix ? CATCH_SLOTS : 64; }
+static void catch_free_slot(unsigned i) {                                     /* lock held: record i removed */
+    g_catch[i].cfa = 1; g_catch[i].jb = NULL;
+    if (!g_cfix || g_catch[(i + 1) & (CATCH_SLOTS - 1)].cfa != 0) return;
+    for (unsigned n = 0; n < CATCH_SLOTS && g_catch[i].cfa == 1; n++) { g_catch[i].cfa = 0; i = (i - 1) & (CATCH_SLOTS - 1); }
+}
+/* lock held (or every guest thread held: r1_ring.c rgc_after). here: compare only records on this thread's stack. */
+static void catch_insert(uint64_t cfa, jmp_buf *jb, int here) {
+    unsigned h = catch_hash(cfa), first_free = CATCH_SLOTS, win = catch_window(), n;
+    for (n = 0; n < win; n++) {
         unsigned i = (h + n) & (CATCH_SLOTS - 1);
-        if (g_catch[i].cfa == cfa) { first_free = i; break; }                 /* a frame at the same guest stack address replaces a stale one */
+        if (g_catch[i].cfa == cfa && (here ? catch_here(g_catch[i].jb) : g_catch[i].jb == jb)) { first_free = i; break; }   /* a frame at the same guest stack address ON THIS STACK replaces a stale one */
         if (g_catch[i].cfa <= 1 && first_free == CATCH_SLOTS) first_free = i;
         if (g_catch[i].cfa == 0) break;
     }
-    if (first_free == CATCH_SLOTS) first_free = h;                            /* crowded by records of abandoned stacks: reuse */
+    if ((LONG)n > g_c_maxprobe) g_c_maxprobe = (LONG)n;
+    if (first_free == CATCH_SLOTS) {                                          /* no free slot in the window */
+        InterlockedIncrement(&g_c_crowded);
+        if (!g_cfix || g_cprobes > 0) first_free = h;                         /* the old way: the slot at the bucket is overwritten (a live record lost) */
+        else { InterlockedIncrement(&g_c_full); first_free = h; }             /* the whole table is full of live records (never seen) */
+    }
     g_catch[first_free].cfa = cfa; g_catch[first_free].jb = jb;
+}
+static volatile LONG g_c_puts;
+volatile long long g_unwind_trace_frame;                   /* (hs15) rb_rollback.c: the frame being simulated */
+static int g_ctrace;                                       /* SSBU_UNWIND_TRACE=1: every put / take of a catch record kept in memory, printed at a failure (diagnosis) */
+typedef struct { long long f; const char *what; uint64_t cfa; const void *jb; uint64_t stk; void *fiber; DWORD tid; int found; } CTr;
+static CTr *g_ctr; static volatile LONG g_nctr;          /* 1 << 20 events, allocated when the trace is on */
+static void ctrace(const char *what, uint64_t cfa, const void *jb, int found) {
+    if (!g_ctrace || !g_ctr || g_unwind_trace_frame <= 0) return;
+#ifdef _WIN32                                              /* (the trace is a Windows diagnosis: the rollback ring is Windows only) */
+    NT_TIB *tib = (NT_TIB *)NtCurrentTeb();
+    LONG n = InterlockedIncrement(&g_nctr) - 1; CTr *t = &g_ctr[n & ((1 << 20) - 1)];
+    t->f = g_unwind_trace_frame; t->what = what; t->cfa = cfa; t->jb = jb; t->stk = *(uint64_t *)((uint8_t *)tib + 0x1478); t->fiber = GetCurrentFiber(); t->tid = GetCurrentThreadId(); t->found = found;
+#else
+    (void)what; (void)cfa; (void)jb; (void)found;
+#endif
+}
+void nnunwind_trace_note(const char *what, uint64_t cfa, uint64_t jb) { ctrace(what, cfa, (const void *)(uintptr_t)jb, 1); }   /* r1_ring.c: what a load did to a record */
+static void ctrace_dump(uint64_t cfa) {
+    if (!g_ctrace || !g_ctr) return;
+#ifndef _WIN32
+    (void)cfa;
+#else
+    NT_TIB *tib = (NT_TIB *)NtCurrentTeb(); uint64_t lo = *(uint64_t *)((uint8_t *)tib + 0x1478), hi = (uint64_t)(uintptr_t)tib->StackBase;
+    LONG n = g_nctr, from = n > (1 << 20) ? n - (1 << 20) : 0;
+    long long ff = g_unwind_trace_frame - 60;
+    printf("unwind-trace: events of frame %llx, of this stack %llx..%llx, and captures / loads / restores of this stack from frame %lld (%ld events kept):\n", (unsigned long long)cfa, (unsigned long long)lo, (unsigned long long)hi, ff, (long)(n - from));
+    for (LONG i = from; i < n; i++) { CTr *t = &g_ctr[i & ((1 << 20) - 1)];
+        uint64_t j = (uint64_t)(uintptr_t)t->jb;
+        int mine = t->cfa == cfa || (j >= lo && j < hi) || t->stk == lo;
+        int frame_ev = t->f >= ff && (!strncmp(t->what, "load (", 6) || !strncmp(t->what, "capture", 7));
+        if (!mine && !frame_ev) continue;
+        printf("unwind-trace:   f %lld %s %llx jb %p %s stack %llx fiber %p thread %lu\n", t->f, t->what, (unsigned long long)t->cfa, t->jb, t->found ? "ok" : "NONE", (unsigned long long)t->stk, t->fiber, (unsigned long)t->tid); }
+#endif
+}
+long nnunwind_events(void) { return g_throws + g_c_puts; }        /* (hs15, test switch SSBU_RB_NET_TEST_EH) throws + entries of catch frames so far */
+static void catch_put(uint64_t cfa, jmp_buf *jb) {
+    InterlockedIncrement(&g_c_puts);
+    AcquireSRWLockExclusive(&g_catch_lock);
+    catch_insert(cfa, jb, 1);
     ReleaseSRWLockExclusive(&g_catch_lock);
+    ctrace("put", cfa, jb, 1);
+}
+/* r1_ring.c (a ring load, every guest thread held): put a record back as it was */
+void nnunwind_catch_reinsert(uint64_t cfa, uint64_t jb) { catch_insert(cfa, (jmp_buf *)(uintptr_t)jb, 0); }
+void nnunwind_catch_free(unsigned i) { if (i < CATCH_SLOTS) catch_free_slot(i); }
+void nnunwind_catch_stats(long long *live, long long *dead, long long *crowded, long long *full, long long *maxprobe) {
+    long long l = 0, d = 0; for (unsigned i = 0; i < CATCH_SLOTS; i++) { if (g_catch[i].cfa > 1) l++; else if (g_catch[i].cfa == 1) d++; }
+    *live = l; *dead = d; *crowded = g_c_crowded; *full = g_c_full; *maxprobe = g_c_maxprobe;
 }
 static jmp_buf *catch_take(uint64_t cfa, jmp_buf *only) {                     /* removes the record; only != NULL: remove if it is that one */
-    unsigned h = (unsigned)((cfa >> 4) * 2654435761u) & (CATCH_SLOTS - 1);
+    unsigned h = catch_hash(cfa), win = catch_window();
     jmp_buf *jb = NULL;
     AcquireSRWLockExclusive(&g_catch_lock);
-    for (unsigned n = 0; n < 64; n++) {
+    for (unsigned n = 0; n < win; n++) {
         unsigned i = (h + n) & (CATCH_SLOTS - 1);
-        if (g_catch[i].cfa == cfa) { if (!only || g_catch[i].jb == only) { jb = g_catch[i].jb; g_catch[i].cfa = 1; g_catch[i].jb = NULL; } break; }
+        if (g_catch[i].cfa == cfa && catch_here(g_catch[i].jb)) { if (!only || g_catch[i].jb == only) { jb = g_catch[i].jb; catch_free_slot(i); } break; }
         if (g_catch[i].cfa == 0) break;
     }
     ReleaseSRWLockExclusive(&g_catch_lock);
+    ctrace(only ? "take(return)" : "take(handler)", cfa, only ? (const void *)only : (const void *)jb, jb != NULL);
     return jb;
+}
+static void catch_diag(uint64_t cfa) {                                        /* (hs15) the "not entered" report: what the table holds */
+    long long l, d, cr, fu, mp; int same = 0, here = 0;
+    for (unsigned i = 0; i < CATCH_SLOTS; i++) if (g_catch[i].cfa == cfa) { same++; if (catch_here(g_catch[i].jb)) here++; }
+    nnunwind_catch_stats(&l, &d, &cr, &fu, &mp);
+    printf("unwind: catch table: %d records of this frame (%d on this stack), %lld live records, %lld removed, %lld puts found no free slot in their window, %lld table full, longest probe %lld (fix %s, window %u)\n",
+           same, here, l, d, cr, fu, mp, g_cfix ? "on" : "OFF", catch_window());
 }
 
 /* Entry of every lifted function whose LSDA has a catch clause (generated code: `nro_catch_call(c, u_<fn>)`). */
@@ -221,6 +323,130 @@ void nro_catch_call(Ctx *c, void (*body)(Ctx *, uint64_t)) {
         cc->in_import = in_import;
         cc->import_from = import_from;
     }
+}
+
+/* ---------------------------------------------------------------- smashline's ACMD interpreter (skyline.c)
+ * smashline (a Skyline plugin) runs every ACMD script through an asm stub, __smashline_interpreter, that records
+ * (landing pad, sp) for the current fiber and calls the script, often Rust code without unwind tables. On the console it
+ * hooks libunwind's step: while that record exists, the first frame stepped gets the stub's landing pad and a personality
+ * that says "handler here", so a script ended by L2CExceptionShutdown resumes in the stub, which takes its saved sp back
+ * and returns normally to the game. Here: when the stub is on the throwing stack (its call's return address in a frame
+ * record, or failing that in a stack slot), raise() enters the landing pad's resume entry; the stub then returns, and the
+ * host stack is cut back to the record unwind_interp_call() made at the stub's entry (installed with the hook table). */
+static uint64_t g_interp_ret, g_interp_lp;
+/* SSBU_EH_TIMING=1 (test): where a throw that smashline's stub takes spends its time. Stages: 0 interp_on_stack, 1 the
+ * stub's landing code, 2 catch_take + checks, 3 longjmp back to unwind_interp_call (the host unwind); plus the host stack
+ * the longjmp cut. Slow throws (> 2 ms, first 80) get a line; every 500 throws a summary. */
+static int g_ehtm = -1;
+static __declspec(thread) LONG64 t_eh_t[5];
+static __declspec(thread) uint64_t t_eh_rsp;
+static LONG64 g_ehtm_sum[4], g_ehtm_max[4], g_ehtm_n, g_ehtm_slow;
+static double g_ehtm_f;
+static LONG64 ehtm_now(void) { LARGE_INTEGER t; QueryPerformanceCounter(&t); return t.QuadPart; }
+static int ehtm_on(void) { if (g_ehtm < 0) { LARGE_INTEGER f; QueryPerformanceFrequency(&f); g_ehtm_f = 1000.0 / (double)f.QuadPart; g_ehtm = getenv("SSBU_EH_TIMING") && atoi(getenv("SSBU_EH_TIMING")); } return g_ehtm; }
+static void ehtm_landed(uint64_t rsp_now) {
+    t_eh_t[4] = ehtm_now();
+    LONG64 d[4]; for (int i = 0; i < 4; i++) d[i] = t_eh_t[i + 1] - t_eh_t[i];
+    LONG64 n = InterlockedIncrement64(&g_ehtm_n);
+    for (int i = 0; i < 4; i++) { InterlockedAdd64(&g_ehtm_sum[i], d[i]); if (d[i] > g_ehtm_max[i]) g_ehtm_max[i] = d[i]; }
+    double tot = (double)(t_eh_t[4] - t_eh_t[0]) * g_ehtm_f;
+    if (tot > 2.0 && InterlockedIncrement64(&g_ehtm_slow) <= 80)
+        printf("eh-timing: slow throw %.2f ms: stub search %.2f, landing code %.2f, record %.2f, longjmp %.2f ms; host stack cut %llu KB\n", tot,
+               d[0] * g_ehtm_f, d[1] * g_ehtm_f, d[2] * g_ehtm_f, d[3] * g_ehtm_f, (unsigned long long)((rsp_now - t_eh_rsp) >> 10));
+    if (n % 500 == 0)
+        printf("eh-timing: %lld stub throws: average ms search %.3f landing %.3f record %.3f longjmp %.3f | worst %.2f %.2f %.2f %.2f | slow (> 2 ms) %lld\n", (long long)n,
+               g_ehtm_sum[0] * g_ehtm_f / n, g_ehtm_sum[1] * g_ehtm_f / n, g_ehtm_sum[2] * g_ehtm_f / n, g_ehtm_sum[3] * g_ehtm_f / n,
+               g_ehtm_max[0] * g_ehtm_f, g_ehtm_max[1] * g_ehtm_f, g_ehtm_max[2] * g_ehtm_f, g_ehtm_max[3] * g_ehtm_f, (long long)g_ehtm_slow);
+}
+static volatile LONG g_interp_landings;
+void unwind_set_interpreter(uint64_t ret_addr, uint64_t resume_lp) { g_interp_ret = ret_addr; g_interp_lp = resume_lp; }
+/* The interpreter calls in progress on each guest thread / fiber: a list through records on the host stack of
+ * unwind_interp_call, its head in fiber-local storage (every guest fiber is a Windows fiber, os_threads.c; a fiber that
+ * is dropped takes its list with it). interp_on_stack used to scan the whole throwing stack (up to 2 MB, one word at a
+ * time) for the stub's return address, after a VirtualQuery of the stack: the guest stacks of fibers lie in the game's
+ * heap, one committed region of gigabytes, which VirtualQuery walks page by page. Every L2CExceptionShutdown of HDR's
+ * scripts paid 1-22 ms for it on the main thread (frames of 10-37 ms in a 120 Hz fight, up to 2.5 s of them in two
+ * minutes). Now the innermost record of this fiber is the interpreter call the throw is inside of; its guest side is
+ * confirmed by the stub's return address just below the stub's sp (a few hundred bytes), else the old scan decides. */
+typedef struct IRec { struct IRec *prev; uint64_t cfa; } IRec;
+static DWORD g_irec_fls = FLS_OUT_OF_INDEXES;
+static volatile LONG g_irec_init;
+static DWORD irec_slot(void) {
+    if (g_irec_init != 2) {
+        if (InterlockedCompareExchange(&g_irec_init, 1, 0) == 0) { g_irec_fls = FlsAlloc(NULL); InterlockedExchange(&g_irec_init, 2); }
+        else while (g_irec_init != 2) SwitchToThread();
+    }
+    return g_irec_fls;
+}
+void unwind_interp_call(Ctx *c, void (*orig)(Ctx *)) {
+    Ctx *volatile cc = c;
+    jmp_buf jb;
+    volatile uint64_t cfa = c->x[31];
+    const char *volatile in_import = c->in_import;
+    volatile uint64_t import_from = c->import_from;
+    volatile DWORD fls = irec_slot();
+    IRec rec = {fls != FLS_OUT_OF_INDEXES ? (IRec *)FlsGetValue(fls) : NULL, cfa};
+    IRec *volatile prev = rec.prev;                       /* read again after a longjmp: kept in memory */
+    if (fls != FLS_OUT_OF_INDEXES) FlsSetValue(fls, &rec);
+    catch_put(cfa, &jb);
+    if (setjmp(jb) == 0) {
+        orig(c);
+        catch_take(cfa, &jb);
+    } else {
+        if (g_ehtm > 0 && t_eh_t[0]) { ehtm_landed((uint64_t)(uintptr_t)_AddressOfReturnAddress()); t_eh_t[0] = 0; }
+        cc->in_import = in_import;
+        cc->import_from = import_from;
+    }
+    if (fls != FLS_OUT_OF_INDEXES) FlsSetValue(fls, prev);
+}
+static LONG64 g_iact_fast, g_iact_scan, g_iact_stale, g_iact_none;
+static int interp_on_stack_scan(Ctx *c) {                /* the old way: when the record is not confirmed */
+    MEMORY_BASIC_INFORMATION mi;
+    uint64_t sp = c->x[31];
+    if (!VirtualQuery((void *)(uintptr_t)sp, &mi, sizeof mi)) return 0;
+    uint64_t top = (uint64_t)(uintptr_t)mi.BaseAddress + mi.RegionSize;
+    if (top - sp > 0x200000) top = sp + 0x200000;
+    for (uint64_t fp = c->x[29], n = 0; fp >= sp && fp + 16 <= top && !(fp & 7) && n < 4096; n++) {      /* frame records */
+        if (rd64(fp + 8) == g_interp_ret) return 1;
+        uint64_t next = rd64(fp);
+        if (next <= fp) break;
+        fp = next;
+    }
+    for (uint64_t a = sp & ~7ull; a + 8 <= top; a += 8) if (rd64(a) == g_interp_ret) return 1;      /* a frame without a record */
+    return 0;
+}
+static int interp_on_stack(Ctx *c) {
+    DWORD fls = irec_slot();
+    if (fls == FLS_OUT_OF_INDEXES) { InterlockedIncrement64(&g_iact_scan); return interp_on_stack_scan(c); }
+#ifdef _WIN32
+    NT_TIB *tib = (NT_TIB *)NtCurrentTeb();
+    uint64_t now = (uint64_t)(uintptr_t)_AddressOfReturnAddress(), base = (uint64_t)(uintptr_t)tib->StackBase, sp = c->x[31];
+#else                                                 /* POSIX builds: the running fiber's stack, else the thread's (plat_posix.c) */
+    uintptr_t slo = 0, shi = UINTPTR_MAX; plat_current_stack(&slo, &shi);
+    uint64_t now = (uint64_t)(uintptr_t)_AddressOfReturnAddress(), base = shi, sp = c->x[31];
+#endif
+    IRec *r = (IRec *)FlsGetValue(fls);
+    if (!r) {
+        LONG64 k = InterlockedIncrement64(&g_iact_none);
+        if (g_ehtm > 0) {                             /* SSBU_EH_TIMING (test): would the old scan have said otherwise? */
+            static LONG64 differ;
+            if (interp_on_stack_scan(c) && InterlockedIncrement64(&differ) <= 10) printf("eh-timing: no interpreter call recorded on this fiber, but the old scan finds the stub's return address (guest sp %llx)\n", (unsigned long long)sp);
+            if (k % 100 == 0) printf("eh-timing: interpreter check: %lld outside (old scan disagrees %lld), %lld inside (confirmed), %lld unconfirmed\n",
+                                     (long long)k, (long long)differ, (long long)g_iact_fast, (long long)g_iact_stale);
+        }
+        return 0;
+    }
+    if ((uint64_t)(uintptr_t)r > now && (uint64_t)(uintptr_t)r < base && r->cfa > sp && r->cfa - sp <= 0x200000) {
+        uint64_t cfa = r->cfa, lo = cfa - sp > 0x10000 ? cfa - 0x10000 : sp;      /* the stub's return address in the frame it called, just below its sp */
+        for (uint64_t a = (cfa - 8) & ~7ull; a >= lo && a >= sp; a -= 8)
+            if (rd64(a) == g_interp_ret) {
+                LONG64 k = InterlockedIncrement64(&g_iact_fast);
+                if (g_ehtm > 0 && k % 500 == 0) printf("eh-timing: interpreter check: %lld inside (confirmed), %lld outside, %lld unconfirmed\n", (long long)k, (long long)g_iact_none, (long long)g_iact_stale);
+                return 1;
+            }
+    }
+    InterlockedIncrement64(&g_iact_stale);            /* not confirmed (a record left behind by a longjmp?): the old scan decides */
+    return interp_on_stack_scan(c);
 }
 
 /* ---------------------------------------------------------------- the unwinder (eh_runtime.h: EhRaiseFn) */
@@ -268,6 +494,31 @@ static void eh_raise(Ctx *c, int reason) {
     uint64_t cfa = 0;
     const char *stop = "frame limit";
     const char *owner = "?";
+    if (g_interp_ret && ehtm_on()) { t_eh_t[0] = ehtm_now(); t_eh_rsp = (uint64_t)(uintptr_t)_AddressOfReturnAddress(); }
+    if (g_interp_ret && interp_on_stack(c)) {            /* smashline: the interpreter stub catches it (see above) */
+        if (g_ehtm > 0) t_eh_t[1] = ehtm_now();
+        void (*fn)(Ctx *, uint64_t) = resume_entry(g_interp_lp, &owner);
+        if (fn) {
+            EhPad ip;
+            memset(&ip, 0, sizeof ip);
+            ip.kind = EH_HANDLER; ip.landing_pad = g_interp_lp; ip.exception = exc;
+            if (InterlockedIncrement(&g_interp_landings) <= 3 || g_log)
+                printf("unwind: %s thrown at 0x%llx: smashline's interpreter stub takes it (landing pad %llx)\n", eh_type_name(exc), (unsigned long long)c->x[30] - 4, (unsigned long long)g_interp_lp);
+            int uncaught_before = eh_uncaught_count(c);
+            eh_enter_pad(c, &ip);
+            c->in_import = NULL;
+            fn(c, g_interp_lp);                           /* the stub's landing code: its saved sp back, then it returns */
+            if (g_ehtm > 0) t_eh_t[2] = ehtm_now();
+            eh_stub_done(c, exc, uncaught_before);        /* nncxxrt.c: the exception is over for this context */
+            jmp_buf *jb = catch_take(c->x[31], NULL);
+            if (!jb) {
+                printf("\nunwind: smashline's interpreter stub returned to sp %llx, where no entry record is\n", (unsigned long long)c->x[31]);
+                eh_terminate(c, "no host frame to return to");
+            }
+            if (g_ehtm > 0) t_eh_t[3] = ehtm_now();
+            longjmp(*jb, 1);
+        }
+    }
     if (reason == EH_RAISE_THROW) {                       /* phase 1: is there a handler at all? (the console terminates without unwinding if not) */
         LONG seq = InterlockedIncrement(&g_throws);
         int found = 0, depth = 0;
@@ -314,7 +565,22 @@ static void eh_raise(Ctx *c, int reason) {
         jmp_buf *jb = catch_take(cfa, NULL);
         if (!jb) {
             printf("\nunwind: f_%llx handled an exception but was not entered through nro_catch_call (frame %llx)\n", (unsigned long long)pad.function.start, (unsigned long long)cfa);
+            catch_diag(cfa); ctrace_dump(cfa); fflush(stdout);
             eh_terminate(c, "no host frame to return to");
+        }
+        {   /* (R3 hs13, diagnosis) the jmp_buf must be on the stack this thread runs on now (its TEB limits): a longjmp across
+             * stacks ends in ntdll's unwinder with 0xC00000FF (tl4 / nmr / le3a / lg2a after a rollback) */
+#ifdef _WIN32
+            NT_TIB *tib = (NT_TIB *)NtCurrentTeb(); uint64_t a = (uint64_t)(uintptr_t)jb, lo = *(uint64_t *)((uint8_t *)tib + 0x1478), hi = (uint64_t)(uintptr_t)tib->StackBase;
+#else
+            uintptr_t slo = 0, shi = UINTPTR_MAX; plat_current_stack(&slo, &shi); uint64_t a = (uint64_t)(uintptr_t)jb, lo = slo, hi = shi;
+#endif
+            if (a < lo || a >= hi) {
+                volatile uint64_t here = 0;
+                printf("\nunwind: CROSS-STACK longjmp: handler f_%llx frame cfa %llx, jmp_buf %p is NOT on this thread's stack %llx..%llx (rsp ~%p, fiber %p, thread %lu)\n",
+                       (unsigned long long)pad.function.start, (unsigned long long)cfa, (void *)jb, (unsigned long long)lo, (unsigned long long)hi, (void *)&here, GetCurrentFiber(), (unsigned long)GetCurrentThreadId());
+                fflush(stdout);
+            }
         }
         longjmp(*jb, 1);
     }
@@ -324,9 +590,19 @@ static void eh_raise(Ctx *c, int reason) {
 
 void unwind_report(FILE *out) {
     if (g_throws) fprintf(out, "unwind: %ld exceptions thrown, %ld clean-up pads run, %ld skipped\n", (long)g_throws, (long)g_cleanups, (long)g_skipped);
+    if (g_interp_landings) fprintf(out, "unwind: %ld taken by smashline's interpreter stub\n", (long)g_interp_landings);
 }
 
 void register_unwind_imports(void) {
     g_log = getenv("SSBU_UNWIND_LOG") != NULL;
+    /* (hs15, the pp3h crash) every page of the catch table written once now: an image's .bss page that was never written is
+     * copy-on-write, and r1_state.c's state collection takes only read-write pages, so the part of the table not yet used at
+     * the ring's full save (48 of its 128 KB in every run: "extra ... + 80 KB") was never captured nor restored: a load put the
+     * coroutines' stacks back but left those records as they were (a record of a coroutine that had ended since was missing:
+     * "handled an exception but was not entered through nro_catch_call"). SSBU_UNWIND_TOUCH=0: the old way (test). */
+    { const char *e = getenv("SSBU_UNWIND_TOUCH");
+      if (!(e && e[0] == '0')) for (unsigned i = 0; i < CATCH_SLOTS; i += 4096 / sizeof(CatchSlot)) ((volatile CatchSlot *)g_catch)[i].cfa = 0;
+      if (!(e && e[0] == '0')) { volatile uint8_t *last = (volatile uint8_t *)&g_catch[CATCH_SLOTS - 1]; *last = *last; ((volatile CatchSlot *)g_catch)[CATCH_SLOTS - 1].cfa = 0; } }
+    { const char *e = getenv("SSBU_UNWIND_CATCHFIX"); g_cfix = !(e && e[0] == '0'); e = getenv("SSBU_UNWIND_TEST_PROBES"); g_cprobes = e ? atoi(e) : 0; g_ctrace = getenv("SSBU_UNWIND_TRACE") != NULL; if (g_ctrace) g_ctr = VirtualAlloc(NULL, sizeof(CTr) << 20, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE); }
     eh_set_unwinder(eh_raise);
 }

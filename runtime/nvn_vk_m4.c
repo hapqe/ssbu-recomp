@@ -178,7 +178,7 @@ static void vstage_from_rec(VStage *v, const StageRec *r, uint64_t vh, VkShaderM
     v->mod = mod; v->ok = 1;
 }
 static int key_fits(int s, const uint32_t *want, const uint32_t *have, uint32_t dep, uint32_t tex) {
-    uint32_t da = s == 0 ? dep : 0;
+    uint32_t da = s == 0 ? dep | dep << 16 : 0;      /* 2026-10-20: bit 16 + n of key[0] = attribute n decoded from A2B10G10R10 SNORM (records made before carry no such bits) */
     return !((want[0] ^ have[0]) & da) && !((want[1] ^ have[1]) & da) && !((want[2] ^ have[2]) & tex) && !((want[3] ^ have[3]) & tex);
 }
 /* g_sh_lock held. The variant of this code that serves `key` (compared under the variant's own masks: a stage that reads no
@@ -336,7 +336,7 @@ static VStage *vstage_get(Prog *p, int s, const uint32_t *key, uint32_t fo) {
 }
 
 /* ---------------------------------------------------------------- pipelines */
-typedef struct { uint32_t vs, fs, chanmask, sample_mask; int32_t cfmt[8], dfmt; uint8_t topo_class, ncolor, samples, poly, a2c, dclamp, logic, sshade, blend_on, pad[3]; uint8_t blend[8][8]; } PKey;
+typedef struct { uint32_t vs, fs, chanmask, sample_mask; int32_t cfmt[8], dfmt; uint8_t topo_class, ncolor, samples, poly, a2c, dclamp, logic, sshade, blend_on, pad[3]; uint8_t blend[8][8]; PKEY_VI } PKey;
 typedef struct Pipe { PKey k; VkPipeline p, p_fast; /* p_fast: the pipeline linked at once, after the optimised one took its place */ VkPipelineLayout layout; VkDescriptorSetLayout dl[2]; int nb[2], push0; VStage *vs, *fs; volatile LONG state; uint8_t recorded, predicted, used, libbed, lib_how; struct Pipe *next; } Pipe;      /* libbed: linked from libraries (layout and set layouts belong to the pair library); lib_how: 0 the pair library was there, 1 compiled by this build, 2 waited for */      /* state: 0 queued for a worker, 1 being made, 2 made */
 static Pipe *g_pipes[1024];
 static void pkey_targets(PKey *k);
@@ -625,7 +625,20 @@ static VkPipeline stagelib_ensure(VStage *v, int alone, int *how) {
     FbInfo fbi = {(VkStructureType)1000192000, NULL, &fb_all, 1, &fb_st};
     ri.pNext = &fbi;
     VkResult r = pw_graphics(g_pcache, &gi, lib);
-    if (r != VK_SUCCESS) vkd_fail("vkCreateGraphicsPipelines, stage library (%s stage %u): %s", isfs ? "fragment" : "vertex", v->id, vk_result_name(r));
+    /* (2026-10-21, tester: AMD RX 6750 XT, VK_ERROR_INITIALIZATION_FAILED during the first-run preparation) tried again, then
+     * without the pipeline cache; if the driver still refuses, the next start uses whole pipelines (no stage libraries):
+     * the marker file ../cache/vk/no_stage_libraries.txt (vk_gpl_mode), deleted by hand to try the libraries again */
+    for (int t = 0; r != VK_SUCCESS && t < 3; t++) {
+        printf("nvn_vk: the driver refused the stage library (%s stage %u): %s; trying again%s\n", isfs ? "fragment" : "vertex", v->id, vk_result_name(r), t == 2 ? " without the pipeline cache" : "");
+        fflush(stdout);
+        Sleep(50 << t);
+        r = pw_graphics(t == 2 ? VK_NULL_HANDLE : g_pcache, &gi, lib);
+    }
+    if (r != VK_SUCCESS) {
+        FILE *mk = fopen("../cache/vk/no_stage_libraries.txt", "w");
+        if (mk) { fprintf(mk, "The graphics driver refused a stage library (%s): the game uses whole pipelines from the next start. Delete this file to try the libraries again.\n", vk_result_name(r)); fclose(mk); }
+        vkd_fail("vkCreateGraphicsPipelines, stage library (%s stage %u): %s. START THE GAME AGAIN: from now on it uses whole pipelines, which this driver accepts", isfs ? "fragment" : "vertex", v->id, vk_result_name(r));
+    }
     LONG64 dt = tk() - t0;
     fb_note(0, &fb_all, dt);
     EnterCriticalSection(&g_sh_lock);
@@ -804,7 +817,7 @@ static double pipe_build(Pipe *p) {
     if (k->dfmt && (fmt_aspect((VkFormat)k->dfmt) & VK_IMAGE_ASPECT_STENCIL_BIT)) ri.stencilAttachmentFormat = (VkFormat)k->dfmt;
     VkGraphicsPipelineCreateInfo gi = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
     gi.pNext = &ri; gi.stageCount = fs ? 2 : 1; gi.pStages = st; gi.pInputAssemblyState = &ia; gi.pViewportState = &vp; gi.pRasterizationState = &rs; gi.pMultisampleState = &ms;
-    gi.pDepthStencilState = &ds; gi.pColorBlendState = &cb; gi.pDynamicState = &dy; gi.layout = p->layout;
+    gi.pDepthStencilState = &ds; gi.pColorBlendState = &cb; gi.pDynamicState = &dy; gi.layout = p->layout; NVK_VI_PIPE(k, dyn, &gi)
     VkResult r = pw_graphics(g_pcache, &gi, &p->p);
     if (r != VK_SUCCESS) vkd_fail("vkCreateGraphicsPipelines (vertex stage %u, fragment stage %u, %d colour targets, depth format %d): %s", k->vs, k->fs, k->ncolor, k->dfmt, vk_result_name(r));
     InterlockedIncrement64(&R.pipelines);
@@ -823,7 +836,7 @@ static void piperec_append(const PKey *k, VStage *vs, VStage *fs, int compute) {
     memset(&r, 0, sizeof r);
     r.magic = PIPEREC_MAGIC; r.compute = (uint32_t)compute; r.vs_h = vs->h; r.fs_h = fs ? fs->h : 0;
     if (k) { r.k = *k; r.k.vs = r.k.fs = 0; }
-    FILE *fp = fopen(vkc_file("pipes.bin"), "ab");
+    FILE *fp = fopen(vkc_file(VK_PIPES_BIN), "ab");
     if (fp) { fwrite(&r, 1, sizeof r, fp); fclose(fp); }
 }
 
@@ -1296,7 +1309,7 @@ static void job_draw(Job *j) {                     /* a draw the look-ahead met 
     if (j->has[1]) { fs = stage_ensure(&j->src[1], ssrc_hb(&j->src[1]), j->key1, 0, &how); if (how == 1) InterlockedIncrement64(&g_w_stages); if (!fs->ok) return; }
     if (!vs->ok) return;
     if (fs && (fs->in_attr & ~vs->out_attr)) { vs = stage_ensure(&j->src[0], hv, j->key0, fs->in_attr & ~vs->out_attr, &how); if (how == 1) InterlockedIncrement64(&g_w_stages); if (!vs->ok) return; }
-    if (!D.has_eds3) return;                       /* the key holds blend state the look-ahead does not follow */
+    if (!D.has_eds3 || !D.has_vids) return;        /* the key holds blend state (or, V_novids, the vertex layout) the look-ahead does not follow */
     PKey k = j->k;
     k.vs = vs->id; k.fs = fs ? fs->id : 0;
     uint64_t h = fnv(0xcbf29ce484222325ULL, &k, sizeof k);
@@ -1633,15 +1646,15 @@ static void prewarm_start(void) {
     /* Blind prediction (pair x most used pass signatures) is OFF unless SSBU_VK_PREDICT=1: measured on a first run it made
      * 8,418 pipelines of which draws used 324, and kept the workers from the programs being handed over. The look-ahead
      * (scan_list below) names exactly what a batch needs instead. */
-    g_predict = D.has_eds3 && getenv("SSBU_VK_PREDICT") && atoi(getenv("SSBU_VK_PREDICT"));
+    g_predict = D.has_eds3 && D.has_vids && getenv("SSBU_VK_PREDICT") && atoi(getenv("SSBU_VK_PREDICT"));
     g_scan_on = D.has_eds3 && !(getenv("SSBU_VK_LOOKAHEAD") && !atoi(getenv("SSBU_VK_LOOKAHEAD")));
     g_cscan = !(getenv("SSBU_VK_CSCAN") && !atoi(getenv("SSBU_VK_CSCAN")));                              /* session 6: the container scan */
-    g_cpredict = D.has_eds3 && !(getenv("SSBU_VK_CPREDICT") && !atoi(getenv("SSBU_VK_CPREDICT")));      /* and the pipelines of a container's pass signatures for all its pairs */
+    g_cpredict = D.has_eds3 && D.has_vids && !(getenv("SSBU_VK_CPREDICT") && !atoi(getenv("SSBU_VK_CPREDICT")));      /* and the pipelines of a container's pass signatures for all its pairs */
     g_cscan_log = getenv("SSBU_VK_CSCAN_LOG") && atoi(getenv("SSBU_VK_CSCAN_LOG"));
     if (getenv("SSBU_VK_CSCAN_STEP") && atoi(getenv("SSBU_VK_CSCAN_STEP")) >= 8) g_cscan_step = (uint64_t)atoi(getenv("SSBU_VK_CSCAN_STEP")) & ~7ull;
     if (getenv("SSBU_VK_CSCAN_REACH") && atoi(getenv("SSBU_VK_CSCAN_REACH")) > 0) g_cscan_reach = (uint64_t)atoi(getenv("SSBU_VK_CSCAN_REACH"));
     int ahead = !(getenv("SSBU_VK_PREWARM") && !atoi(getenv("SSBU_VK_PREWARM")));
-    FILE *fp = ahead ? fopen(vkc_file("pipes.bin"), "rb") : NULL;
+    FILE *fp = ahead ? fopen(vkc_file(VK_PIPES_BIN), "rb") : NULL;
     if (fp) {
         fseek(fp, 0, SEEK_END); long n = ftell(fp); fseek(fp, 0, SEEK_SET);
         g_pw_rec = malloc((size_t)n + 1);
@@ -1649,7 +1662,7 @@ static void prewarm_start(void) {
         fclose(fp);
         int kept = 0;
         qsort(g_pw_rec, (size_t)g_pw_n, sizeof(PipeRec), piperec_cmp);
-        for (int i = 0; i < g_pw_n; i++) if (g_pw_rec[i].magic == PIPEREC_MAGIC && (!kept || memcmp(&g_pw_rec[kept - 1], &g_pw_rec[i], sizeof(PipeRec)))) g_pw_rec[kept++] = g_pw_rec[i];
+        for (int i = 0; i < g_pw_n; i++) if (g_pw_rec[i].magic == PIPEREC_MAGIC && nvk_vl_rec_ok(&g_pw_rec[i].k) && (!kept || memcmp(&g_pw_rec[kept - 1], &g_pw_rec[i], sizeof(PipeRec)))) g_pw_rec[kept++] = g_pw_rec[i];
         g_pw_n = kept;
     } else printf(ahead ? "nvn_vk: no ../cache/vk/pipes.bin: a first run on this PC; stages and pipelines are made when the game hands its programs over\n" : "nvn_vk: SSBU_VK_PREWARM=0: the pipeline list of earlier runs is not read\n");
     SYSTEM_INFO si;
@@ -1713,7 +1726,7 @@ static void scan_draw(Scan *s, unsigned prim) {
     PKey k = s->sig;
     k.topo_class = tclass[prim]; k.logic = s->logic; k.sshade = p1 ? (uint8_t)p1->sample_shading : 0;
     if (vs_made && fs_made) {
-        if (!vs->ok || (fs && !fs->ok)) return;
+        if (!vs->ok || (fs && !fs->ok) || !D.has_vids) return;      /* V_novids: the look-ahead does not know the vertex layout */
         k.vs = vs->id; k.fs = fs ? fs->id : 0;
         uint64_t h = fnv(0xcbf29ce484222325ULL, &k, sizeof k);
         EnterCriticalSection(&g_sh_lock);
@@ -1971,7 +1984,7 @@ static uint64_t g_cont_neg[1024];
 static uint32_t g32(uint64_t a) { uint32_t v; memcpy(&v, (const void *)(uintptr_t)a, 4); return v; }
 static uint64_t g64(uint64_t a) { uint64_t v; memcpy(&v, (const void *)(uintptr_t)a, 8); return v; }
 static void cont_predict(PairRec *pr, int i) {     /* g_sh_lock held */
-    if (pr->sigs >> i & 1) return;
+    if ((pr->sigs >> i & 1) || !D.has_vids) return;      /* V_novids: a signature holds the vertex layout of another pair */
     pr->sigs |= 1ull << i;
     PKey k = g_sig[i].k;
     k.vs = pr->vs->id; k.fs = pr->fs ? pr->fs->id : 0; k.sshade = pr->fs ? pr->sshade : 0;
@@ -2327,7 +2340,7 @@ static void prep_line(const char *what) {
     printf("nvn_vk_prep: %s: %d of %d containers read, %lld variations, %lld of %lld done by the workers, %.1f s after its start (frame %lld, %s); stage variants in memory %lld, stage libraries %lld; process memory: %llu MB private, %llu MB working set\n",
            what, g_prep_read, g_prep_nfiles, (long long)g_prep_vars, d, q, (double)((g_prep_t1 ? g_prep_t1 : tk()) - g_prep_t0) / (double)fq.QuadPart, (long long)nvn_front_frame_next(), g_in_fight ? "IN A FIGHT" : "no fight",
            made, libs, (unsigned long long)(pm.PrivateUsage >> 20), (unsigned long long)(pm.WorkingSetSize >> 20));
-    fflush(stdout);
+    fflush(stdout); { void display_title_note(const char *); char tn[200]; if (nvn_front_frame_next() <= 2 && g_prep_nfiles && g_prep_read < g_prep_nfiles) { snprintf(tn, sizeof tn, "first start: preparing the shaders, %d of %d (once; can take 10-30 min on a laptop GPU, the window stays black)", g_prep_read, g_prep_nfiles); display_title_note(tn); } else display_title_note(NULL); }      /* (issue #57 / testers: a black window for minutes) */
 }
 static int prep_list(const char *dir) {
     char pat[300];
@@ -2552,7 +2565,7 @@ static void prep_start(void) {
 #define VK_KEYS_VERSION 1
     char kv[16] = "";
     if (VK_KEYS_VERSION > 1) snprintf(kv, sizeof kv, "_k%d", VK_KEYS_VERSION);
-    snprintf(g_prep_marker, sizeof g_prep_marker, "%s/prepared_v%u%s_s%d_%s_%04x_%04x_%08x.txt", vkc_dir(), MX_VK_VERSION, kv, RS_ON ? 1 : 0, D.has_gpl && gpl_sep() ? "lib" : "nolib" /* a pass without libraries (SSBU_VK_PREP=1, run s10n0) must not make a later run with libraries skip theirs */, (unsigned)V.props.vendorID, (unsigned)V.props.deviceID, (unsigned)V.props.driverVersion);
+    snprintf(g_prep_marker, sizeof g_prep_marker, "%s/prepared_v%u%s_s%d_%s_%04x_%04x_%08x.txt", vkc_dir(), MX_VK_VERSION, kv, RS_ON ? 1 : 0, D.has_gpl && gpl_sep() ? "lib" : D.has_vids ? "nolib" : "novi" /* a pass without libraries (SSBU_VK_PREP=1, run s10n0) must not make a later run with libraries skip theirs */, (unsigned)V.props.vendorID, (unsigned)V.props.deviceID, (unsigned)V.props.driverVersion);
     if (on && GetFileAttributesA(g_prep_marker) != INVALID_FILE_ATTRIBUTES && !(e && atoi(e) == 2)) {
         /* 2026-10-16, the owner's order ("all of them during the white screen at the start, with a small loading screen"):
          * graphics.ini shader_load = start (default; SSBU_VK_LOAD_AT_START=0/1 wins, SSBU_VK_PREP_KEEP=<n> too): EVERY
