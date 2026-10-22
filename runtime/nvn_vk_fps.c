@@ -85,7 +85,7 @@ static void fps_draw(uint32_t index) {
     if (!g_fps.have) return;                       /* the first half second: nothing measured yet */
     void display_fit(int sw, int sh, int dw, int dh, int out[4]);
     int W = (int)V.extent.width, H = (int)V.extent.height, d4[4], dot = H / 360 > 1 ? H / 360 : 1;
-    display_fit(16, 9, W, H, d4);                  /* in the picture, not in a black bar */
+    { int pw, ph; pic_shape(&pw, &ph); display_fit(pw, ph, W, H, d4); }      /* in the picture, not in a black bar */
     int x = d4[0] + dot * 4, y = d4[1] + dot * 4;
     if (x + g_fps.tw * dot > W || y + FPS_H * dot > H) return;
     VkImageMemoryBarrier ib;                       /* the picture's blit is written before ours writes over a part of it */

@@ -57,7 +57,7 @@ extern "C" {
 uint64_t nnhid_preview(int id, int st[4]); void nnhid_kb_player_refresh(void); int nnhid_kb_player(void);      /* nnhid.c */
 void nnhid_test_key(int vk); long nnhid_test_result(uint64_t *buttons); int nnpad_kb_default(int idx);
 uint64_t nnhid_menu_buttons(void);                                   /* nnhid.c: every pad, Npad bit order, no effect on the game */
-void display_set_window_mode(int mode); void display_set_client_size(int w, int h); int display_window_mode(void); int display_aspect_stretch(void); void display_set_aspect(int stretch);      /* display.c */
+void display_set_window_mode(int mode); void display_set_client_size(int w, int h); int display_window_mode(void); int display_aspect(void); void display_set_aspect(int mode);      /* display.c */
 int nnaudio_volume(void); void nnaudio_set_volume(int percent);     /* nnaudio.c */
 int nnpad_kb_vk(int idx); void nnpad_kb_bind(int idx, int vk); void nnpad_kb_player_set(int p); int nnpad_kb_player_cfg(void);      /* nnpad_sdl.c */
 const char *nnpad_kb_label(int idx); void nnpad_vk_name(int vk, char *o, int n); int nnpad_describe(char *out, int n); const char *nnpad_config_path(void);
@@ -358,7 +358,7 @@ static const char *const k_onoff[] = {"off", "on"};
 static const char *const k_lang[] = {"auto", "ja", "en-US", "en-GB", "fr", "fr-CA", "de", "it", "es", "es-419", "zh-Hans", "zh-Hant", "ko", "nl", "ru"};
 static const char *const k_lang_name[] = {"auto (Windows display language)", "Japanese", "English (US)", "English (UK)", "French", "French (Canada)", "German", "Italian",
                                           "Spanish (Spain)", "Spanish (Latin America)", "Chinese (simplified)", "Chinese (traditional)", "Korean", "Dutch", "Russian"};
-static const char *const k_aspect[] = {"keep", "stretch"}, *const k_aspect_name[] = {"16:9 with black bars", "Fill the window (stretched)"};
+static const char *const k_aspect[] = {"keep", "stretch", "wide"}, *const k_aspect_name[] = {"16:9 with black bars", "Fill the window (stretched)", "Wide: rendered in the window's shape [restart]"};
 static const int k_sizes[][2] = {{1280, 720}, {1600, 900}, {1920, 1080}, {2560, 1440}, {3840, 2160}};
 static const char *const k_size_name[] = {"1280 x 720", "1600 x 900", "1920 x 1080", "2560 x 1440", "3840 x 2160"};
 #define N(a) ((int)(sizeof(a) / sizeof((a)[0])))
@@ -386,7 +386,7 @@ static void settings_init(int cw, int ch) {
     S.size = -1; for (int i = 0; i < N(k_sizes); i++) if (k_sizes[i][0] == o->width && k_sizes[i][1] == o->height) S.size = i;
     S.kb_player = nnpad_kb_player_cfg();
     S.stats = gfx_stats_overlay();
-    S.aspect = display_aspect_stretch();
+    S.aspect = display_aspect();
     S0 = S;
     (void)cw; (void)ch;
 }
@@ -598,7 +598,8 @@ static void sec_display(int cw, int ch) {
     ImGui::TextDisabled("now %d x %d (the windowed size is kept for later when borderless)", cw, ch);
     if (combo("Picture shape", &S.aspect, k_aspect_name, N(k_aspect_name))) { display_set_aspect(S.aspect); ini("aspect", k_aspect[S.aspect]); }
     tag(0, 0);
-    help("16:9 with bars: the game's own shape, black bars when the window or screen is wider or taller. Fill: the picture is stretched to the window or screen (21:9, 16:10) and nothing is cut off.");
+    help("16:9 with bars: the game's own shape, black bars when the window or screen is wider or taller. Fill: the picture is stretched to the window or screen (21:9, 16:10) and nothing is cut off. "
+         "Wide (Vulkan, at the next start): the game renders in the window's shape at its start, the camera sees more at the sides and nothing is stretched; the interface stays 16:9 in the middle. Changing to or from it takes a restart.");
     ImGui::Separator();
     if (combo("Vsync / pacing", &S.vsync, k_vsync, N(k_vsync))) ini("vsync", k_vsync[S.vsync]);
     tag(1, S.vsync != S0.vsync);

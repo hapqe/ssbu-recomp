@@ -134,10 +134,13 @@ static const char *const k_default_ini =
 ";   display of the Vulkan renderer: frames per second, mean and longest frame time, top left). SSBU_FPS=1 / 0 wins.\r\n"
 "frame_time_overlay = off\r\n"
 "\r\n"
-"; aspect = keep | stretch\r\n"
+"; aspect = keep | stretch | wide\r\n"
 ";   keep: the game's 16:9 picture keeps its shape, with black bars when the window or screen has another shape.\r\n"
 ";   stretch: the picture fills the whole window or screen (a phone's 20:9, a 21:9 monitor): nothing is cut off, but\r\n"
-";   it is widened (or heightened) to that shape. SSBU_ASPECT=keep / stretch wins.\r\n"
+";   it is widened (or heightened) to that shape.\r\n"
+";   wide (Vulkan): the game renders in the window's or screen's shape at its start (2400x1080 on a 20:9 phone):\r\n"
+";   the camera sees more beside (or above) the 16:9 view, nothing is stretched; the interface stays 16:9 in the\r\n"
+";   middle. Shaders are translated again for it once. SSBU_ASPECT=keep / stretch / wide wins.\r\n"
 "aspect = keep\r\n"
 "\r\n"
 "; menu = on | off (default on)\r\n"
@@ -223,7 +226,7 @@ static BOOL CALLBACK opt_load(PINIT_ONCE once, PVOID arg, PVOID *ctx) {
         else if (!_stricmp(key, "console_mode")) o->handheld = !_stricmp(val, "handheld");
         else if (!_stricmp(key, "resolution_scale")) { float v = (float)atof(val); if (v > 0) o->scale = v; }
         else if (!_stricmp(key, "anisotropic_filtering")) { int v = atoi(val); o->aniso = v == 2 || v == 4 || v == 8 || v == 16 ? v : 0; }
-        else if (!_stricmp(key, "aspect")) o->aspect = !_stricmp(val, "stretch") || !_stricmp(val, "fill") || !strcmp(val, "1");
+        else if (!_stricmp(key, "aspect")) o->aspect = !_stricmp(val, "wide") ? 2 : !_stricmp(val, "stretch") || !_stricmp(val, "fill") || !strcmp(val, "1");
         else if (!_stricmp(key, "frame_time_overlay")) o->overlay = !_stricmp(val, "on") || !strcmp(val, "1");
         else if (!_stricmp(key, "profile")) o->profile = !_stricmp(val, "low");
         else if (!_stricmp(key, "shader_wait")) o->shader_skip = !_stricmp(val, "skip");

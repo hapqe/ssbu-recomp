@@ -201,7 +201,7 @@ static const char *attr_in(Mx *e, unsigned a, int vertex_reg_ok) {
         return S(e, "U(in_attr%u[%u])", n, c);
     }
     if (st == MX_FRAGMENT) {
-        if (a >= 0x70 && a < 0x80 && c < 2 && e->in->screen_scale && e->in->target == 1) { e->uses_fcs = 1; return S(e, "U(gl_FragCoord[%u] * mx_fcs)", c); }      /* track O: the game's pixel position */
+        if (a >= 0x70 && a < 0x80 && c < 2 && e->in->screen_scale && e->in->target == 1) { e->uses_fcs = 1; return S(e, e->in->screen_wide ? "U(gl_FragCoord[%u] * mx_fcs2[%u])" : "U(gl_FragCoord[%u] * mx_fcs)", c, c); }      /* track O: the game's pixel position */
         if (a >= 0x70 && a < 0x80) return S(e, "U(gl_FragCoord[%u])", c);
         if (a == 0x3fc) return "(gl_FrontFacing ? 0xffffffffu : 0u)";
         if ((a == 0x2e0 || a == 0x2e4) && e->in->target == 1 && c == 1) return "U(1.0 - gl_PointCoord[1])";      /* Vulkan: t runs the other way (flipped viewport) */
@@ -1552,6 +1552,9 @@ int mx_translate(const MxIn *in, MxOut *out) {
                  "#extension GL_ARB_shader_ballot : enable\n#extension GL_ARB_shader_group_vote : enable\n#extension GL_EXT_texture_shadow_lod : enable\n");
         if (e->uses_layer_out || e->uses_vp_out) emit(&h, "#extension GL_ARB_shader_viewport_layer_array : require\n");
         emit(&h, "%s", k_prelude);
+        if (vk && in->screen_wide && (in->stage == MX_VERTEX || (in->stage == MX_FRAGMENT && in->screen_scale && e->uses_fcs)))      /* aspect = wide */
+            emit(&h, "layout(push_constant) uniform MXPC { uvec2 mx_alpha; float mx_point_size; float mx_fcs; vec2 mx_fcs2; vec2 mx_wide; };\n");
+        else
         if (vk && in->stage == MX_FRAGMENT && in->screen_scale && e->uses_fcs) emit(&h, "layout(push_constant) uniform MXPC { uvec2 mx_alpha; float mx_point_size; float mx_fcs; };\n");      /* track O */
         else
         if (vk && (in->stage == MX_VERTEX || (in->stage == MX_FRAGMENT && e->uses_alpha))) emit(&h, "layout(push_constant) uniform MXPC { uvec2 mx_alpha; float mx_point_size; };\n");
@@ -1639,7 +1642,10 @@ int mx_translate(const MxIn *in, MxOut *out) {
         for (unsigned p = 0; p < 7; p++) if (e->preds[p]) { emit(&h, "%s p%u = false", any ? "," : " bool", p); any = 1; }
         if (any) emit(&h, ";\n");
         if (e->any_jump) emit(&h, " uint pc = 1u;\n for (;;) { switch (pc) {\n");
-        const char *vertex_entry = vk && in->stage == MX_VERTEX ? "\nvoid main() { mx_vertex_main(); gl_Position = mx_position; }\n" : "";
+        const char *vertex_entry = vk && in->stage == MX_VERTEX ? in->screen_wide
+            ? "\nvoid main() { mx_vertex_main(); vec4 p = mx_position; bool o = abs(p.w - 1.0) < 1e-5;\n"      /* aspect = wide (MxIn.screen_wide) */
+              " if (!(o && abs(p.x) >= 0.999)) p.x *= mx_wide.x; if (!(o && abs(p.y) >= 0.999)) p.y *= mx_wide.y; gl_Position = p; }\n"
+            : "\nvoid main() { mx_vertex_main(); gl_Position = mx_position; }\n" : "";
         size_t need = h.len + e->len + strlen(e->exitcode) + strlen(vertex_entry) + 256;
         res = malloc(need);
         memcpy(res, h.s, h.len);

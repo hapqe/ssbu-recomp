@@ -712,7 +712,20 @@ static float rs_scale(void) {
     }
     return g_rs;
 }
-#define RS_ON (rs_scale() != 1.0f)
+/* aspect = wide (2026-10-23; display.c display_aspect() == 2, Vulkan): the screen-class targets get g_wide_x (g_wide_y) times
+ * the width (height) of the scaled size, the window's shape at the start (vkd_init, wide_init: a 20:9 phone 2400x1080, a
+ * 16:10 tablet 1920x1200); the vertex stages are translated with MxIn.screen_wide and widen the projection on such a pass
+ * (push constant mx_wide = 1 / g_wide_x, 1 / g_wide_y), the fragment stages read the pixel position per axis (mx_fcs2). The
+ * rest is the resolution-scale path, which already keeps an x and a y ratio per image (VTex.sx, sy). */
+static float g_wide_x = 1.0f, g_wide_y = 1.0f;
+static int g_wide_on;
+#define WIDE_ON g_wide_on
+#define RS_ON (rs_scale() != 1.0f || WIDE_ON)
+/* the shape the picture is placed with (display_fit): 16:9, or the wide targets' */
+static void pic_shape(int *w, int *h) {
+    if (!g_wide_on) { *w = 16; *h = 9; return; }
+    *w = (int)(1920.0f * g_wide_x + 0.5f); *h = (int)(1080.0f * g_wide_y + 0.5f);
+}
 static int rs_screen_class(int w, int h) { for (int k = 0; k < 7; k++) if (w == 1920 >> k && h == 1080 >> k) return 1; return 0; }
 /* A coordinate of the game's grid on a scaled image (nearest image texel edge, inside 0..max). */
 static int rs_edge(int v, float s, int max) { int r = (int)floorf((float)v * s + 0.5f); return r < 0 ? 0 : r > max ? max : r; }
@@ -951,7 +964,7 @@ static VTex *vt_get2(Tex *t, int sync) {
         if (RS_ON && (b->target == 1 || b->target == 5) && vt->layers == 1 && !vt->decode && rs_screen_class(vt->w, vt->h) && !(rs_ui_native() && wintex_is(t)) &&
             (vt->aspect != VK_IMAGE_ASPECT_COLOR_BIT || (f.kind != 4 && fmt_supported(vt->fmt, VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT)))) {      /* track O: a screen-class target */
             int gw = vt->w, gh = vt->h, lv = 1;
-            vt->w = (int)((float)gw * rs_scale() + 0.5f); vt->h = (int)((float)gh * rs_scale() + 0.5f);
+            vt->w = (int)((float)gw * rs_scale() * g_wide_x + 0.5f); vt->h = (int)((float)gh * rs_scale() * g_wide_y + 0.5f);      /* aspect = wide: g_wide_x, g_wide_y (1.0 otherwise) */
             if (vt->w < 1) vt->w = 1; if (vt->h < 1) vt->h = 1;
             vt->rs = 1; vt->sx = (float)vt->w / (float)gw; vt->sy = (float)vt->h / (float)gh;
             while ((vt->w >> lv) || (vt->h >> lv)) lv++;
@@ -2953,6 +2966,12 @@ static int draw_prepare(unsigned prim) {
             float fcs = R.pass_rs ? 1.0f / R.pass_sx : 1.0f, ps = R.pass_rs ? R.point_size * R.pass_sx : R.point_size;
             memcpy(&pc[3], &fcs, 4); memcpy(&pc[2], &ps, 4);
         }
+        if (WIDE_ON) {                               /* aspect = wide: mx_fcs2 (per axis) and mx_wide (the projection widened on a wide pass) */
+            float wd[4] = {R.pass_rs ? 1.0f / R.pass_sx : 1.0f, R.pass_rs ? 1.0f / R.pass_sy : 1.0f, R.pass_rs ? 1.0f / g_wide_x : 1.0f, R.pass_rs ? 1.0f / g_wide_y : 1.0f};
+            uint32_t pc8[8];
+            memcpy(pc8, pc, 16); memcpy(&pc8[4], wd, 16);
+            vkCmdPushConstants(R.cmd, p->layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 32, pc8);
+        } else
         vkCmdPushConstants(R.cmd, p->layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 16, pc);
     }
     return 1;
@@ -3761,7 +3780,7 @@ static void osk_draw(uint32_t index) {
     } else if (fresh) return;                      /* nothing to show yet */
     void display_fit(int sw, int sh, int dw, int dh, int out[4]);
     int d4[4];
-    display_fit(16, 9, (int)V.extent.width, (int)V.extent.height, d4);
+    { int pw, ph; pic_shape(&pw, &ph); display_fit(pw, ph, (int)V.extent.width, (int)V.extent.height, d4); }
     VkImageBlit b;
     memset(&b, 0, sizeof b);
     b.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT; b.srcSubresource.layerCount = 1; b.dstSubresource = b.srcSubresource;
@@ -4119,7 +4138,7 @@ swap: ;
             /* PR #24 (v1Ta44): the picture keeps its shape (display.c display_fit): black bars when the window is not 16:9 */
             void display_fit(int sw, int sh, int dw, int dh, int out[4]);
             int d4[4];
-            display_fit(16, 9, (int)V.extent.width, (int)V.extent.height, d4);
+            { int pw, ph; pic_shape(&pw, &ph); display_fit(pw, ph, (int)V.extent.width, (int)V.extent.height, d4); }
             if (vt->rs && vt->sx > 1.0f) rs_reduce(&src, s4, d4[2], d4[3]);      /* PR #8 (stephenjayakar): track O, supersampling: halved in 2:1 steps to at most twice the picture */
             memset(&b, 0, sizeof b);
             b.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT; b.srcSubresource.layerCount = 1; b.dstSubresource = b.srcSubresource;
@@ -4445,7 +4464,24 @@ static void pcache_save(void) {
 }
 #endif
 #include "nvn_vk_wd.c"                             /* session 12: the freeze watchdog (wd_start / wd_stop) */
+/* aspect = wide: the shape of the picture, from the window's (the swapchain's) at the start. Before anything is translated
+ * (the prewarm below): the stages' hashes depend on it. A window without area yet, or the OpenGL renderer: 16:9 as before. */
+int display_aspect(void);                          /* display.c: 0 keep, 1 stretch, 2 wide */
+static void wide_init(void) {
+    if (display_aspect() != 2) return;
+    int w = (int)V.extent.width, h = (int)V.extent.height;
+    if (w <= 0 || h <= 0) { printf("nvn_vk: aspect = wide: the window has no area at the start: the game's 16:9 (black bars)\n"); fflush(stdout); return; }
+    double a = (double)w / (double)h, a0 = 16.0 / 9.0;
+    if (a > a0 * 1.005) g_wide_x = (float)(a / a0 > 2.4 ? 2.4 : a / a0);       /* at most 2.4 x 16:9 (above 32:9) */
+    else if (a < a0 / 1.005) g_wide_y = (float)(a0 / a > 2.4 ? 2.4 : a0 / a);
+    g_wide_on = g_wide_x != 1.0f || g_wide_y != 1.0f;
+    if (g_wide_on) printf("nvn_vk: aspect = wide: the window is %dx%d: screen-class targets are made %.4f x wider, %.4f x taller (1920x1080 -> %dx%d at scale 1.0); the projection is widened in the vertex stages, which are another translation\n",
+                          w, h, (double)g_wide_x, (double)g_wide_y, (int)(1920.0f * g_wide_x + 0.5f), (int)(1080.0f * g_wide_y + 0.5f));
+    else printf("nvn_vk: aspect = wide: the window is %dx%d, already 16:9: nothing to widen\n", w, h);
+    fflush(stdout);
+}
 static void vkd_init(void) {
+    wide_init();
 #define X(n) n = (PFN_##n)vkGetDeviceProcAddr(V.device, #n); if (!n) vkd_fail("the device has no " #n);
     VKD(X)
 #undef X

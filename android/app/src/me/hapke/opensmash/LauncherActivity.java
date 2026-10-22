@@ -134,9 +134,9 @@ public class LauncherActivity extends Activity {
         col.addView(label("Render resolution (lower = faster)"));
         resolution = spinner(RES_NAMES, p.getInt("resolution", 0));
         col.addView(resolution);
-        /* the game's picture is 16:9; aspect = keep | stretch of graphics.ini (SSBU_ASPECT, display.c display_fit) */
+        /* the game's picture is 16:9; aspect = keep | stretch | wide of graphics.ini (SSBU_ASPECT, display.c display_fit; wide: nvn_vk_draw.c wide_init) */
         col.addView(label("Picture shape"));
-        aspect = spinner(new String[] {"From graphics.ini", "16:9 with black bars (the game's own shape)", "Fill the screen (" + screenShape() + ", stretched)"}, p.getInt("aspect", 0));
+        aspect = spinner(new String[] {"From graphics.ini", "16:9 with black bars (the game's own shape)", "Fill the screen (" + screenShape() + ", stretched)", "Wide: rendered in the screen's shape (" + screenShape() + ", more seen at the sides)"}, p.getInt("aspect", 0));
         col.addView(aspect);
         fps = new CheckBox(this);
         fps.setText("Show the frame rate (frames per second and frame time, top left)");
@@ -463,7 +463,7 @@ public class LauncherActivity extends Activity {
         String scale = RES_SCALE[resolution.getSelectedItemPosition()];
         if (scale != null) env.add("SSBU_VK_SCALE=" + scale);                       /* before the extra settings: one of them can override it */
         int as = aspect.getSelectedItemPosition();
-        if (as > 0) env.add("SSBU_ASPECT=" + (as == 2 ? "stretch" : "keep"));
+        if (as > 0) env.add("SSBU_ASPECT=" + (as == 3 ? "wide" : as == 2 ? "stretch" : "keep"));
         if (fps.isChecked()) env.add("SSBU_FPS=1");
         for (String l : extraEnv.getText().toString().split("\n")) { l = l.trim(); if (l.contains("=") && !l.startsWith("#")) env.add(l); }
         env.add("SSBU_LOCALE=" + Locale.getDefault().toLanguageTag());

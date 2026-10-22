@@ -325,22 +325,27 @@ int oe_exit_request(void);                            /* nnmisc.c */
  * borderless window over the whole monitor it is on. */
 #define ASPECT_W 16
 #define ASPECT_H 9
-/* 2026-10-22: aspect = stretch (graphics.ini; SSBU_ASPECT=keep|stretch wins): the picture fills the window or the device's
- * screen whatever its shape, no bars (a phone's 20:9 is filled by the 16:9 picture widened by 25 %). */
-static volatile int g_aspect = -1;
-int display_aspect_stretch(void);
-void display_set_aspect(int stretch) { display_aspect_stretch(); g_aspect = stretch != 0; }      /* the settings menu (menu.cpp): live */
-int display_aspect_stretch(void) {
+/* 2026-10-22: aspect = stretch (graphics.ini; SSBU_ASPECT=keep|stretch|wide wins): the picture fills the window or the device's
+ * screen whatever its shape, no bars (a phone's 20:9 is filled by the 16:9 picture widened by 25 %).
+ * aspect = wide (2026-10-23): the game's screen-sized targets are MADE in the screen's shape (2400x1080 on a 20:9 phone) and
+ * its projection is widened in the vertex stages (nvn_vk_draw.c wide_init, mx_translate.c screen_wide): more of the scene is
+ * seen beside the 16:9 one, nothing is stretched. Vulkan only, decided once at the start (the window's shape then). */
+static volatile int g_aspect = -1;                     /* 0 keep, 1 stretch, 2 wide */
+static int aspect_parse(const char *v) { return !_stricmp(v, "wide") || !_stricmp(v, "2") ? 2 : !_stricmp(v, "stretch") || !_stricmp(v, "fill") || !strcmp(v, "1") ? 1 : 0; }
+int display_aspect(void) {
     int v = g_aspect;
     if (v < 0) {
         const char *e = getenv("SSBU_ASPECT");
-        v = e && e[0] ? (!_stricmp(e, "stretch") || !_stricmp(e, "fill") || !strcmp(e, "1")) : gfx_options()->aspect;
-        printf("display: aspect %s (%s)\n", v ? "stretch: the picture fills the window or screen" : "keep: the 16:9 picture, black bars beside or above it", e && e[0] ? "SSBU_ASPECT" : "graphics.ini aspect");
+        v = e && e[0] ? aspect_parse(e) : gfx_options()->aspect;
+        printf("display: aspect %s (%s)\n", v == 2 ? "wide: the game renders in the window's or screen's shape (Vulkan)" : v ? "stretch: the picture fills the window or screen" : "keep: the 16:9 picture, black bars beside or above it", e && e[0] ? "SSBU_ASPECT" : "graphics.ini aspect");
         fflush(stdout);
         g_aspect = v;
     }
     return v;
 }
+int display_aspect_stretch(void) { return display_aspect() == 1; }
+/* the settings menu (menu.cpp): keep <-> stretch live; wide is not changed while running (the targets exist already), the menu writes it for the next start */
+void display_set_aspect(int mode) { if (display_aspect() != 2 && mode != 2) g_aspect = mode != 0; }
 void display_fit(int sw, int sh, int dw, int dh, int out[4]) {      /* the largest rectangle of sw:sh in dw x dh, centred: x, y, w, h */
     out[0] = 0; out[1] = 0; out[2] = dw; out[3] = dh;
     if (sw <= 0 || sh <= 0 || dw <= 0 || dh <= 0) return;
@@ -475,7 +480,7 @@ static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM w, LPARAM l) {
         if (!g_frames) { RECT rc; GetClientRect(h, &rc); FillRect((HDC)w, &rc, (HBRUSH)GetStockObject(BLACK_BRUSH)); }
         return 1;
     }
-    if (m == WM_SIZING && !g_full && !display_aspect_stretch()) { sizing_keep_aspect(h, w, (RECT *)l); return TRUE; }
+    if (m == WM_SIZING && !g_full && !display_aspect()) { sizing_keep_aspect(h, w, (RECT *)l); return TRUE; }
     if (m == WM_KEYDOWN && w == VK_F11 && !(l & (1 << 30))) { toggle_fullscreen(h); return 0; }      /* bit 30: auto-repeat of a held key */
     if (m == WM_APP + 0x51) { window_mode_set(h, (int)w); return 0; }                                 /* U1: the settings menu (menu.cpp) */
     if (m == WM_APP + 0x52) { window_size_set(h, (int)w, (int)l); return 0; }

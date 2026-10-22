@@ -66,6 +66,13 @@ typedef struct {
      * per real pixel of the pass, 1.0 on a target that is not scaled), and the coordinates of a texelFetch from a 2D sampler
      * are mapped from the game's texel grid (the size table in c2) to the image's real one (textureSize). */
     int screen_scale;
+    /* aspect = wide (2026-10-23, display.c): the screen-class targets are wider (or taller) than the game's 16:9. 1 (target 1):
+     * MXPC grows to { uvec2 mx_alpha; float mx_point_size; float mx_fcs; vec2 mx_fcs2; vec2 mx_wide; } (32 bytes). Fragment
+     * stage: gl_FragCoord.xy * mx_fcs2 (game pixels per image pixel, per axis) instead of mx_fcs. Vertex stage: the position's
+     * x (y) is multiplied by mx_wide.x (.y), 16:9 / the picture's shape on a wide pass and 1.0 elsewhere: a perspective
+     * projection then sees more beside the game's view, the 2D interface keeps its shape in the middle; a vertex of an
+     * orthographic draw (w == 1) at or beyond the edge (|x| >= 1: full-screen passes, fades) is left where it is. */
+    int screen_wide;
 } MxIn;
 
 typedef struct {
