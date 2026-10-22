@@ -4271,8 +4271,10 @@ swap: ;
         int nl = 0, nlinked = 0;
         EnterCriticalSection(&g_sh_lock);
         for (int i = 0; i < 4096; i++) for (VStage *v = g_vstage[i]; v; v = v->next) { if (v->lib || v->lib2) { nl++; nlinked += v->linked; } }
+        int np = 0, nused = 0, nrec = 0;
+        for (int i = 0; i < 1024; i++) for (Pipe *p = g_pipes[i]; p; p = p->next) { np++; nused += p->used; nrec += p->recorded; }
         LeaveCriticalSection(&g_sh_lock);
-        printf("nvn_vk_mem: frame %lld: %d stages have a library, %d of them were linked into a pipeline\n", (long long)frame, nl, nlinked);
+        printf("nvn_vk_mem: frame %lld: %d stages have a library, %d of them were linked into a pipeline; %d pipelines (%d from the records of earlier runs), %d of them drawn with; recorded pipelines deferred %lld, queued since %lld (SSBU_VK_RECLAZY)\n", (long long)frame, nl, nlinked, np, nrec, nused, (long long)g_def_n, (long long)g_def_q);
     }
     if (frame % 600 == 0 && R.dispatches) {
         LARGE_INTEGER fq; QueryPerformanceFrequency(&fq);

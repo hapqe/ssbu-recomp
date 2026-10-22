@@ -422,7 +422,7 @@ static VStage *vstage_get(Prog *p, int s, const uint32_t *key, uint32_t fo) {
 
 /* ---------------------------------------------------------------- pipelines */
 typedef struct { uint32_t vs, fs, chanmask, sample_mask; int32_t cfmt[8], dfmt; uint8_t topo_class, ncolor, samples, poly, a2c, dclamp, logic, sshade, blend_on, pad[3]; uint8_t blend[8][8]; PKEY_VI } PKey;
-typedef struct Pipe { PKey k; VkPipeline p, p_fast; /* p_fast: the pipeline linked at once, after the optimised one took its place */ VkPipelineLayout layout; VkDescriptorSetLayout dl[2]; int nb[2], push0; VStage *vs, *fs; volatile LONG state; uint8_t recorded, predicted, used, libbed, lib_how; struct Pipe *next; } Pipe;      /* libbed: linked from libraries (layout and set layouts belong to the pair library); lib_how: 0 the pair library was there, 1 compiled by this build, 2 waited for */      /* state: 0 queued for a worker, 1 being made, 2 made */
+typedef struct Pipe { PKey k; VkPipeline p, p_fast; /* p_fast: the pipeline linked at once, after the optimised one took its place */ VkPipelineLayout layout; VkDescriptorSetLayout dl[2]; int nb[2], push0; VStage *vs, *fs; volatile LONG state; uint8_t recorded, predicted, used, libbed, lib_how, deferred; struct Pipe *next, *dnv, *dnf; } Pipe;      /* libbed: linked from libraries (layout and set layouts belong to the pair library); lib_how: 0 the pair library was there, 1 compiled by this build, 2 waited for */      /* state: 0 queued for a worker, 1 being made, 2 made */
 static Pipe *g_pipes[1024];
 static void pkey_targets(PKey *k);
 static int pkey_targets_of(PKey *k, int ncol, const TargetRef *col, const TargetRef *depth);
@@ -694,6 +694,18 @@ static int liblazy_on(void) {
 #endif
     }
     return on;
+}
+static int reclazy_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("SSBU_VK_RECLAZY");
+#ifdef SSBU_ANDROID
+        on = e ? atoi(e) != 0 : liblazy_on() >= 2;
+#else
+        on = e && atoi(e);
+#endif
+    }
+    return on && D.has_gpl && gpl_sep();
 }
 static VkPipeline stagelib_ensure(VStage *v, int alone, int *how) {
     VkPipeline *lib = alone ? &v->lib2 : &v->lib;
@@ -1049,6 +1061,51 @@ static void job_push_front(Job *j) {               /* g_sh_lock held: needed by 
     g_jq_queued++;
     WakeConditionVariable(&g_jq_cv);
 }
+/* 2026-10-22 (memory footprint), SSBU_VK_RECLAZY (default on Android with lazy libraries, off elsewhere): the pipelines of
+ * the records of earlier runs are no longer all linked at start (Marble: 3,875 of them, of which a fight drew with 185, each
+ * pinning its two stages' shaders in the driver for good). A recorded pipeline waits ("deferred") until the game shows
+ * both of its stages: a program it hands over, a stage of a container in its memory (the scan), a stage a skipped draw
+ * waits for. That happens while it loads, so the loading barrier still holds the loading screen for them; a draw that
+ * meets a deferred pipeline first makes it (hold mode) or queues it at the front (skip mode). Stages are known by their
+ * code hash (hb): a program's variant need not be the recorded one. */
+static int reclazy_on(void);
+#define MET_N 65536
+static uint64_t g_met[MET_N];                      /* code hashes (hb) of the stages the game has shown: open addressing, 0 = empty; g_sh_lock */
+static int g_nmet;
+static Pipe *g_dv[4096], *g_df[4096];              /* deferred pipelines by the hb of their vertex / fragment stage (p->dnv, p->dnf) */
+static LONG64 g_def_n, g_def_q;
+static int met_has(uint64_t hb) {
+    for (unsigned i = (unsigned)hb & (MET_N - 1);; i = (i + 1) & (MET_N - 1)) { if (g_met[i] == hb) return 1; if (!g_met[i]) return g_nmet >= MET_N * 3 / 4; }      /* a full table: everything counts as shown */
+}
+static int met_add(uint64_t hb) {                  /* 1: new */
+    if (g_nmet >= MET_N * 3 / 4) return 0;
+    unsigned i = (unsigned)hb & (MET_N - 1);
+    while (g_met[i]) { if (g_met[i] == hb) return 0; i = (i + 1) & (MET_N - 1); }
+    g_met[i] = hb; g_nmet++;
+    return 1;
+}
+static void def_queue(Pipe *p) {                   /* g_sh_lock held */
+    if (!p->deferred) return;
+    p->deferred = 0;
+    if (p->state != 0) return;
+    Job *j = calloc(1, sizeof *j);
+    j->kind = 1; j->pipe = p; job_push(j); g_def_q++;
+}
+static void stage_met(VStage *v) {                 /* g_sh_lock held: the game showed this stage's code */
+    if (!v || !reclazy_on()) return;
+    uint64_t hb = v->hb;
+    if (!hb || !met_add(hb)) return;
+    for (Pipe *p = g_dv[hb & 4095]; p; p = p->dnv) if (p->deferred && p->vs->hb == hb && (!p->fs || met_has(p->fs->hb))) def_queue(p);
+    for (Pipe *p = g_df[hb & 4095]; p; p = p->dnf) if (p->deferred && p->fs && p->fs->hb == hb && met_has(p->vs->hb)) def_queue(p);
+}
+static void stage_met_lock(VStage *v) { if (!v || !reclazy_on()) return; EnterCriticalSection(&g_sh_lock); stage_met(v); LeaveCriticalSection(&g_sh_lock); }
+static int def_add(Pipe *p) {                      /* g_sh_lock held, p just made with state 1 by a history worker: 1 = deferred (state 0) */
+    if (!reclazy_on() || (met_has(p->vs->hb) && (!p->fs || met_has(p->fs->hb)))) return 0;
+    p->state = 0; p->deferred = 1; g_def_n++;
+    p->dnv = g_dv[p->vs->hb & 4095]; g_dv[p->vs->hb & 4095] = p;
+    if (p->fs) { p->dnf = g_df[p->fs->hb & 4095]; g_df[p->fs->hb & 4095] = p; }
+    return 1;
+}
 static void job_copy_src(Job *j, uint8_t **d, int i, const SSrc *s) {
     j->has[i] = 1; j->src[i] = *s;
     memcpy(*d, s->code, (size_t)s->code_len); j->src[i].code = *d; *d += (s->code_len + 7) & ~7;
@@ -1081,13 +1138,14 @@ static Pipe *pipe_get(const PKey *k, VStage *vs, VStage *fs) {
         int libs_ready = D.has_gpl && gpl_sep() && !k->sshade && (fs ? vs->lib_state == 2 && fs->lib_state == 2 : vs->lib2_state == 2);
         if (!(libs_ready && (!p || p->state == 0))) {
             if (!p) { Job *j = calloc(1, sizeof *j); j->kind = 1; j->pipe = pipe_new(k, vs, fs, h, 0); job_push_front(j); }
+            else if (p->deferred && p->state == 0) { Job *j = calloc(1, sizeof *j); j->kind = 1; j->pipe = p; p->deferred = 0; job_push_front(j); g_def_q++; }
             LeaveCriticalSection(&g_sh_lock);
             skip_note(1, vs->hb, fs ? fs->hb : 0);
             return NULL;
         }
     }
     if (!p) { p = pipe_new(k, vs, fs, h, 1); mine = 1; }
-    else if (p->state == 0) { p->state = 1; mine = 1; was_queued = 1; }          /* queued, no worker has begun: made here rather than waited for behind the queue */
+    else if (p->state == 0) { p->state = 1; mine = 1; was_queued = !p->deferred; p->deferred = 0; }          /* queued (or deferred), no worker has begun: made here rather than waited for behind the queue */
     else if (p->state == 1) { waited = 1; t0 = tk(); while (p->state < 2) WD_SLEEP(&g_sh_cv, &g_sh_lock, INFINITE); }
     if (!p->used) {
         int idx, i = sig_note(k, &idx);
@@ -1392,6 +1450,7 @@ static void job_prog(Job *j) {
         if (how == 1) InterlockedIncrement64(&g_w_stages);
         if (!vs->ok) return;
     }
+    if (!j->prep) { EnterCriticalSection(&g_sh_lock); stage_met(vs); stage_met(fs); LeaveCriticalSection(&g_sh_lock); }      /* deferred recorded pipelines of this pair */
     if (j->cont) {                                 /* found by the container scan: the pair belongs to that container */
         EnterCriticalSection(&g_sh_lock);
         PairRec *pc = pair_get(vs, fs);
@@ -1590,7 +1649,7 @@ static DWORD WINAPI pw_main(void *arg) {           /* arg: the worker's number (
         if (vs && !r->compute && (!r->fs_h || fs)) {
             r->k.vs = vs->id; r->k.fs = fs ? fs->id : 0;
             uint64_t h = fnv(0xcbf29ce484222325ULL, &r->k, sizeof r->k);
-            if (!pipe_find(&r->k, h)) { p = pipe_new(&r->k, vs, fs, h, 1); p->recorded = 1; }
+            if (!pipe_find(&r->k, h)) { p = pipe_new(&r->k, vs, fs, h, 1); p->recorded = 1; if (def_add(p)) p = NULL; }
             int idx;
             sig_note(&r->k, &idx);
             PairRec *pr0 = pair_get(vs, fs);
@@ -1601,6 +1660,7 @@ static DWORD WINAPI pw_main(void *arg) {           /* arg: the worker's number (
         if (!vs || (r->fs_h && !fs)) { InterlockedIncrement64(&g_pw_failed); continue; }      /* a stage record or SPIR-V file is gone: made when the game hands the program over, as on a first run */
         if (r->compute) { vs->cp_recorded = 1; if (compute_pipe_ensure(vs) == 1) InterlockedIncrement64(&g_pw_pipes); continue; }
         if (p) { pipe_build(p); InterlockedIncrement64(&g_pw_pipes); }
+        else if (reclazy_on()) { stage_mod_release(vs); if (fs) stage_mod_release(fs); }      /* deferred (or made by another): the modules come back from their files at a link */
     }
     g_pw_profile = NULL;                           /* phase 2 is not measured */
     InterlockedExchange64(&g_pw_t1, tk());
@@ -1634,10 +1694,10 @@ static DWORD WINAPI pw_main(void *arg) {           /* arg: the worker's number (
         }
         if (j->kind == 0) { if (j->prep == 2) job_prep(j); else job_prog(j); }
         else if (j->kind == 2) job_draw(j);
-        else if (j->kind == 3) { int how; VStage *v = stage_ensure(&j->src[1], ssrc_hb(&j->src[1]), j->key1, 0, &how); if (how == 1) InterlockedIncrement64(&g_w_stages); if (v && v->ok && D.has_gpl && gpl_sep() && !g_offline && stage_fits_universal(v)) { int lh; if (!liblazy_on()) stagelib_ensure(v, 0, &lh); else stage_mod_release(v); } else if (j->cont == -7 && v && v->ok) gpl_fo_made(v); }
+        else if (j->kind == 3) { int how; VStage *v = stage_ensure(&j->src[1], ssrc_hb(&j->src[1]), j->key1, 0, &how); if (how == 1) InterlockedIncrement64(&g_w_stages); if (v && v->ok) stage_met_lock(v); if (v && v->ok && D.has_gpl && gpl_sep() && !g_offline && stage_fits_universal(v)) { int lh; if (!liblazy_on()) stagelib_ensure(v, 0, &lh); else stage_mod_release(v); } else if (j->cont == -7 && v && v->ok) gpl_fo_made(v); }
         else if (j->kind == 5) { int lh; pairlib_ensure(j->lvs, j->lfs, 1, 0, &lh); }
         else if (j->kind == 6) gpl_optimise(j->pipe);
-        else if (j->kind == 7) { int how, lh; VStage *v = stage_ensure(&j->src[1], ssrc_hb(&j->src[1]), j->key1, (uint32_t)j->sshade, &how); if (how == 1) InterlockedIncrement64(&g_w_stages); if (v && v->ok && D.has_gpl && gpl_sep() && stage_fits_universal(v)) stagelib_ensure(v, 0, &lh); }      /* the stage a skipped draw waits for */
+        else if (j->kind == 7) { int how, lh; VStage *v = stage_ensure(&j->src[1], ssrc_hb(&j->src[1]), j->key1, (uint32_t)j->sshade, &how); if (how == 1) InterlockedIncrement64(&g_w_stages); if (v && v->ok) stage_met_lock(v); if (v && v->ok && D.has_gpl && gpl_sep() && stage_fits_universal(v)) stagelib_ensure(v, 0, &lh); }      /* the stage a skipped draw waits for */
         else if (j->kind == 4) job_scan(j);
         else if (j->kind == 8) pix_announce(j->cont, 0);
         else if (p) { pipe_build(p); InterlockedIncrement64(&g_w_pipes); }
