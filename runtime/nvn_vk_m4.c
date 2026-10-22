@@ -30,6 +30,7 @@ typedef struct VStage {
     VSmp smp[64];
     VkShaderModule mod; struct VStage *next, *next_h;
     uint64_t spv; int mod_refs, mod_drop;          /* 2026-10-22 (lazy modules, stage_mod_get): spv = the hash of ..\cache\vk\spv\<spv>.spv; refs / drop under g_mod_lock */
+    uint8_t linked;                                /* 2026-10-22 (memory footprint, measurement): a pipeline was linked from its library */
     VkPipeline lib, lib2; volatile LONG lib_state, lib2_state;      /* session 9 (SSBU_VK_GPL=2): the stage's pipeline library; lib2: a vertex stage with the empty fragment shader state */
 } VStage;
 #define MX_VK_VERSION 6u                        /* part of every hash: change it when mx_translate's Vulkan text or these records change */
@@ -674,6 +675,26 @@ static void gpl_universal(void) {
 static int gpl_opt_on(void);
 static int stage_fits_universal(const VStage *v) { for (int i = 0; i < v->nsmp; i++) { unsigned b = v->smp[i].binding; if (b >= 240) b -= 240; if (b >= 80 || b % 40u >= 32) return 0; } return 1; }      /* texture units 0..31 only */
 /* Any thread, no lock held: the library of one stage (alone: a vertex stage that is drawn without a fragment stage). */
+/* 2026-10-22 (memory footprint), SSBU_VK_LIBLAZY: stage libraries only when a pipeline is linked from them, not ahead for
+ * every stage the look-ahead meets (2: neither for a program the game handed over nor for a stage of a scanned container;
+ * 1: only not for the scanned containers; 0: ahead for both, as before). The default is 2 on Android, 0 elsewhere. A library
+ * found in the driver's pipeline cache costs the driver its shader for good (Turnip's cache holds every shader it ever
+ * deserialised, with its GPU copy); on the Marble 6,300 of 10,400 libraries were never linked in a fight. Their modules
+ * are released at once (lazy modules) and made again from the file at a link. Measured (Big Battlefield, fixed seed):
+ * anon + swap 2.10 -> 1.99 GB, kgsl 832 -> 796 MB, fps and late frames unchanged, 62 modules made again; a random stage:
+ * no hold and no skipped draw in the fight. */
+static int liblazy_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("SSBU_VK_LIBLAZY");
+#ifdef SSBU_ANDROID
+        on = e ? atoi(e) : 2;
+#else
+        on = e ? atoi(e) : 0;
+#endif
+    }
+    return on;
+}
 static VkPipeline stagelib_ensure(VStage *v, int alone, int *how) {
     VkPipeline *lib = alone ? &v->lib2 : &v->lib;
     volatile LONG *state = alone ? &v->lib2_state : &v->lib_state;
@@ -796,6 +817,7 @@ static double pipe_build(Pipe *p) {
         libs[n++] = stagelib_ensure(vs, !fs, &how);
         if (fs) libs[n++] = stagelib_ensure(fs, 0, &how2);
         libs[n++] = gpl_olib(k);
+        vs->linked = 1; if (fs) fs->linked = 1;
         if (how2 == 1 || how == 1) how = 1; else if (how2 == 2 || how == 2) how = 2;
         LONG64 t1 = tk();
         VkPipelineLibraryCreateInfoKHR pli = {VK_STRUCTURE_TYPE_PIPELINE_LIBRARY_CREATE_INFO_KHR};
@@ -1377,7 +1399,7 @@ static void job_prog(Job *j) {
         cont_learn(pc);
         LeaveCriticalSection(&g_sh_lock);
     }
-    if (D.has_gpl && !g_offline && gpl_sep() && !(fs && j->sshade) && stage_fits_universal(vs) && (!fs || stage_fits_universal(fs))) { int lh; stagelib_ensure(vs, 0, &lh); if (fs) stagelib_ensure(fs, 0, &lh); else stagelib_ensure(vs, 1, &lh); }      /* SSBU_VK_GPL=2: a library per stage (a program without a fragment stage: both forms of its vertex stage) */
+    if (D.has_gpl && !g_offline && gpl_sep() && !(fs && j->sshade) && stage_fits_universal(vs) && (!fs || stage_fits_universal(fs))) { int lh; if (liblazy_on() >= 2) { stage_mod_release(vs); if (fs) stage_mod_release(fs); } else if (fs) { stagelib_ensure(vs, 0, &lh); stagelib_ensure(fs, 0, &lh); } else { stagelib_ensure(vs, 0, &lh); stagelib_ensure(vs, 1, &lh); } }      /* SSBU_VK_GPL=2: a library per stage (a program without a fragment stage: both forms of its vertex stage) */
     else
     if (D.has_gpl && !g_offline && !j->prep) { int lh; pairlib_ensure(vs, fs, 1, fs ? j->sshade : 0, &lh); }      /* session 9: the pair's shaders compiled now, without pass formats; a draw links */
     if (!g_predict || j->prep) return;
@@ -1612,7 +1634,7 @@ static DWORD WINAPI pw_main(void *arg) {           /* arg: the worker's number (
         }
         if (j->kind == 0) { if (j->prep == 2) job_prep(j); else job_prog(j); }
         else if (j->kind == 2) job_draw(j);
-        else if (j->kind == 3) { int how; VStage *v = stage_ensure(&j->src[1], ssrc_hb(&j->src[1]), j->key1, 0, &how); if (how == 1) InterlockedIncrement64(&g_w_stages); if (v && v->ok && D.has_gpl && gpl_sep() && !g_offline && stage_fits_universal(v)) { int lh; stagelib_ensure(v, 0, &lh); } else if (j->cont == -7 && v && v->ok) gpl_fo_made(v); }
+        else if (j->kind == 3) { int how; VStage *v = stage_ensure(&j->src[1], ssrc_hb(&j->src[1]), j->key1, 0, &how); if (how == 1) InterlockedIncrement64(&g_w_stages); if (v && v->ok && D.has_gpl && gpl_sep() && !g_offline && stage_fits_universal(v)) { int lh; if (!liblazy_on()) stagelib_ensure(v, 0, &lh); else stage_mod_release(v); } else if (j->cont == -7 && v && v->ok) gpl_fo_made(v); }
         else if (j->kind == 5) { int lh; pairlib_ensure(j->lvs, j->lfs, 1, 0, &lh); }
         else if (j->kind == 6) gpl_optimise(j->pipe);
         else if (j->kind == 7) { int how, lh; VStage *v = stage_ensure(&j->src[1], ssrc_hb(&j->src[1]), j->key1, (uint32_t)j->sshade, &how); if (how == 1) InterlockedIncrement64(&g_w_stages); if (v && v->ok && D.has_gpl && gpl_sep() && stage_fits_universal(v)) stagelib_ensure(v, 0, &lh); }      /* the stage a skipped draw waits for */

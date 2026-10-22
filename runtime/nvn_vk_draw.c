@@ -4268,6 +4268,11 @@ swap: ;
         LARGE_INTEGER fq; QueryPerformanceFrequency(&fq);
         printf("nvn_vk_lazymod: frame %lld: %lld shader modules released after their library / compute pipeline was made (%lld still held), %lld made again from their file for a later pipeline (%.0f ms in all, longest %.1f ms)\n",
                (long long)frame, (long long)g_mod_dropped, (long long)(R.modules - g_mod_dropped), (long long)g_mod_loads, (double)g_mod_load_tk * 1000.0 / (double)fq.QuadPart, (double)g_mod_load_max * 1000.0 / (double)fq.QuadPart);
+        int nl = 0, nlinked = 0;
+        EnterCriticalSection(&g_sh_lock);
+        for (int i = 0; i < 4096; i++) for (VStage *v = g_vstage[i]; v; v = v->next) { if (v->lib || v->lib2) { nl++; nlinked += v->linked; } }
+        LeaveCriticalSection(&g_sh_lock);
+        printf("nvn_vk_mem: frame %lld: %d stages have a library, %d of them were linked into a pipeline\n", (long long)frame, nl, nlinked);
     }
     if (frame % 600 == 0 && R.dispatches) {
         LARGE_INTEGER fq; QueryPerformanceFrequency(&fq);
