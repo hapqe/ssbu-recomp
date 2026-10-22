@@ -7,8 +7,10 @@
  * GPU's level also votes the memory bus: the audio thread used 290 ms of CPU per second against 210 at 580 MHz, the
  * game's thread 16-19 ms per frame against 9-10). An ADPF hint session did not move the GPU clock.
  *
- * SSBU_GPU_BOOST: 0 off, 1 (default) after a frame that missed its refresh, for 3 s after the last such frame (menus
- * that keep up at a low clock are left to the governor), 2 always. Not an Adreno with KGSL: off. */
+ * SSBU_GPU_BOOST: 0 off, 1 (default) after a frame that missed its refresh, for SSBU_GPU_BOOST_HOLD_MS (default 20000)
+ * after the last such frame (menus that keep up at a low clock are left to the governor), 2 always. Not an Adreno with
+ * KGSL: off. The hold was 3 s: in a fight the clock then fell back every few seconds, the next frames came late, and the
+ * boost began again (Big Battlefield, 2026-10-22: 55.8 fps with 3 s, 58.1 with the boost always on). */
 #include <errno.h>
 #include <fcntl.h>
 #include <stdint.h>
@@ -78,7 +80,7 @@ static int boost_init(void) {
     munmap(ib, 4096);
     g_ib_id = al.id; g_ib_addr = al.gpuaddr;
     printf("gpu_boost: KGSL power constraint ready (context %u): the GPU is held at its highest level %s\n", g_ctx,
-           mode >= 2 ? "always (SSBU_GPU_BOOST=2)" : "for 3 s after a frame that missed its refresh (SSBU_GPU_BOOST=2: always, 0: off)");
+           mode >= 2 ? "always (SSBU_GPU_BOOST=2)" : "for a while after a frame that missed its refresh (SSBU_GPU_BOOST_HOLD_MS; SSBU_GPU_BOOST=2: always, 0: off)");
     return mode;
 }
 
@@ -87,7 +89,9 @@ void android_gpu_boost_frame(int late) {
     if (g_mode < 0) g_mode = boost_init();
     if (!g_mode) return;
     int64_t now = now_ns();
-    if (late) g_until = now + 3000000000ll;
+    static int64_t hold = -1;
+    if (hold < 0) { const char *e = getenv("SSBU_GPU_BOOST_HOLD_MS"); hold = (e && atoi(e) > 0 ? atoi(e) : 20000) * 1000000ll; }
+    if (late) g_until = now + hold;
     g_frames++;
     if (g_mode < 2 && now >= g_until) return;
     struct kgsl_command_object co = {0, g_ib_addr, 4, KGSL_CMDLIST_IB, g_ib_id};
