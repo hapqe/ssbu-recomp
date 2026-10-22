@@ -997,6 +997,25 @@ static void l1_report(FILE *out) {
     }
 }
 
+/* SSBU_PACE_LATE: what a frame presented AFTER the tick it was due at does. 0: the game waits for the next tick (a frame of
+ * 17 ms becomes one of 33 ms, and the game then steps its logic twice). 1: the game goes on at once and the next frame
+ * starts late; when that one is on time it waits for its tick as usual, so a frame over budget borrows from the next one
+ * (as a third window texture would) and the logic still steps by the refreshes the game counts. Default 1 on Android:
+ * on the Marble the game's frame took ~14 ms in the median with a long tail over 16.7 ms, and every such frame cost a
+ * whole refresh pair (Big Battlefield ~47 fps). */
+static int late_go(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("SSBU_PACE_LATE");
+#ifdef SSBU_ANDROID
+        on = e ? atoi(e) != 0 : 1;
+#else
+        on = e ? atoi(e) != 0 : 0;
+#endif
+        printf("display: a late frame %s (SSBU_PACE_LATE=%d)%c", on ? "lets the game go on at once (the next frame starts late and waits for its tick again)" : "waits for the next tick", on, 10);
+    }
+    return on;
+}
 /* Session 14, game thread, BEFORE the present job goes to the render thread (Vulkan only; OpenGL keeps the path above):
  * the refresh that shows this frame, by the same rule as frame_queued, and whether the present is held for it. A frame
  * queued before the tick it is due at (on time) is held until that tick; a late one is presented at once. */
@@ -1008,6 +1027,7 @@ void display_present_plan(int vulkan) {
     int on_time = iv && now_n < prev + iv && prev + iv - now_n <= 6;
     if (!iv) at = now_n;
     else if (at < prev + iv) at = prev + iv;
+    else if (!on_time && late_go()) at = now_n;            /* late: the game goes on at once (see late_go) */
     g_latch = at;
     InterlockedExchange(&g_latch_pending, iv != 0);
     if (iv && !on_time) g_hold_late++;
