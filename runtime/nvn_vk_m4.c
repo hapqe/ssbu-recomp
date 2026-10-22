@@ -174,7 +174,10 @@ static VkShaderModule module_from_glsl(int stage, const char *glsl, const char *
  * pipeline) and then not again. Now a stage's module is destroyed once its library or compute pipeline is made, and made
  * again from ..\cache\vk\spv\<spv>.spv for every later pipeline that needs it (stage_mod_get / stage_mod_put; the
  * driver's pipeline cache keys on the SPIR-V, so the same pipeline is found). A module is dropped only when its file is
- * there; one that is in use is dropped when its last user puts it back (g_mod_lock). */
+ * there; one that is in use is dropped when its last user puts it back (g_mod_lock).
+ * Measured on the Marble (Big Battlefield, fixed seed): game anon + swap in the fight 2.92 GB -> 2.10 GB (swap used 2.15 GB
+ * -> 34 MB), 10,413 of 10,429 modules released, 2,348 made again (1.7 s of worker time, all while loading, longest 4 ms),
+ * fight 57.3 / 59.0 fps against 59.0 / 59.0. */
 static CRITICAL_SECTION g_mod_lock;
 static LONG64 g_mod_dropped, g_mod_loads, g_mod_load_tk, g_mod_load_max, g_mod_lost;
 static int lazymod_on(void) {
