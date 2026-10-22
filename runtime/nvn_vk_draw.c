@@ -26,7 +26,7 @@ static int have_targets_live(void);
     X(vkCmdSetBlendConstants) X(vkCmdSetStencilCompareMask) X(vkCmdSetStencilWriteMask) X(vkCmdSetStencilReference) X(vkCmdSetLineWidth) X(vkCmdSetCullMode) X(vkCmdSetFrontFace) \
     X(vkCmdSetPrimitiveTopology) X(vkCmdSetDepthTestEnable) X(vkCmdSetDepthWriteEnable) X(vkCmdSetDepthCompareOp) X(vkCmdSetStencilTestEnable) X(vkCmdSetStencilOp) \
     X(vkCmdSetDepthBiasEnable) X(vkCmdSetPrimitiveRestartEnable) X(vkCmdSetRasterizerDiscardEnable) X(vkCmdBindVertexBuffers) X(vkCmdBindIndexBuffer) X(vkCmdDraw) X(vkCmdDrawIndexed) \
-    X(vkCmdClearAttachments) X(vkCmdCopyBufferToImage) X(vkCmdCopyImageToBuffer) X(vkCmdBlitImage) X(vkCmdResolveImage) X(vkCmdClearDepthStencilImage) X(vkGetFenceStatus) \
+    X(vkCmdClearAttachments) X(vkCmdCopyBufferToImage) X(vkCmdCopyImageToBuffer) X(vkCmdBlitImage) X(vkCmdResolveImage) X(vkCmdClearDepthStencilImage) X(vkGetFenceStatus) X(vkCreateEvent) X(vkResetEvent) X(vkGetEventStatus) X(vkCmdSetEvent) \
     X(vkCreateComputePipelines) X(vkCmdDispatch) X(vkCreateQueryPool) X(vkDestroyQueryPool) X(vkCmdResetQueryPool) X(vkCmdWriteTimestamp) X(vkGetQueryPoolResults) X(vkCreatePipelineCache) X(vkGetPipelineCacheData) X(vkDestroyPipelineCache) X(vkCmdCopyBuffer)
 #define X(n) static PFN_##n n;
 VKD(X)
@@ -391,12 +391,29 @@ static void slot_wait(Slot *s) {
 static void garbage_collect(void);
 static uint32_t g_tset_gen = 1;                   /* texture descriptor sets live as long as the command buffer whose pools they come from */
 static int g_tset_used, g_tset_list_used;
+/* Whether a submitted slot has finished, WITHOUT a system call: vkGetFenceStatus on Turnip / KGSL (the Marble, driver
+ * Mesa 26.0-devel) never answered "not ready" but waited until the GPU had finished (measured: 1,180 calls, 0 not ready,
+ * 5.8 ms each), so every poll of the render thread stood it still for the GPU. Each command buffer now ends with
+ * vkCmdSetEvent on an event of its slot (reset from the host when the slot is taken again), and the poll reads the event
+ * (Turnip: a word in memory). SSBU_VK_EVENTPOLL=0: the fence status as before. */
+static VkEvent g_slot_ev[NSLOT];
+static int g_evpoll = -1;
+static int evpoll_on(void) { if (g_evpoll < 0) { const char *e = getenv("SSBU_VK_EVENTPOLL"); g_evpoll = e ? atoi(e) != 0 : 1; printf("nvn_vk: finished command buffers are told by %s (SSBU_VK_EVENTPOLL)\n", g_evpoll ? "an event each one sets at its end" : "the fence status"); } return g_evpoll; }
+static int slot_done(Slot *s) {
+    int i = (int)(s - R.slot);
+    if (evpoll_on() && g_slot_ev[i]) return vkGetEventStatus(V.device, g_slot_ev[i]) == VK_EVENT_SET;
+    return vkGetFenceStatus(V.device, s->fence) == VK_SUCCESS;
+}
 static void cmd_begin(void) {
     if (R.recording) return;
     g_tset_gen++; g_tset_used = 0; g_tset_list_used = 0;
     R.cur = (R.cur + 1) % NSLOT;
     Slot *s = &R.slot[R.cur];
     slot_wait(s);
+    if (evpoll_on()) {
+        if (!g_slot_ev[R.cur]) { VkEventCreateInfo ei = {VK_STRUCTURE_TYPE_EVENT_CREATE_INFO}; if (vkCreateEvent(V.device, &ei, NULL, &g_slot_ev[R.cur]) != VK_SUCCESS) g_slot_ev[R.cur] = NULL; }
+        if (g_slot_ev[R.cur]) vkResetEvent(V.device, g_slot_ev[R.cur]);
+    }
     for (int i = 0; i < s->npool; i++) VKC(vkResetDescriptorPool(V.device, s->pool[i], 0));
     s->ipool = 0;
     VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
@@ -440,6 +457,7 @@ static uint64_t cmd_submit(VkSemaphore wait, VkSemaphore signal) {
     if (g_pt_on > 0 && g_pt_slot[R.cur].n) g_pt_draws[g_pt_slot[R.cur].kind[g_pt_slot[R.cur].n - 1]] += g_cmd_draws - g_pt_slot[R.cur].d0;
     if (g_tl_t0) { LONG64 now = tk(); if (!g_tl_first) g_tl_first = now; g_tl_last = now; }
     CKPT_OP("end of the command buffer (submission)", 0, (int)(R.serial + 1), 0, 0);
+    if (g_evpoll > 0 && g_slot_ev[R.cur]) vkCmdSetEvent(s->cmd, g_slot_ev[R.cur], VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);      /* slot_done */
     VKC(vkEndCommandBuffer(s->cmd));
     VkFlags stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
     VkSubmitInfo sb = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
@@ -2040,7 +2058,7 @@ static void cb_land_force(CB *c, int cause) {      /* the bytes are needed in gu
 static void cb_landing_poll(void) {                /* at the start of a batch: landings whose copy has finished; never waits */
     int open = 0;
     for (int i = 0; i < 256; i++) if (g_cb[i].state == 4 && R.done < g_cb[i].lserial) open = 1;
-    if (open) for (int i = 0; i < NSLOT; i++) if (R.slot[i].pending && vkGetFenceStatus(V.device, R.slot[i].fence) == VK_SUCCESS) slot_wait(&R.slot[i]);
+    if (open) for (int i = 0; i < NSLOT; i++) if (R.slot[i].pending && slot_done(&R.slot[i])) slot_wait(&R.slot[i]);
     for (int i = 0; i < 256; i++) if (g_cb[i].state == 4 && R.done >= g_cb[i].lserial) cb_land_finish(&g_cb[i]);
 }
 /* The kept and landing buffers as they are at the START of the batch (cb_kept_index, from vk_submit): during a batch the
@@ -2106,9 +2124,32 @@ static void cb_kept_age(void) {                    /* at the start of a batch */
         else cb_kept_land(c, 0);
     }
 }
-static void cb_poll(void) {                        /* pending CBs whose submission has finished are copied back; never waits */
+static LONG64 g_idle_tk[4], g_idle_n, g_fst_n[2];      /* SSBU_SYNCSTAT: cb_poll, take_dead, fence status calls, slot waits after them */
+/* Pending CBs whose submission has finished are copied back; never waits. Runs before every job of the render thread
+ * (vk_idle). It asked every pending slot's fence each time, which on Turnip / KGSL waited for the GPU (see slot_done):
+ * on the Marble in a fight 11.5 ms of the render thread's time per frame, the slowest thread of the frame. Now only the
+ * oldest pending slots are asked (one queue: they finish in the order they were submitted, so the first one not finished
+ * ends the look), through slot_done. */
+static void cb_poll(void) {
     if (!g_cb_pending) return;
-    if (R.done < g_cb_serial) for (int i = 0; i < NSLOT; i++) if (R.slot[i].pending && vkGetFenceStatus(V.device, R.slot[i].fence) == VK_SUCCESS) slot_wait(&R.slot[i]);
+    if (R.done < g_cb_serial) {
+        static LONG64 last, per_ms;
+        LONG64 now = tk();
+        if (!per_ms) { LARGE_INTEGER f; QueryPerformanceFrequency(&f); per_ms = f.QuadPart / 1000; }
+        if (!evpoll_on() && now - last < per_ms) return;      /* the fence status is a system call: at most once per millisecond */
+        last = now;
+        for (;;) {
+            Slot *o = NULL;
+            for (int i = 0; i < NSLOT; i++) if (R.slot[i].pending && (!o || R.slot[i].serial < o->serial)) o = &R.slot[i];
+            if (!o || o->serial > g_cb_serial) break;
+            LONG64 f0 = tk(); int fin = slot_done(o); LONG64 f1 = tk();
+            g_idle_tk[2] += f1 - f0; g_fst_n[fin]++;
+            if (!fin) break;
+            slot_wait(o);
+            g_idle_tk[2 + 1] += tk() - f1;
+            if (o->pending) break;                 /* (slot_wait clears it; never loop on one slot) */
+        }
+    }
     if (R.done >= g_cb_serial) cb_land(0);
 }
 /* V 2026-10-21 (plan/phases/V_fps_collapse_2026-10-20.md): the owner's online match went to 28 fps, then 2, as soon as
@@ -3351,7 +3392,18 @@ static void vk_submit(void *arg) {
     nvn_front_count(3, 1);
 }
 static void vk_submit_async(void *arg) { SubmitJob *j = arg; j->handles = (const uint64_t *)(j + 1); vk_submit(j); }
-static void vk_idle(void) { if (V.alive) { cb_poll(); nvn_front_take_dead(vk_drop); } }
+
+static void vk_idle(void) {
+    if (!V.alive) return;
+    LONG64 t0 = tk(); cb_poll(); LONG64 t1 = tk(); nvn_front_take_dead(vk_drop);
+    g_idle_tk[0] += t1 - t0; g_idle_tk[1] += tk() - t1; g_idle_n++;
+}
+void nvn_vk_idle_stat(char *out, size_t n) {
+    LARGE_INTEGER f; QueryPerformanceFrequency(&f); double ms = 1000.0 / (double)f.QuadPart;
+    snprintf(out, n, "idle calls %lld: cb_poll %.0f ms (fence status %lld not done / %lld done: %.0f ms, slot waits %.0f ms), take_dead %.0f ms", (long long)g_idle_n, g_idle_tk[0] * ms,
+             (long long)g_fst_n[0], (long long)g_fst_n[1], g_idle_tk[2] * ms, g_idle_tk[3] * ms, g_idle_tk[1] * ms);
+    memset(g_idle_tk, 0, sizeof g_idle_tk); g_idle_n = 0; g_fst_n[0] = g_fst_n[1] = 0;
+}
 static void vk_housekeeping(void *arg) { (void)arg; if (V.alive) nvn_front_take_dead(vk_drop); }
 static void vk_flush(void *arg) { (void)arg; if (V.alive) cmd_submit(NULL, NULL); }
 static void vk_finish(void *arg) { (void)arg; if (V.alive) cmd_wait_all(); }
@@ -3365,20 +3417,25 @@ static void vk_fence(void *arg) { SyncJob *j = arg; if (j->o->dead || !V.alive) 
  * GPU's work on it one after the other (Marble, a fight: replay ~7 ms + GPU ~13 ms = 20 ms a frame, never 60 fps); now
  * the replay of the next frame runs while the GPU works on this one. The command-buffer slots (NSLOT) and the display's
  * tick bound how far ahead the game gets. SSBU_VK_FENCE_EARLY=0: the fence is the GPU's, as before (default on Android). */
+/* 2: also when compute results are still to be copied back into guest memory. They are the fighters' skinned vertices
+ * (see "compute" below), read by the next batch's draws on the GPU, and cb_sync at the start of every batch lands them
+ * before the replay reads guest memory; only a CPU read of them between the fence and the next batch would see the
+ * previous frame's values (none known). Waiting for the GPU there was ~6.7 ms of every fight frame on the Marble once the
+ * fence polls stopped hiding it: Big Battlefield 55 -> 57-59 fps. Default 2 on Android. */
 #ifdef SSBU_ANDROID
-#define VK_FENCE_EARLY_DEFAULT 1
+#define VK_FENCE_EARLY_DEFAULT 2
 #else
 #define VK_FENCE_EARLY_DEFAULT 0
 #endif
 static LONG64 g_fence_early, g_fence_gpu;
-static int fence_early_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("SSBU_VK_FENCE_EARLY"); on = e ? atoi(e) != 0 : VK_FENCE_EARLY_DEFAULT; printf("nvn_vk: fences %s (SSBU_VK_FENCE_EARLY)\n", on ? "signal once the render thread has submitted the work before them; compute results that go back to guest memory still wait for the GPU" : "signal when the GPU has finished the work before them"); } return on; }
+static int fence_early_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("SSBU_VK_FENCE_EARLY"); on = e ? atoi(e) : VK_FENCE_EARLY_DEFAULT; printf("nvn_vk: fences %s (SSBU_VK_FENCE_EARLY)\n", on ? "signal once the render thread has submitted the work before them; compute results that go back to guest memory still wait for the GPU" : "signal when the GPU has finished the work before them"); } return on; }
 static void vk_sync_wait(void *arg) {
     SyncJob *j = arg;
     uint64_t want = (uint64_t)(uintptr_t)j->o->s;
     if (!want || !V.alive) { j->result = 3; return; }       /* never fenced */
     want--;
     if (want <= R.done) { j->result = 0; return; }
-    if (fence_early_on() && !(g_cb_pending && g_cb_serial <= want)) { cb_poll(); g_fence_early++; j->result = 1; return; }
+    if (fence_early_on() && (fence_early_on() >= 2 || !(g_cb_pending && g_cb_serial <= want))) { cb_poll(); g_fence_early++; j->result = 1; return; }
     g_fence_gpu++;
     for (int i = 0; i < NSLOT; i++) {
         Slot *s = &R.slot[i];
@@ -3399,7 +3456,7 @@ static void vk_sync_wait(void *arg) {
 static LONG64 g_fence_fast;
 int nvn_vk_fence_early(void) { return fence_early_on(); }
 int nvn_vk_sync_fast(SyncObj *o) {
-    if (!fence_early_on() || !V.alive || o->dead || o->in_cmdbuf || g_cb_pending) return 0;
+    if (!fence_early_on() || !V.alive || o->dead || o->in_cmdbuf || (g_cb_pending && fence_early_on() < 2)) return 0;
     LONG posted = o->posted;
     if (!posted || InterlockedCompareExchange(&o->done, 0, 0) != posted || !o->s) return 0;
     InterlockedIncrement64(&g_fence_fast);

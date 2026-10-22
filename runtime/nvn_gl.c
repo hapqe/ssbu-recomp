@@ -245,7 +245,7 @@ enum {
 };
 
 /* ---------------------------------------------------------------- the render thread */
-typedef struct Job { void (*fn)(void *); void *arg; HANDLE done; struct Job *next; } Job;
+typedef struct Job { void (*fn)(void *); void *arg; HANDLE done; struct Job *next; LONG64 t_post; } Job;      /* t_post: QPC when queued (SSBU_SYNCSTAT) */
 static CRITICAL_SECTION g_job_lock;
 static Job *g_job_head, *g_job_tail;
 static HANDLE g_job_event, g_ready_event;
@@ -271,7 +271,8 @@ void hitch_wait_render(int on); void hitch_frame(long long frame, double ms, int
 static void gl_run(void (*fn)(void *), void *arg) {
     if (GetCurrentThreadId() == g_render_tid) { fn(arg); return; }
     if (!t_done) t_done = CreateEventA(NULL, FALSE, FALSE, NULL);
-    Job j = {fn, arg, t_done, NULL};
+    Job j = {fn, arg, t_done, NULL, 0};
+    { LARGE_INTEGER q; QueryPerformanceCounter(&q); j.t_post = q.QuadPart; }
     LONG64 pf0 = pf_now();
     if (g_joblog_frame > 0 && g_joblog_cur >= g_joblog_frame && g_joblog_cur < g_joblog_frame + 3) joblog(fn, pf0);
     EnterCriticalSection(&g_job_lock);
@@ -310,6 +311,7 @@ static void gl_post(void (*fn)(void *), const void *arg, size_t size) {       /*
     Job *j = malloc(sizeof *j + size + 8);
     if (size) memcpy(j + 1, arg, size);
     j->fn = fn; j->arg = j + 1; j->done = NULL; j->next = NULL;
+    { LARGE_INTEGER q; QueryPerformanceCounter(&q); j->t_post = q.QuadPart; }
     InterlockedIncrement(&g_async_pending);
     EnterCriticalSection(&g_job_lock);
     if (g_job_tail) g_job_tail->next = j; else g_job_head = j;
@@ -3787,9 +3789,29 @@ static void job_write_texels(void *arg) {
 }
 
 /* The render thread's job loop (both back ends). */
+/* SSBU_SYNCSTAT=1 (test): where the render thread's time goes, every 600 frames: asleep (no job), the back end's idle
+ * work between jobs, the jobs by kind, and how long jobs waited in the queue before they began */
+static void rt_stat(int k, LONG64 t) {
+    static int on = -1; static LONG64 n[8], tt[8], last; static LARGE_INTEGER f;
+    if (on < 0) { on = getenv("SSBU_SYNCSTAT") && atoi(getenv("SSBU_SYNCSTAT")); QueryPerformanceFrequency(&f); }
+    if (!on) return;
+    n[k]++; tt[k] += t;
+    long long fr = (long long)g_st.frames;
+    if (fr / 600 != last / 600) {
+        double ms = 1000.0 / (double)f.QuadPart;
+        { char b[160]; void nvn_vk_idle_stat(char *out, size_t n); if (g_vk) { nvn_vk_idle_stat(b, sizeof b); printf("rtstat: %s\n", b); } }
+        printf("rtstat: frame %lld: asleep %.0f ms, idle work %.0f ms, submit %lld jobs %.0f ms, present %lld %.0f ms, sync wait %lld %.0f ms, fence %lld %.0f ms, other %lld %.0f ms | queue wait before a job began: mean %.2f ms\n", fr,
+               tt[0] * ms, tt[1] * ms, (long long)n[2], tt[2] * ms, (long long)n[3], tt[3] * ms, (long long)n[4], tt[4] * ms, (long long)n[5], tt[5] * ms, (long long)n[6], tt[6] * ms, n[7] ? tt[7] * ms / (double)n[7] : 0.0);
+        memset(n, 0, sizeof n); memset(tt, 0, sizeof tt);
+    }
+    last = fr;
+}
+static LONG64 rt_now(void) { LARGE_INTEGER q; QueryPerformanceCounter(&q); return q.QuadPart; }
 static void render_loop(void) {
     for (;;) {
+        LONG64 t0 = rt_now();
         WaitForSingleObject(g_job_event, INFINITE);
+        rt_stat(0, rt_now() - t0);
         for (;;) {
             EnterCriticalSection(&g_job_lock);
             Job *j = g_job_head;
@@ -3797,9 +3819,15 @@ static void render_loop(void) {
             LeaveCriticalSection(&g_job_lock);
             if (!j) break;
             HANDLE done = j->done;
+            LONG64 ta = rt_now();
+            if (j->t_post) rt_stat(7, ta - j->t_post);
             if (g_rb->idle) g_rb->idle();
+            LONG64 tb = rt_now();
+            rt_stat(1, tb - ta);
             g_hitch_rt = j->fn == g_rb->submit || j->fn == g_rb->submit_async ? "submitted commands (outside the named scopes)" : j->fn == g_rb->present ? "present (blit)" : j->fn == g_rb->sync_wait ? "SyncWait job" : "other job (texel read/write, finish, barrier, ...)";
+            int kind = j->fn == g_rb->submit || j->fn == g_rb->submit_async ? 2 : j->fn == g_rb->present ? 3 : j->fn == g_rb->sync_wait ? 4 : j->fn == g_rb->fence ? 5 : 6;
             j->fn(j->arg);                       /* a member of g_rb (seam step S2), or a job of the front end / of the back end itself */
+            rt_stat(kind, rt_now() - tb);
             g_hitch_rt = "idle";
             if (done) SetEvent(done); else { free(j); InterlockedDecrement(&g_async_pending); }      /* gl_post: nobody waits */
         }
@@ -5006,10 +5034,24 @@ static void sync_wait(Ctx *c) {                         /* (sync, timeoutNs) -> 
     L1T("sync wait %llx%s", (unsigned long long)A0, hobj(A0, K_SYNC) == g_window_sync ? " (WINDOW texture)" : "");
     SyncObj *o = hobj(A0, K_SYNC);
     SyncJob j = {o, 0, A1, 3, 0};
+    long long nvn_front_frame_next(void);
     int nvn_vk_sync_fast(SyncObj *o), nvn_vk_fence_early(void);      /* nvn_vk_draw.c: answered here, without a trip through the render thread's queue */
+    static int stat = -1; static LONG64 st_n[4], st_t[4], st_last; LARGE_INTEGER q0, q1;      /* SSBU_SYNCSTAT=1: where the game's sync waits went (test) */
+    if (stat < 0) stat = getenv("SSBU_SYNCSTAT") && atoi(getenv("SSBU_SYNCSTAT"));
+    int kind = 0;
+    if (stat) QueryPerformanceCounter(&q0);
     if (o && g_vk && nvn_vk_sync_fast(o)) j.result = 1;
     else if (o && g_vk && o == g_window_sync && !o->s && !o->posted && !o->in_cmdbuf && nvn_vk_fence_early()) j.result = 3;      /* the window texture's sync, never fenced: straight to the refresh wait below (the trip through the queue was ~6 % of the game thread's time) */
-    else if (o) gl_run(g_rb->sync_wait, &j);
+    else if (o) { kind = o == g_window_sync ? 1 : o->in_cmdbuf ? 2 : 3; gl_run(g_rb->sync_wait, &j); }
+    if (stat && kind) {
+        QueryPerformanceCounter(&q1); st_n[kind]++; st_t[kind] += q1.QuadPart - q0.QuadPart;
+        LONG64 fr = nvn_front_frame_next();
+        if (fr / 600 != st_last / 600) { LARGE_INTEGER f; QueryPerformanceFrequency(&f); double ms = 1000.0 / (double)f.QuadPart;
+            printf("syncstat: frame %lld: waits through the render thread: window sync %lld (%.1f ms), command-buffer fenced %lld (%.1f ms), queue fence not yet run %lld (%.1f ms)\n", (long long)fr,
+                   (long long)st_n[1], st_t[1] * ms, (long long)st_n[2], st_t[2] * ms, (long long)st_n[3], st_t[3] * ms);
+            memset(st_n, 0, sizeof st_n); memset(st_t, 0, sizeof st_t); }
+        st_last = fr;
+    }
     if (o && o == g_window_sync && A1 && j.result == 3) {      /* P3 round 3: the window texture's sync (never fenced by us): it is free at the refresh that shows the queued frame (display.c) */
         if (l1_pipe_wait()) j.result = 1; else {      /* L1 round 2: pipe mode does not hold here */
         l1_early_present();                                    /* L1 (latency = early / SSBU_L1_EARLY=1): the picture the game finished before this wait goes to the window now (at its tick) */
