@@ -67,7 +67,9 @@ if [ ! -f "$KS" ]; then
   "${JAVA_BIN}keytool" -genkeypair -keystore "$KS" -storepass android -keypass android -alias androiddebugkey -dname "CN=Android Debug,O=Android,C=US" \
       -keyalg RSA -keysize 2048 -validity 10000 >/dev/null
 fi
-"$BT/apksigner" sign --ks "$KS" --ks-key-alias "${KEY_ALIAS:-androiddebugkey}" --ks-pass "pass:${KS_PASS:-android}" --key-pass "pass:${KEY_PASS:-android}" \
+# no v4 signature (.idsig): with one, adb installs incrementally and leaves wrap.sh out of the installed library folder,
+# so the game process is a zygote fork and the guest range cannot be reserved ("cannot map guest image")
+"$BT/apksigner" sign --v4-signing-enabled false --ks "$KS" --ks-key-alias "${KEY_ALIAS:-androiddebugkey}" --ks-pass "pass:${KS_PASS:-android}" --key-pass "pass:${KEY_PASS:-android}" \
     --out build/OpenSmash.apk "$OUT/aligned.apk"
 ls -la build/OpenSmash.apk
 echo "== done: android/build/OpenSmash.apk"
