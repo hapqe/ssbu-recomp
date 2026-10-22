@@ -462,7 +462,11 @@ static DWORD g_render_tid;
 static void fb_note(int kind, const FbRec *f, LONG64 ticks) {
     int valid = f->flags & 1, hit = valid && (f->flags & 2);
     InterlockedIncrement64(!valid ? &g_fb_none[kind] : hit ? &g_fb_hit[kind] : &g_fb_miss[kind]);
-    if (kind == 0 && !hit) InterlockedIncrement64(&g_pc_dirty);      /* session 14: a stage library the pipeline cache did not have: the file on disk is now older than the cache */
+    /* session 14: a stage library the pipeline cache did not have: the file on disk is now older than the cache.
+     * 2026-10-22: Turnip never sets the cache-hit flag (Marble: 12,743 libraries "compiled now" in 100 ms of driver time,
+     * 8 us each), so every exit rewrote the whole file (212-457 MB): a miss with feedback counts only when the driver took
+     * over 0.5 ms, which no real compilation is under */
+    if (kind == 0 && !hit && (!valid || f->duration > 500000)) InterlockedIncrement64(&g_pc_dirty);
     if (valid && !hit) InterlockedAdd64(&g_fb_miss_ns[kind], (LONG64)f->duration);
     if (GetCurrentThreadId() == g_render_tid && g_in_fight) {
         static int nl;
