@@ -721,6 +721,23 @@ static float g_wide_x = 1.0f, g_wide_y = 1.0f;
 static int g_wide_on;
 #define WIDE_ON g_wide_on
 #define RS_ON (rs_scale() != 1.0f || WIDE_ON)
+/* WIDE_TR: the vertex / fragment stages are translated in the wide form (MxIn.screen_wide, MXPC of 32 bytes). With aspect = wide
+ * always; with SSBU_VK_WIDE_TR=1 (default on Android) also for any scaled run, mx_wide then being 1, 1: keep, stretch and wide
+ * at a scaled resolution are ONE translation and one prepared set (marker _s2_), so changing the picture shape does not start
+ * a first-run preparation of every shader again (2026-10-23: it took ~20 minutes on the Marble and looked like a freeze). */
+static int wide_tr_always(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("SSBU_VK_WIDE_TR");
+#ifdef SSBU_ANDROID
+        v = !(e && e[0] == '0');
+#else
+        v = e && e[0] == '1';
+#endif
+    }
+    return v;
+}
+#define WIDE_TR (WIDE_ON || (RS_ON && wide_tr_always()))
 /* the shape the picture is placed with (display_fit): 16:9, or the wide targets' */
 static void pic_shape(int *w, int *h) {
     if (!g_wide_on) { *w = 16; *h = 9; return; }
@@ -2966,7 +2983,7 @@ static int draw_prepare(unsigned prim) {
             float fcs = R.pass_rs ? 1.0f / R.pass_sx : 1.0f, ps = R.pass_rs ? R.point_size * R.pass_sx : R.point_size;
             memcpy(&pc[3], &fcs, 4); memcpy(&pc[2], &ps, 4);
         }
-        if (WIDE_ON) {                               /* aspect = wide: mx_fcs2 (per axis) and mx_wide (the projection widened on a wide pass) */
+        if (WIDE_TR) {                               /* aspect = wide: mx_fcs2 (per axis) and mx_wide (the projection widened on a wide pass; 1, 1 without wide) */
             float wd[4] = {R.pass_rs ? 1.0f / R.pass_sx : 1.0f, R.pass_rs ? 1.0f / R.pass_sy : 1.0f, R.pass_rs ? 1.0f / g_wide_x : 1.0f, R.pass_rs ? 1.0f / g_wide_y : 1.0f};
             uint32_t pc8[8];
             memcpy(pc8, pc, 16); memcpy(&pc8[4], wd, 16);

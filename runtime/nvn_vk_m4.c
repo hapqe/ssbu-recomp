@@ -168,7 +168,7 @@ static uint64_t ssrc_hb(const SSrc *o) {
     if (o->stage == 5) { h = fnv(h, o->local, sizeof o->local); h = fnv(h, &o->smem, 4); h = fnv(h, &o->lmem, 4); }
     if (o->cdata) h = fnv(h ^ o->cdata_size, o->cdata, o->cdata_size);
     if (o->stage == 1 && RS_ON) h = fnv(h, "rs1", 3);      /* track O: the fragment stages of a run with an internal resolution scale are another translation (MxIn.screen_scale); at 1.0 the hash is the one it always was */
-    if (WIDE_ON && (o->stage == 0 || o->stage == 1)) h = fnv(h, "wide1", 5);      /* aspect = wide: the vertex and fragment stages are another translation (MxIn.screen_wide) */
+    if (WIDE_TR && (o->stage == 0 || o->stage == 1)) h = fnv(h, "wide1", 5);      /* aspect = wide (or WIDE_TR): the vertex and fragment stages are another translation (MxIn.screen_wide) */
     return fnv(h, &ver, 4);
 }
 static VkShaderModule module_from_spv(uint64_t h) {              /* any thread; NULL when the file is not there */
@@ -346,7 +346,7 @@ static void vstage_build(VStage *v, const SSrc *src) {
         }
         snprintf(what, sizeof what, "program #%d %s stage", src->serial, s == 5 ? "compute" : s ? "fragment" : "vertex");
         if (s == 1 && RS_ON) in.screen_scale = 1;
-        if (WIDE_ON && (s == 0 || s == 1)) in.screen_wide = 1;
+        if (WIDE_TR && (s == 0 || s == 1)) in.screen_wide = 1;
         if (!mx_translate(&in, &out)) { printf("nvn_vk: %s: machine code not translated: %s\n", what, out.why); fflush(stdout); }
         else {
             uint64_t spv_hash = 0;
@@ -573,7 +573,7 @@ static PairLib *pairlib_ensure(VStage *vs, VStage *fs, int samples, int sshade, 
         if (i == 0 && D.has_push && l->nb[0] <= 32) { li.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR; l->push0 = 1; }
         VKC(vkCreateDescriptorSetLayout(V.device, &li, NULL, &l->dl[i]));
     }
-    VkPushConstantRange pc = {VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, WIDE_ON ? 32 : 16};      /* aspect = wide: MXPC of 32 bytes */
+    VkPushConstantRange pc = {VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, WIDE_TR ? 32 : 16};      /* aspect = wide: MXPC of 32 bytes */
     VkPipelineLayoutCreateInfo pl = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     pl.setLayoutCount = 2; pl.pSetLayouts = l->dl; pl.pushConstantRangeCount = 1; pl.pPushConstantRanges = &pc;
     VKC(vkCreatePipelineLayout(V.device, &pl, NULL, &l->layout));
@@ -699,7 +699,7 @@ static void gpl_universal(void) {
             li.bindingCount = (uint32_t)(i ? n1 : n0); li.pBindings = i ? b1 : b0;
             VKC(vkCreateDescriptorSetLayout(V.device, &li, NULL, &g_udl[i]));
         }
-        VkPushConstantRange pc = {VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, WIDE_ON ? 32 : 16};      /* aspect = wide: MXPC of 32 bytes */
+        VkPushConstantRange pc = {VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, WIDE_TR ? 32 : 16};      /* aspect = wide: MXPC of 32 bytes */
         VkPipelineLayoutCreateInfo pl = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
         pl.setLayoutCount = 2; pl.pSetLayouts = g_udl; pl.pushConstantRangeCount = 1; pl.pPushConstantRanges = &pc;
         VKC(vkCreatePipelineLayout(V.device, &pl, NULL, &g_ulayout));
@@ -1014,7 +1014,7 @@ static double pipe_build(Pipe *p) {
         if (i == 0 && D.has_push && p->nb[0] <= 32) { li.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR; p->push0 = 1; }      /* 32: the smallest maxPushDescriptors a device may have */
         VKC(vkCreateDescriptorSetLayout(V.device, &li, NULL, &p->dl[i]));
     }
-    VkPushConstantRange pc = {VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, WIDE_ON ? 32 : 16};      /* aspect = wide: MXPC of 32 bytes */
+    VkPushConstantRange pc = {VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, WIDE_TR ? 32 : 16};      /* aspect = wide: MXPC of 32 bytes */
     VkPipelineLayoutCreateInfo pl = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     pl.setLayoutCount = 2; pl.pSetLayouts = p->dl; pl.pushConstantRangeCount = 1; pl.pPushConstantRanges = &pc;
     VKC(vkCreatePipelineLayout(V.device, &pl, NULL, &p->layout));
@@ -2943,7 +2943,7 @@ static DWORD WINAPI sweep_main(void *arg) {
 static void prep_marker_path(char *out, size_t n, int mini) {
     char kv[16] = "";
     if (VK_KEYS_VERSION > 1) snprintf(kv, sizeof kv, "_k%d", VK_KEYS_VERSION);
-    snprintf(out, n, "%s/prepared_v%u%s_s%d_%s_%04x_%04x_%08x.txt", vkc_dir(), MX_VK_VERSION, kv, RS_ON ? (WIDE_ON ? 2 : 1) : 0, mini ? "mlib" /* libraries in files of their own (minilib_on) */ : D.has_gpl && gpl_sep() ? "lib" : D.has_vids ? "nolib" : "novi" /* a pass without libraries (SSBU_VK_PREP=1, run s10n0) must not make a later run with libraries skip theirs */, (unsigned)V.props.vendorID, (unsigned)V.props.deviceID, (unsigned)V.props.driverVersion);
+    snprintf(out, n, "%s/prepared_v%u%s_s%d_%s_%04x_%04x_%08x.txt", vkc_dir(), MX_VK_VERSION, kv, RS_ON ? (WIDE_TR ? 2 : 1) : 0, mini ? "mlib" /* libraries in files of their own (minilib_on) */ : D.has_gpl && gpl_sep() ? "lib" : D.has_vids ? "nolib" : "novi" /* a pass without libraries (SSBU_VK_PREP=1, run s10n0) must not make a later run with libraries skip theirs */, (unsigned)V.props.vendorID, (unsigned)V.props.deviceID, (unsigned)V.props.driverVersion);
 }
 static void prep_start(void) {
     const char *e = getenv("SSBU_VK_PREP");
