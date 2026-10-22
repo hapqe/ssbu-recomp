@@ -11,10 +11,10 @@ One-click installer, Vulkan renderer, in-game settings, fighters as readable C++
 [![Website](https://img.shields.io/badge/website-denkishi.github.io-informational)](https://denkishi.github.io/opensmash-site/)
 [![Download](https://img.shields.io/badge/download-ZIP-brightgreen?logo=github)](https://github.com/Denkishi/ssbu-recomp/archive/refs/heads/main.zip)
 [![License: GPL-3.0](https://img.shields.io/badge/license-GPL--3.0-blue)](LICENSE)
-![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11%20x64-lightgrey)
+![Platform](https://img.shields.io/badge/platform-Windows%20x64%20%7C%20Linux%20%7C%20Android%20arm64-lightgrey)
 ![Game versions](https://img.shields.io/badge/game-13.0.4%20%7C%2013.0.5-green)
 
-### [Install](#install-in-3-steps) &nbsp;|&nbsp; [Website](https://denkishi.github.io/opensmash-site/) &nbsp;|&nbsp; [Discord](https://discord.gg/RyZpx3u2t4)
+### [Install](#install-in-3-steps) &nbsp;|&nbsp; [Android](#android-experimental) &nbsp;|&nbsp; [Website](https://denkishi.github.io/opensmash-site/) &nbsp;|&nbsp; [Discord](https://discord.gg/RyZpx3u2t4)
 
 </div>
 
@@ -68,6 +68,18 @@ You need **your own game dump and keys**. That is all: the installer fetches eve
 
 Full guide, requirements and the same build done by hand: **[BUILDING.md](BUILDING.md)**.
 
+## Android (experimental)
+
+The same recompiled game also runs natively on arm64 phones and tablets, drawn with Vulkan: measured at **59-60 fps in a
+fight** on a Poco F5 (Snapdragon 7+ Gen 2, Adreno 725, Mesa Turnip driver). The Android launcher sets the game up **on
+the device** from your own Switch files: point it at a folder with your keys, base game, update and DLC, and it unpacks
+the game data, unlocks your DLC and imports your save. The one part that needs a PC, once, is the game's recompiled code
+(`android/tools/build_game_android.py --package`), imported into the launcher as a `.zip`.
+
+<!-- OWNER: a screenshot of the launcher and of a fight on a phone would fit here (media/android-*.png, your own captures). -->
+
+Requirements, setup and limits: **[docs/ANDROID.md](docs/ANDROID.md)**.
+
 ## Features
 
 Status key: **Done** = works and was tested on the development PC; **Experimental** = works, not widely tested or off
@@ -91,6 +103,8 @@ by default; **In progress**; **Planned**.
 | Freeze watchdog: a report with the stack of every thread | Done |
 | Fixed 60 fps in every mode | In progress |
 | Items and stages as source | Planned |
+| Android build for arm64 ([docs/ANDROID.md](docs/ANDROID.md)): launcher with on-device setup from your Switch files (RomFS, ExeFS, DLC, saves), Turnip driver install, touch controls and gamepads, 16:9 / fill / wide picture; 59-60 fps in fights on a Snapdragon 7+ Gen 2 | Experimental |
+| DLC: your add-on content packages unlock their fighters, stages, costumes and spirits (only their ids are read) | Done (PC installer, Android launcher) |
 | Native Linux build ([BUILDING_LINUX.md](BUILDING_LINUX.md)): movies, menus, a whole match at 60 fps with sound on one PC (CachyOS, NVIDIA, Wayland); F1 menu built (not yet tried on Linux), no online play there yet; Steam Deck not tested | In progress |
 
 ### Game modes (measured on the development PC)
@@ -184,6 +198,7 @@ per-frame logs against the lifted version (2,010 fight frames each). More: [docs
 | 6 | Single-file fighter packages (drop one file in the characters folder) | In progress |
 | 7 | Controllers confirmed on physical pads | In progress |
 | 8 | Linux / Steam Deck (a native Linux build runs on one tested PC: [BUILDING_LINUX.md](BUILDING_LINUX.md)) | In progress |
+| 9 | Android: tested on more devices; the game libraries built without a PC | Planned |
 
 ## FAQ
 
@@ -214,6 +229,10 @@ empty `build\saves\save` and copy your `save_data` folder into it (you should ha
 session files: leave them or delete them while the game is closed.
 
 **"ssbu_game_eh_o1.dll is missing" when I start the game?** The game DLL (about 500 MB, built on your PC and not signed) was removed after the installation, usually by an antivirus, or the installation stopped before the end. Open Windows Security > Virus & threat protection > Protection history and restore/allow the file if it is there (adding your install folder to the exclusions stops it happening again), then double-click `Install SSBU.bat` and press **Resume**: it links the missing files again in a few minutes, without compiling everything again.
+
+**DLC?** The DLC fighters, stages and costumes are data of the game update; your add-on content packages only unlock
+them. The PC installer finds your DLC packages next to the game; on Android, *Add-on content > Import* in the launcher
+reads them (`.nsp`, or a `.rar` / `.zip` of them). Both write `config\dlc.txt`, the list of what you own.
 
 **Mods and new fighters?** Mods through the function hook table and C++ fighter source work today; new fighters are in
 progress ([docs/NEW_FIGHTER.md](docs/NEW_FIGHTER.md)).
