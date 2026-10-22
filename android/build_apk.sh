@@ -29,6 +29,11 @@ echo "== libguestreserve.so, libnoaslr.so, wrap.sh"
     -o build/lib/arm64-v8a/libguestreserve.so -llog -Wl,-z,max-page-size=16384 -Wl,-soname,libguestreserve.so
 "$NDK/toolchains/llvm/prebuilt/$HOST/bin/clang" --target=aarch64-linux-android30 -fPIE -pie -O2 runtime/noaslr.c \
     -o build/lib/arm64-v8a/libnoaslr.so -Wl,-z,max-page-size=16384
+echo "== libswitchimport.so"
+# the on-device import of the user's Switch files (RomFS, ExeFS, package info: tools/romfs_extract.c), an executable the
+# launcher runs (GameSetup.java); named lib*.so so that it is installed with the libraries (executable there)
+"$NDK/toolchains/llvm/prebuilt/$HOST/bin/clang" --target=aarch64-linux-android30 -fPIE -pie -O2 -march=armv8-a+crypto tools/romfs_extract.c \
+    -o build/lib/arm64-v8a/libswitchimport.so -Wl,-z,max-page-size=16384
 echo "== libdevcheck.so"
 VKH="$DEPS/Vulkan-Headers-1.4.329/include"
 AT=build/deps/adrenotools/install
@@ -44,8 +49,11 @@ cp "$DEPS/SDL3-3.4.18/android-project/app/src/main/java/org/libsdl/app/"*.java "
 
 echo "== aapt2"
 "$BT/aapt2" compile --dir app/res -o "$OUT/res.zip"
+# assets: the open-source system fonts of the runtime (runtime/fonts_open; the launcher puts them into work/fonts_open)
+mkdir -p "$OUT/assets/fonts_open"
+cp ../runtime/fonts_open/*.ttf ../runtime/fonts_open/LICENSE-* ../runtime/fonts_open/README.md "$OUT/assets/fonts_open/"
 "$BT/aapt2" link -o "$OUT/base.apk" -I "$PLATFORM" --manifest app/AndroidManifest.xml \
-    -R "$OUT/res.zip" --auto-add-overlay --java "$OUT/gen"
+    -R "$OUT/res.zip" -A "$OUT/assets" --auto-add-overlay --java "$OUT/gen"
 
 echo "== javac"
 find "$OUT/src" "$OUT/gen" -name '*.java' > "$OUT/sources.txt"

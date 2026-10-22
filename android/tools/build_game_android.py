@@ -2,6 +2,7 @@
 
     python3 android/tools/build_game_android.py --dump <folder> [--build <folder>] [--jobs N] [--modules all|a,b]
                                                 [--redo <step> | --from <step> | --only <step>] [--push [--serial <adb serial>]]
+                                                [--package [<file.zip>]]
 
 The steps of scripts/setup.py that derive files from the dump run as they are there (stage, convert, modules, tables, lift,
 sdk); compile and nro build the game libraries with the NDK's clang for arm64 (tools/lifter/build.py RECOMP_TARGET=android):
@@ -11,6 +12,10 @@ into the app and android/compat's LoadLibraryA opens. Steps are resumable, as in
 --push copies what the game reads at run time to the device's game folder (default /sdcard/OpenSmash, the launcher's):
 state.json, binaries/<version>/, work/ (the libraries and fonts_open/) and the dump's RomFS as romfs/. data.arc goes in
 parts of 512 MB, appended on the device one by one, so an interrupted push resumes where it stopped.
+--package writes the game libraries alone into a .zip (default <build>/OpenSmash-libraries-<version>.zip): the one part of the
+game folder that needs a PC. Copy it to the device and import it in the launcher ("Import libraries (.zip)"); the launcher
+makes everything else there from your Switch files (keys, base game, update, DLC). The .zip holds your recompiled game: it
+is for your own devices, do not share it.
 Needs: python 3.10+ with requirements.txt, the Android NDK (NDK, else $ANDROID_HOME/ndk/29.0.14206865) and, for --push, adb.
 """
 import argparse
@@ -70,6 +75,24 @@ def step_nro(cx):
 
 RUNNERS = {'deps': step_deps, 'stage': S.step_stage, 'convert': S.step_convert, 'modules': S.step_modules, 'tables': step_tables,
            'lift': S.step_lift, 'sdk': S.step_sdk, 'compile': step_compile, 'nro': step_nro}
+
+
+# ---------------------------------------------------------------------------------------------- package
+def package(cx, out):
+    """work/ssbu_game_eh_o1.dll and work/nro_bin_eh_o2/*.dll into a .zip (stored: the libraries hardly compress, and the
+    launcher's progress counts the bytes of the file)."""
+    import zipfile
+    ver = cx.state['game_version']
+    out = out or os.path.join(cx.build, 'OpenSmash-libraries-%s.zip' % ver)
+    libs = [(f, 'work/' + rel) for f, rel in [(l, os.path.relpath(l, cx.work).replace(os.sep, '/')) for l, _ in push_list(cx) if l.lower().endswith('.dll')]]
+    tmp = out + '.part'
+    with zipfile.ZipFile(tmp, 'w', zipfile.ZIP_STORED, allowZip64=True) as z:
+        z.writestr('README.txt', 'OpenSmash game libraries for Android, game version %s. Your own recompiled game: for your own devices only.\n'
+                                 'Import this file in the OpenSmash launcher: Game files > Import libraries (.zip).\n' % ver)
+        for f, rel in libs:
+            z.write(f, rel)
+    os.replace(tmp, out)
+    S.say('package: %d libraries, %.0f MB -> %s' % (len(libs), os.path.getsize(out) / 1048576.0, out))
 
 
 # ---------------------------------------------------------------------------------------------- push
@@ -154,6 +177,8 @@ def main():
     ap.add_argument('--push', action='store_true', help='copy the game folder to the device (adb) after the build')
     ap.add_argument('--serial', help='adb serial of the device')
     ap.add_argument('--dest', default='/sdcard/OpenSmash', help='game folder on the device (default /sdcard/OpenSmash)')
+    ap.add_argument('--package', nargs='?', const='', default=None, metavar='ZIP',
+                    help='write the game libraries into a .zip for the launcher\'s "Import libraries" (default <build>/OpenSmash-libraries-<version>.zip)')
     a = ap.parse_args()
     a.nocrt = a.runtime = None
     cx = S.Ctx(a)
@@ -194,6 +219,8 @@ def main():
         cx.save()
         S.say('[%d/%d] %s: ok  %s' % (i + 1, len(STEPS), s, S.fmt(done[s]['secs'])))
     S.say('build finished in %s: %s' % (S.fmt(time.time() - t_all), cx.build))
+    if a.package is not None:
+        package(cx, a.package)
     if a.push:
         try:
             push(cx, a.serial, a.dest.rstrip('/'))

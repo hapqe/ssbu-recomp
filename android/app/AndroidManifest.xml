@@ -37,6 +37,7 @@
         android:allowNativeHeapPointerTagging="false">
         <activity
             android:name=".LauncherActivity"
+            android:theme="@style/Theme.OpenSmash"
             android:exported="true"
             android:launchMode="singleTask"
             android:windowSoftInputMode="adjustResize">

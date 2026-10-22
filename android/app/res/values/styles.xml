@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- the launcher: dark, with the accent of Ui.java (dialogs, spinners, check boxes, the progress bar) -->
+    <style name="Theme.OpenSmash" parent="@android:style/Theme.Material.NoActionBar">
+        <item name="android:colorAccent">#FF4D6A</item>
+        <item name="android:colorPrimary">#181B22</item>
+        <item name="android:colorPrimaryDark">#0E1014</item>
+        <item name="android:colorBackground">#0E1014</item>
+        <item name="android:windowBackground">#0E1014</item>
+        <item name="android:statusBarColor">#0E1014</item>
+        <item name="android:navigationBarColor">#0E1014</item>
+        <item name="android:alertDialogTheme">@style/Theme.OpenSmash.Dialog</item>
+    </style>
+    <style name="Theme.OpenSmash.Dialog" parent="@android:style/Theme.Material.Dialog.Alert">
+        <item name="android:colorAccent">#FF4D6A</item>
+        <item name="android:colorBackground">#181B22</item>
+        <item name="android:windowBackground">@android:color/transparent</item>
+    </style>
+</resources>
