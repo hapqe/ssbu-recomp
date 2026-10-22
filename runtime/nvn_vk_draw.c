@@ -177,6 +177,21 @@ typedef struct { VkDeviceMemory mem; uint64_t size; void *map; uint32_t type; in
 static VBlock *g_blk[2048];
 static int g_nblk;
 static LONG64 g_mem_total, g_mem_leak;
+/* 2026-10-22 (memory footprint), SSBU_VK_BLOCKSMALL (default 1 on Android, 0 elsewhere): the blocks of buffers and compute
+ * buffers (classes 1-3) start at 4 MB and double with what the class already has, up to 64 MB. Marble fights: each of
+ * those classes had one 64 MB block with 1-5 MB used in it (the zero buffer alone held one), ~185 MB of RAM for nothing. */
+static int blocksmall_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("SSBU_VK_BLOCKSMALL");
+#ifdef SSBU_ANDROID
+        on = e ? atoi(e) != 0 : 1;
+#else
+        on = e && atoi(e);
+#endif
+    }
+    return on;
+}
 static VMem vmem_alloc(VkMemoryRequirements rq, VkFlags want, int cls) {
     VMem m = {-1, 0, 0, NULL, NULL};
     uint32_t type = 32;
@@ -205,7 +220,14 @@ static VMem vmem_alloc(VkMemoryRequirements rq, VkFlags want, int cls) {
         if (b == 2048) vkd_fail("out of memory blocks");
         VBlock *k = calloc(1, sizeof *k);
         VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-        k->size = rq.size > (16u << 20) ? rq.size : (64u << 20); k->type = type; k->cls = rq.size > (16u << 20) ? 100 + b : cls;      /* large: a block of its own */
+        k->size = rq.size > (16u << 20) ? rq.size : (64u << 20); k->type = type;
+        if (cls != 0 && rq.size <= (16u << 20) && blocksmall_on()) {      /* see blocksmall_on */
+            uint64_t have = 0, sz = 4u << 20;
+            for (int o = 0; o < g_nblk; o++) if (g_blk[o] && g_blk[o]->type == type && g_blk[o]->cls == cls) have += g_blk[o]->size;
+            while (sz < have && sz < (64u << 20)) sz <<= 1;
+            while (sz < rq.size + rq.alignment) sz <<= 1;
+            k->size = sz;
+        } k->cls = rq.size > (16u << 20) ? 100 + b : cls;      /* large: a block of its own */
         ai.allocationSize = k->size; ai.memoryTypeIndex = type;
         VkResult r = vkAllocateMemory(V.device, &ai, NULL, &k->mem);
         if (r != VK_SUCCESS) vkd_fail("vkAllocateMemory of %llu MB (type %u): %s; %lld MB allocated so far", (unsigned long long)(k->size >> 20), type, vk_result_name(r), (long long)(g_mem_total >> 20));
@@ -500,10 +522,64 @@ static void cmd_wait_all(void) { cmd_submit(NULL, NULL); for (int i = 0; i < NSL
 /* ---------------------------------------------------------------- stream ring */
 #define RING_ALIGN 256
 static void cb_ring_wrap(void);
+/* 2026-10-22 (memory footprint), SSBU_VK_RINGSEG (default 1 on Android, 0 elsewhere): the ring is cut into RSEG_N segments;
+ * each remembers the newest submission that may read it (an allocation or an address-cache hit in it). A wrap no longer
+ * waits for the whole GPU: before the ring is written past g_ring_clear, the segments ahead are waited for one at a time
+ * (their submission + 1: a range taken while one command buffer was recorded may be named in the next one after a submit
+ * in between), which a lap later have long finished. Before, every wrap drained the GPU (Marble fights: one every ~27
+ * frames with 256 MB), which is why the ring was large; now it is 64 MB on Android (SSBU_VK_RING_MB; Marble fight: 272
+ * wraps in 3600 frames, not one segment wait; the largest range 10 MB of the 32 MB a range may now take). The mask words of
+ * compute dispatches (cb_masks) are read from the ring once their dispatches have run: a segment that still holds one not
+ * read takes the old way (everything waited for, cb_ring_wrap). */
+#define RSEG_N 64
+typedef struct { uint64_t wm_off; uint32_t written; int16_t cb[16]; } CDisp;      /* compute dispatches whose mask words are not read yet (cb_masks) */
+static CDisp g_cdisp[2048];
+static int g_ncdisp;
+static int g_rseg_on = -1, g_rseg_shift;
+static uint64_t g_rseg_serial[RSEG_N], g_ring_clear;
+static LONG64 g_rseg_waits, g_rseg_wait_tk, g_rseg_drains, g_ring_maxn;
+static int ringseg_on(void) {
+    if (g_rseg_on < 0) {
+        const char *e = getenv("SSBU_VK_RINGSEG");
+#ifdef SSBU_ANDROID
+        g_rseg_on = e ? atoi(e) != 0 : 1;
+#else
+        g_rseg_on = e && atoi(e);
+#endif
+    }
+    return g_rseg_on;
+}
+static inline void ring_touch(uint64_t off, uint64_t n) {
+    if (g_rseg_on <= 0 || !n) return;
+    for (uint64_t k = off >> g_rseg_shift, e = (off + n - 1) >> g_rseg_shift; k <= e; k++) g_rseg_serial[k] = R.serial + 1;
+}
+static void ring_clear_to(uint64_t end) {          /* the ring up to `end` may be written: what read it in the last lap has finished */
+    while (g_ring_clear < end) {
+        uint64_t k = g_ring_clear >> g_rseg_shift, lo = k << g_rseg_shift, hi = lo + ((uint64_t)1 << g_rseg_shift);
+        uint64_t want = g_rseg_serial[k] ? g_rseg_serial[k] + 1 : 0;
+        int masks = 0;
+        for (int i = 0; i < g_ncdisp && !masks; i++) masks = g_cdisp[i].wm_off >= lo && g_cdisp[i].wm_off < hi;
+        if (masks) { cmd_wait_all(); cb_ring_wrap(); g_rseg_drains++; }
+        else if (want > R.done) {
+            LONG64 t0 = tk();
+            if (want > R.serial) { cmd_submit(NULL, NULL); if (want > R.serial) want = R.serial; }
+            for (int i = 0; i < NSLOT; i++) if (R.slot[i].pending && R.slot[i].serial <= want) slot_wait(&R.slot[i]);
+            if (R.done < want) R.done = want;
+            g_rseg_waits++; g_rseg_wait_tk += tk() - t0;
+        }
+        g_rseg_serial[k] = 0; g_ring_clear = hi;
+    }
+}
 static uint64_t ring_raw(const void *p, uint64_t n) {
     R.ring_pos = (R.ring_pos + RING_ALIGN - 1) & ~(uint64_t)(RING_ALIGN - 1);
-    if (n > R.ring_size / 4) vkd_fail("a range of %llu bytes does not fit the stream ring (%llu MB)", (unsigned long long)n, (unsigned long long)(R.ring_size >> 20));
-    if (R.ring_pos + n > R.ring_size) { cmd_wait_all(); cb_ring_wrap(); R.ring_pos = 0; R.gen++; R.ring_wraps++; }     /* everything that reads the ring has finished */
+    if ((LONG64)n > g_ring_maxn) g_ring_maxn = (LONG64)n;
+    if (n > R.ring_size / (g_rseg_on > 0 ? 2 : 4)) vkd_fail("a range of %llu bytes does not fit the stream ring (%llu MB)", (unsigned long long)n, (unsigned long long)(R.ring_size >> 20));
+    if (g_rseg_on > 0) {
+        if (R.ring_pos + n > R.ring_size) { R.ring_pos = 0; g_ring_clear = 0; R.gen++; R.ring_wraps++; }      /* the address cache names nothing of the last lap */
+        if (R.ring_pos + n > g_ring_clear) ring_clear_to(R.ring_pos + n);
+        ring_touch(R.ring_pos, n);
+    }
+    else if (R.ring_pos + n > R.ring_size) { cmd_wait_all(); cb_ring_wrap(); R.ring_pos = 0; R.gen++; R.ring_wraps++; }     /* everything that reads the ring has finished */
     uint64_t off = R.ring_pos;
     if (p) memcpy((uint8_t *)R.ring_mem.map + off, p, (size_t)n);
     R.ring_pos += n;
@@ -513,7 +589,7 @@ static uint64_t ring_put(uint64_t addr, uint64_t size) {
     unsigned h = (unsigned)(((addr >> 4) ^ (size * 0x9E3779B1u)) * 2654435761u) >> 19;
     for (int probe = 0; probe < 8; probe++) {
         unsigned i = (h + (unsigned)probe) & 8191;
-        if (R.acache[i].gen == R.gen && R.acache[i].addr == addr && R.acache[i].size == size) return R.acache[i].off;
+        if (R.acache[i].gen == R.gen && R.acache[i].addr == addr && R.acache[i].size == size) { ring_touch(R.acache[i].off, size); return R.acache[i].off; }
         if (R.acache[i].gen != R.gen) { h = i; break; }
     }
     uint64_t off = ring_raw(P(addr), size);
@@ -1916,10 +1992,8 @@ static void cg_unguard(int i) {
     if (g_cg[i].hi) { DWORD old; VirtualProtect((void *)g_cg[i].lo, g_cg[i].hi - g_cg[i].lo, g_cg[i].old, &old); g_cg[i].lo = g_cg[i].hi = 0; }
     ReleaseSRWLockExclusive(&g_cg_lock);
 }
-typedef struct { uint64_t wm_off; uint32_t written; int16_t cb[16]; } CDisp;
 static CB g_cb[256];
-static CDisp g_cdisp[2048];
-static int g_ncdisp, g_cb_live, g_cb_pending, g_cb_cached = -1;
+static int g_cb_live, g_cb_pending, g_cb_cached = -1;
 static uint64_t g_cb_serial;                       /* the submission the pending CBs wait for */
 /* SSBU_VK_CBKEEP: the buffer's bytes go to guest memory. With the snapshot of the fill (SSBU_VK_CBMERGE, the default) only
  * the words compute changed since the fill are written, and a word the game changed since then stays the game's. */
@@ -3840,6 +3914,46 @@ static void prep_first_hold(LONG64 frame) {
     fflush(stdout);
 }
 static void vk_present(void *arg) { vk_present2(arg, 0); }
+/* 2026-10-22 (memory footprint): where our device memory goes, every 600 frames on Android (SSBU_VK_MEMREPORT=1 elsewhere,
+ * =0 off): the live images by kind (block-compressed textures, other textures, images the GPU wrote = targets, scaled
+ * targets), the blocks by class with what is free inside them, and the largest images. */
+static void mem_report(LONG64 frame) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("SSBU_VK_MEMREPORT");
+#ifdef SSBU_ANDROID
+        on = e ? atoi(e) : 1;
+#else
+        on = e && atoi(e);
+#endif
+    }
+    if (!on) return;
+    LONG64 n[5] = {0}, by[5] = {0};
+    VTex *top[6] = {0};
+    static const char *kn[5] = {"compressed textures", "other textures", "GPU-written images", "scaled targets", "no texture record"};
+    for (VTex *vt = g_vtex_all; vt; vt = vt->next) {
+        int k = !vt->t ? 4 : vt->rs ? 3 : vt->t->gpu_written ? 2 : vt->bw > 1 ? 0 : 1;
+        n[k]++; by[k] += (LONG64)vt->mem.size;
+        for (int i = 0; i < 6; i++) if (!top[i] || vt->mem.size > top[i]->mem.size) { memmove(&top[i + 1], &top[i], sizeof top[0] * (size_t)(5 - i)); top[i] = vt; break; }
+    }
+    printf("nvn_vk_mem: frame %lld: images:", (long long)frame);
+    for (int k = 0; k < 5; k++) if (n[k]) printf(" %s %lld (%lld MB)", kn[k], (long long)n[k], (long long)(by[k] >> 20));
+    LONG64 cs[5] = {0}, cf[5] = {0}; int cn[5] = {0};
+    for (int b = 0; b < g_nblk; b++) {
+        VBlock *k = g_blk[b];
+        if (!k) continue;
+        int c = k->cls >= 100 ? 4 : k->cls;
+        LONG64 fr = 0;
+        for (int i = 0; i < k->nfree; i++) fr += (LONG64)k->fr[i].size;
+        cn[c]++; cs[c] += (LONG64)k->size; cf[c] += fr;
+    }
+    printf(" | blocks (MB, free inside):");
+    static const char *cname[5] = {"images", "buffers", "host compute", "device compute", "large"};
+    for (int c = 0; c < 5; c++) if (cn[c]) printf(" %s %d = %lld (%lld free)", cname[c], cn[c], (long long)(cs[c] >> 20), (long long)(cf[c] >> 20));
+    printf(" | largest:");
+    for (int i = 0; i < 6 && top[i]; i++) printf(" %dx%dx%d L%d l%d fmt %d %s %.1f MB;", top[i]->w, top[i]->h, top[i]->d, top[i]->levels, top[i]->layers, (int)top[i]->fmt,
+                                                top[i]->t && top[i]->t->gpu_written ? "gpu" : "tex", (double)top[i]->mem.size / 1048576.0);
+    printf("\n");
+}
 static void vk_present2(void *arg, int progress) {
     PresentJob *j = arg;
     static int shot = -2, every, shot_from;
@@ -4132,6 +4246,12 @@ swap: ;
         printf("nvn_vk: totals at frame %lld: %lld images made (%lld live, %lld views), %lld uploads (%lld MB), %lld shader modules, %lld pipelines, %lld descriptor sets, %lld command buffers, %lld ring wraps, %lld feedback passes, %lld MB device memory\n",
                (long long)frame, (long long)R.images, (long long)R.images_live, (long long)R.views, (long long)R.uploads, (long long)(R.upload_bytes >> 20), (long long)R.modules, (long long)R.pipelines, (long long)R.sets,
                (long long)R.flushes, (long long)R.ring_wraps, (long long)R.feedback, (long long)(g_mem_total >> 20));
+    if (frame % 600 == 0) mem_report(frame);
+    if (frame % 600 == 0 && g_rseg_on > 0) {
+        LARGE_INTEGER fq; QueryPerformanceFrequency(&fq);
+        printf("nvn_vk_ring: frame %lld: %llu MB ring, %lld wraps, %lld segment waits (%.1f ms in all), %lld full waits for mask words, largest range %lld KB (SSBU_VK_RINGSEG)\n", (long long)frame, (unsigned long long)(R.ring_size >> 20),
+               (long long)R.ring_wraps, (long long)g_rseg_waits, (double)g_rseg_wait_tk * 1000.0 / (double)fq.QuadPart, (long long)g_rseg_drains, (long long)(g_ring_maxn >> 10));
+    }
     if (frame % 600 == 0 && blockfree_on()) printf("nvn_vk: frame %lld: %lld empty memory blocks of 64 MB given back to the driver so far (SSBU_VK_BLOCKFREE)\n", (long long)frame, (long long)g_blk_freed);
     if (frame % 600 == 0 && lazymod_on()) {        /* nvn_vk_m4.c, lazy modules */
         LARGE_INTEGER fq; QueryPerformanceFrequency(&fq);
@@ -4332,7 +4452,13 @@ static void vkd_init(void) {
         VKC(vkAllocateCommandBuffers(V.device, &ai, &R.slot[i].cmd));
         VKC(vkCreateFence(V.device, &fi, NULL, &R.slot[i].fence));
     }
-    R.ring_size = 256ull << 20;
+    {   const char *e = getenv("SSBU_VK_RING_MB");
+        int mb = e && atoi(e) >= 16 ? atoi(e) : ringseg_on() ? 64 : 256;
+        mb = 1 << (31 - __builtin_clz((unsigned)mb));      /* a power of two (the segments) */
+        R.ring_size = (uint64_t)mb << 20;
+        g_rseg_shift = 31 - __builtin_clz((unsigned)(R.ring_size / RSEG_N));
+        if (ringseg_on()) g_ring_clear = R.ring_size;     /* the first lap: nothing read it yet */
+    }
     R.ring = vbuf_new(R.ring_size, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, &R.ring_mem);      /* TRANSFER_DST: cb_assemble */
     R.zero = vbuf_new(65536 + 64, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &R.zero_mem);
     memset(R.zero_mem.map, 0, 65536 + 64);
