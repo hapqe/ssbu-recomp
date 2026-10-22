@@ -3397,6 +3397,7 @@ static void vk_sync_wait(void *arg) {
  * waiting to go back to guest memory. Then no job goes through the render thread's queue: the game used to wait there
  * for the replay of everything it had queued since (Marble, a fight: ~10 % of the game thread's time). */
 static LONG64 g_fence_fast;
+int nvn_vk_fence_early(void) { return fence_early_on(); }
 int nvn_vk_sync_fast(SyncObj *o) {
     if (!fence_early_on() || !V.alive || o->dead || o->in_cmdbuf || g_cb_pending) return 0;
     LONG posted = o->posted;

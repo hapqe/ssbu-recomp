@@ -37,6 +37,9 @@
  *
  * NVN enum values and argument orders: public nvn.h (open-ead/nnheaders), checked against the trace.
  * Maxwell encodings: envytools envydis/gm107.c. */
+#ifdef SSBU_ANDROID
+#include <pthread.h>
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -3815,6 +3818,7 @@ static DWORD WINAPI render_thread(LPVOID arg) {
     g_render_tid = GetCurrentThreadId();
 #ifdef SSBU_ANDROID
     { void android_adpf_register_thread(void); android_adpf_register_thread(); }      /* android/runtime/adpf.c: the render thread works on every frame */
+    pthread_setname_np(pthread_self(), "nvn render");
 #endif
     {   /* Round 17, MEASUREMENT: SSBU_RENDER_PRIO=1 above normal, 2 highest (default: normal, as before). The game's own
          * threads run above normal when the game asked for a priority under 16 (os_threads.c host_priority). */
@@ -5002,8 +5006,9 @@ static void sync_wait(Ctx *c) {                         /* (sync, timeoutNs) -> 
     L1T("sync wait %llx%s", (unsigned long long)A0, hobj(A0, K_SYNC) == g_window_sync ? " (WINDOW texture)" : "");
     SyncObj *o = hobj(A0, K_SYNC);
     SyncJob j = {o, 0, A1, 3, 0};
-    int nvn_vk_sync_fast(SyncObj *o);                  /* nvn_vk_draw.c: answered here, without a trip through the render thread's queue */
+    int nvn_vk_sync_fast(SyncObj *o), nvn_vk_fence_early(void);      /* nvn_vk_draw.c: answered here, without a trip through the render thread's queue */
     if (o && g_vk && nvn_vk_sync_fast(o)) j.result = 1;
+    else if (o && g_vk && o == g_window_sync && !o->s && !o->posted && !o->in_cmdbuf && nvn_vk_fence_early()) j.result = 3;      /* the window texture's sync, never fenced: straight to the refresh wait below (the trip through the queue was ~6 % of the game thread's time) */
     else if (o) gl_run(g_rb->sync_wait, &j);
     if (o && o == g_window_sync && A1 && j.result == 3) {      /* P3 round 3: the window texture's sync (never fenced by us): it is free at the refresh that shows the queued frame (display.c) */
         if (l1_pipe_wait()) j.result = 1; else {      /* L1 round 2: pipe mode does not hold here */

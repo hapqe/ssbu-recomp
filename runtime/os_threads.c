@@ -10,6 +10,9 @@
 #include <windows.h>
 #include "runtime.h"
 #include "hostrt.h"
+#ifdef SSBU_ANDROID
+#include <pthread.h>
+#endif
 /* L1 round 3, TEST ONLY: guest sync calls during the SSBU_L1_TRACE window (display.c) */
 #ifdef _WIN32
 int display_l1_trace(void); double display_l1_ms(void); const char *guest_thread_name_of(unsigned long tid);
@@ -282,6 +285,9 @@ const char *guest_thread_name_of(DWORD tid) {
 static DWORD WINAPI thread_main(LPVOID arg) {
     Obj *o = arg;
     t_thread = o->key;
+#ifdef SSBU_ANDROID
+    if (o->name) { char n[16]; snprintf(n, sizeof n, "%s", (const char *)(uintptr_t)o->name); pthread_setname_np(pthread_self(), n); }      /* named before it started */
+#endif
     { void display_perf_thread(void); display_perf_thread(); }      /* track V session 14: the game's threads on the performance cores of a hybrid CPU (display.c; SSBU_PCORES=0 off) */
     Ctx *c = new_ctx(o->stack + o->stack_size);
     wr64(c->tpidr + 0x1f8, o->key);                   /* Horizon thread-local region: the ThreadType pointer lives at +0x1f8 */
@@ -375,6 +381,14 @@ static void os_DestroyThread(Ctx *c) { Obj *o = obj(A0); if (o->thread) { CloseH
 static void os_SetThreadName(Ctx *c) {               /* the guest string may be a temporary: keep a copy */
     char *copy = _strdup((const char *)(uintptr_t)A1);
     obj(A0)->name = (uint64_t)(uintptr_t)copy;
+#ifdef SSBU_ANDROID
+    {   /* Android: the host thread gets the name too (15 characters), so that profilers and /proc tell the game's threads apart */
+        Obj *o = obj(A0);
+        HANDLE h = o->thread ? o->thread : (A0 == (uint64_t)(uintptr_t)g_main_thread || A0 == t_thread) ? GetCurrentThread() : NULL;
+        if (h && copy) { wchar_t w[16]; int i = 0; for (; copy[i] && i < 15; i++) w[i] = (unsigned char)copy[i]; w[i] = 0; SetThreadDescription(h, w); }
+        if (!o->thread && copy && (A0 == (uint64_t)(uintptr_t)g_main_thread || A0 == t_thread)) { char n[16]; snprintf(n, sizeof n, "%s", copy); pthread_setname_np(pthread_self(), n); }
+    }
+#endif
 }
 static void os_GetCurrentThread(Ctx *c) { RET(t_thread ? t_thread : (uint64_t)g_main_thread); }
 static Obj *thread_obj(uint64_t key);
@@ -872,6 +886,9 @@ static void pthread_release(Obj *o) {                 /* after the thread ended 
 static DWORD WINAPI pthread_main(LPVOID arg) {
     Obj *o = arg;
     t_thread = o->key;
+#ifdef SSBU_ANDROID
+    if (o->name) { char n[16]; snprintf(n, sizeof n, "%s", (const char *)(uintptr_t)o->name); pthread_setname_np(pthread_self(), n); }
+#endif
     Ctx *c = new_ctx(o->stack + o->stack_size);
     wr64(c->tpidr + 0x1f8, o->key);                   /* the ThreadType pointer, as for nn::os threads */
     LONG slot = InterlockedIncrement(&g_threads_n) - 1;
