@@ -423,6 +423,27 @@ static const char *type_name(int t) {
     static const char *const n[] = {"unknown", "standard", "Xbox 360", "Xbox One", "PS3", "PS4", "PS5", "Switch Pro", "Joy-Con left", "Joy-Con right", "Joy-Con pair", "GameCube"};
     return t >= 0 && t < (int)(sizeof n / sizeof n[0]) ? n[t] : "other";
 }
+#ifdef SSBU_ANDROID
+/* Android: SDL makes up a mapping from the buttons / axes a pad reports (SDL_gamepad.c SDL_CreateMappingForAndroidGamepad),
+ * but not for Nintendo's pads other than the Joy-Cons (a Switch / Switch 2 Pro Controller that HIDAPI does not open comes
+ * in as a joystick without one). Its raw buttons are in SDL's order there (SDL_sysjoystick.c keycode_to_SDL: b0 south ..
+ * b14 d-pad right) and the GUID carries the masks of them, so the same made-up mapping is added for it here. */
+static void android_mapping(SDL_JoystickID id) {
+    static const char *const bn[15] = {"a", "b", "x", "y", "back", "guide", "start", "leftstick", "rightstick", "leftshoulder", "rightshoulder", "dpup", "dpdown", "dpleft", "dpright"};
+    static const char *const an[6] = {"leftx", "lefty", "rightx", "righty", "lefttrigger", "righttrigger"};
+    SDL_GUID g = SDL_GetJoystickGUIDForID(id);
+    int bm = g.data[12] | g.data[13] << 8, am = g.data[14] | g.data[15] << 8;
+    char m[1024], gs[33], name[128];
+    if (!(bm & 15)) return;                                                       /* no face buttons: not a pad */
+    SDL_GUIDToString(g, gs, sizeof gs);
+    snprintf(name, sizeof name, "%s", SDL_GetJoystickNameForID(id) ? SDL_GetJoystickNameForID(id) : "Android pad");
+    for (char *p = name; *p; p++) if (*p == ',') *p = ' ';
+    int n = snprintf(m, sizeof m, "%s,%s,", gs, name);
+    for (int i = 0; i < 15; i++) if (bm & 1 << i) n += snprintf(m + n, sizeof m - n, "%s:b%d,", bn[i], i);
+    for (int i = 0; i < 6; i++) if (am & 1 << i) n += snprintf(m + n, sizeof m - n, "%s:a%d,", an[i], i);
+    if (SDL_AddGamepadMapping(m) >= 0) say("nn::pad: \"%s\" had no mapping; made one from its buttons: %s\n", name, m);
+}
+#endif
 static void dev_add(SDL_JoystickID id) {
     Dev *d = NULL;
     for (int i = 0; i < MAXDEV && !d; i++) if (!g_dev[i].used) d = &g_dev[i];
@@ -434,6 +455,9 @@ static void dev_add(SDL_JoystickID id) {
     SDL_GUIDToString(SDL_GetJoystickGUIDForID(id), d->guid, sizeof d->guid);
     snprintf(d->name, sizeof d->name, "%s", SDL_GetJoystickNameForID(id) ? SDL_GetJoystickNameForID(id) : "?");
     if (g_only_virtual && !d->virt) { d->ignored = 1; return; }
+#ifdef SSBU_ANDROID
+    if (!d->virt && !SDL_IsGamepad(id)) android_mapping(id);
+#endif
     if (SDL_IsGamepad(id)) { d->gp = SDL_OpenGamepad(id); if (d->gp) d->js = SDL_GetGamepadJoystick(d->gp); }
     else d->js = SDL_OpenJoystick(id);
     if (!d->js) { d->ignored = 1; return; }
