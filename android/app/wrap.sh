@@ -5,4 +5,6 @@
 # libguestreserve.so (android/runtime/guest_reserve.c) reserves the guest's range first thing.
 D="$(dirname "$0")"
 export LD_PRELOAD="$D/libguestreserve.so${LD_PRELOAD:+:$LD_PRELOAD}"
+# development: extra variables for this start (malloc debug and the like) from the app's own files folder, when present
+[ -r /data/data/me.hapke.opensmash/files/wrap.env ] && . /data/data/me.hapke.opensmash/files/wrap.env
 exec "$D/libnoaslr.so" "$@"

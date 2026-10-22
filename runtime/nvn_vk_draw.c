@@ -3356,12 +3356,30 @@ static void vk_housekeeping(void *arg) { (void)arg; if (V.alive) nvn_front_take_
 static void vk_flush(void *arg) { (void)arg; if (V.alive) cmd_submit(NULL, NULL); }
 static void vk_finish(void *arg) { (void)arg; if (V.alive) cmd_wait_all(); }
 static void vk_fence(void *arg) { SyncJob *j = arg; if (j->o->dead || !V.alive) return; j->o->s = (void *)(uintptr_t)(cmd_submit(NULL, NULL) + 1); }
+/* The game waits for the fence of its previous frame before it submits the next one (nvn_gl.c, L1 PIPE). Here the GPU
+ * never reads guest memory: vertices, uniforms, textures and compute inputs are copied when the commands are replayed,
+ * read-backs into guest memory (texel reads, texture-to-buffer copies) wait for the GPU themselves, and objects the game
+ * frees go to the garbage list until their command buffer has finished. So once the render thread has replayed and
+ * submitted everything before the fence (this job runs after it, in order) the game may go on; only compute results still
+ * to be copied back into guest memory need the GPU itself. Waiting for the GPU there put the replay of a frame and the
+ * GPU's work on it one after the other (Marble, a fight: replay ~7 ms + GPU ~13 ms = 20 ms a frame, never 60 fps); now
+ * the replay of the next frame runs while the GPU works on this one. The command-buffer slots (NSLOT) and the display's
+ * tick bound how far ahead the game gets. SSBU_VK_FENCE_EARLY=0: the fence is the GPU's, as before (default on Android). */
+#ifdef SSBU_ANDROID
+#define VK_FENCE_EARLY_DEFAULT 1
+#else
+#define VK_FENCE_EARLY_DEFAULT 0
+#endif
+static LONG64 g_fence_early, g_fence_gpu;
+static int fence_early_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("SSBU_VK_FENCE_EARLY"); on = e ? atoi(e) != 0 : VK_FENCE_EARLY_DEFAULT; printf("nvn_vk: fences %s (SSBU_VK_FENCE_EARLY)\n", on ? "signal once the render thread has submitted the work before them; compute results that go back to guest memory still wait for the GPU" : "signal when the GPU has finished the work before them"); } return on; }
 static void vk_sync_wait(void *arg) {
     SyncJob *j = arg;
     uint64_t want = (uint64_t)(uintptr_t)j->o->s;
     if (!want || !V.alive) { j->result = 3; return; }       /* never fenced */
     want--;
     if (want <= R.done) { j->result = 0; return; }
+    if (fence_early_on() && !(g_cb_pending && g_cb_serial <= want)) { cb_poll(); g_fence_early++; j->result = 1; return; }
+    g_fence_gpu++;
     for (int i = 0; i < NSLOT; i++) {
         Slot *s = &R.slot[i];
         if (!s->pending || s->serial != want) continue;
@@ -4238,6 +4256,7 @@ static void frstat_report(void) {
         printf("nvn_vk_first: %lld battle frames, %lld of them over 20 ms between presents | frames in which a pipeline was drawn for the first time: %lld (%lld pipelines: %lld linked at the draw from ready stage libraries, %lld compiled or waited for, %lld in a pass signature never seen; %.2f ms in all making them) | of those frames over 20 ms: %lld (%lld of them also made or read a texture at its use)\n",
                (long long)g_fu_fight_frames, (long long)g_fu_fight_slow, (long long)g_fu_frames, (long long)g_fu_total, (long long)g_fu_linked, (long long)g_fu_made, (long long)g_fu_newsig, (double)g_fu_tk * 1000.0 / (double)fq.QuadPart, (long long)g_fu_slow, (long long)g_fu_slow_tex);
     }
+    printf("nvn_vk: fence waits of the game: %lld answered once the work before them was submitted, %lld waited for the GPU (compute results to copy back, or SSBU_VK_FENCE_EARLY=0)\n", (long long)g_fence_early, (long long)g_fence_gpu);
     if (g_pe_on > 0) printf("nvn_vk_split: %lld times the targets of the open pass were set again (the pass went on)\n", (long long)g_targets_kept);
     if (g_pe_on > 0) for (int k = 0; k < g_pe_nk; k++) {      /* SSBU_VK_SPLITLOG */
         const char *sym = "?"; long off = 0;

@@ -1635,7 +1635,7 @@ static void prewarm_start(void) {
         snprintf(g_pcache_path, sizeof g_pcache_path, "%s/pipelines_%04x_%04x_%08x.bin", vkc_dir(), (unsigned)V.props.vendorID, (unsigned)V.props.deviceID, (unsigned)V.props.driverVersion);
         LONG64 tp0 = tk(), tp1;
         LARGE_INTEGER pfq; QueryPerformanceFrequency(&pfq);
-        FILE *fp = fopen(g_pcache_path, "rb");
+        FILE *fp = getenv("SSBU_VK_PCACHE_LOAD") && !atoi(getenv("SSBU_VK_PCACHE_LOAD")) ? NULL : fopen(g_pcache_path, "rb");
         if (fp) { _fseeki64(fp, 0, SEEK_END); long long n = _ftelli64(fp); _fseeki64(fp, 0, SEEK_SET); if (n > 0 && (data = malloc((size_t)n)) && fread(data, 1, (size_t)n, fp) == (size_t)n) { ci.initialDataSize = (size_t)n; ci.pInitialData = data; } fclose(fp); }
         tp1 = tk();
         if (vkCreatePipelineCache(V.device, &ci, NULL, &g_pcache) != VK_SUCCESS) { ci.initialDataSize = 0; ci.pInitialData = NULL; VKC(vkCreatePipelineCache(V.device, &ci, NULL, &g_pcache)); }
