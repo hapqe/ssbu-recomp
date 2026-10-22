@@ -1699,6 +1699,7 @@ static int piperec_cmp(const void *a, const void *b) { return memcmp(a, b, sizeo
 static void prewarm_start(void) {
     InitializeCriticalSection(&g_sh_lock); InitializeCriticalSection(&g_gpl_lock);
     InitializeConditionVariable(&g_sh_cv); InitializeConditionVariable(&g_jq_cv);
+    if (lazymod_on()) printf("nvn_vk: lazy shader modules: a stage's module is released once its library or compute pipeline is made (SSBU_VK_LAZYMOD=0 keeps them)\n");      /* first call here, before any worker: it initialises g_mod_lock */
     CreateDirectoryA(vkc_dir(), NULL); CreateDirectoryA(vkc_file("spv"), NULL); CreateDirectoryA(vkc_file("stage"), NULL);
     if (getenv("SSBU_VK_CACHE")) printf("nvn_vk: cache folder %s (SSBU_VK_CACHE)\n", vkc_dir());
     {   HMODULE m = LoadLibraryA("ssbu_glslang.dll");
