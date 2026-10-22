@@ -218,10 +218,36 @@ static VMem vmem_alloc(VkMemoryRequirements rq, VkFlags want, int cls) {
     vkd_fail("allocation of %llu bytes failed in a fresh block", (unsigned long long)rq.size);
     return m;
 }
+/* 2026-10-22: a 64 MB block left empty is given back to the driver when another empty block of its memory type and class
+ * is kept already (one spare each, so that a texture made and dropped again and again does not allocate a block every
+ * time). Before, the blocks stayed until shutdown: the device memory of a session was the most it had ever needed at once
+ * (Marble: 640 MB at the first menus, 960 MB after one fight), and on a phone that memory is the system's RAM.
+ * SSBU_VK_BLOCKFREE=0: kept as before (the default off the Android build). */
+static LONG64 g_blk_freed;
+static int blockfree_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("SSBU_VK_BLOCKFREE");
+#ifdef SSBU_ANDROID
+        on = e ? atoi(e) != 0 : 1;
+#else
+        on = e && atoi(e);
+#endif
+    }
+    return on;
+}
 static void vmem_free(VMem m) {
     if (m.block < 0) return;
     VBlock *k = g_blk[m.block];
     if (--k->used == 0 && k->cls >= 100) { vkFreeMemory(V.device, k->mem, NULL); g_mem_total -= (LONG64)k->size; free(k); g_blk[m.block] = NULL; return; }
+    if (k->used == 0 && blockfree_on()) {
+        for (int b = 0; b < g_nblk; b++) {
+            VBlock *o = g_blk[b];
+            if (b == m.block || !o || o->used || o->type != k->type || o->cls != k->cls) continue;
+            vkFreeMemory(V.device, k->mem, NULL); g_mem_total -= (LONG64)k->size; free(k); g_blk[m.block] = NULL; g_blk_freed++;
+            return;
+        }
+    }
     int i = 0;
     while (i < k->nfree && k->fr[i].off < m.off) i++;
     if (i > 0 && k->fr[i - 1].off + k->fr[i - 1].size == m.off) { k->fr[i - 1].size += m.size; if (i < k->nfree && k->fr[i].off == m.off + m.size) { k->fr[i - 1].size += k->fr[i].size; memmove(&k->fr[i], &k->fr[i + 1], sizeof k->fr[0] * (size_t)(k->nfree - i - 1)); k->nfree--; } return; }
@@ -4106,6 +4132,7 @@ swap: ;
         printf("nvn_vk: totals at frame %lld: %lld images made (%lld live, %lld views), %lld uploads (%lld MB), %lld shader modules, %lld pipelines, %lld descriptor sets, %lld command buffers, %lld ring wraps, %lld feedback passes, %lld MB device memory\n",
                (long long)frame, (long long)R.images, (long long)R.images_live, (long long)R.views, (long long)R.uploads, (long long)(R.upload_bytes >> 20), (long long)R.modules, (long long)R.pipelines, (long long)R.sets,
                (long long)R.flushes, (long long)R.ring_wraps, (long long)R.feedback, (long long)(g_mem_total >> 20));
+    if (frame % 600 == 0 && blockfree_on()) printf("nvn_vk: frame %lld: %lld empty memory blocks of 64 MB given back to the driver so far (SSBU_VK_BLOCKFREE)\n", (long long)frame, (long long)g_blk_freed);
     if (frame % 600 == 0 && lazymod_on()) {        /* nvn_vk_m4.c, lazy modules */
         LARGE_INTEGER fq; QueryPerformanceFrequency(&fq);
         printf("nvn_vk_lazymod: frame %lld: %lld shader modules released after their library / compute pipeline was made (%lld still held), %lld made again from their file for a later pipeline (%.0f ms in all, longest %.1f ms)\n",
