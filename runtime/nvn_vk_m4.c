@@ -13,6 +13,13 @@
  *     clamp and the sample mask are dynamic state, so the key is (stages, topology class, pass formats, samples, logic op,
  *     sample shading): few keys per pair, which is what makes the prediction possible.
  * One lock (g_sh_lock) guards the stage table, the pipeline table, the signature / pair tables and the job queue. */
+#ifdef SSBU_ANDROID
+#include <sys/mman.h>                               /* the pipeline cache file, mapped (pcache_map_get, prewarm_start) */
+#include <sys/stat.h>
+#include <sys/statvfs.h>
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 typedef struct { uint8_t unit, dim, shadow; uint16_t binding; } VSmp;
 typedef struct VStage {
     uint64_t h, hb;                                /* h: this variant (code, constants, canonical key, forced outputs); hb: code and constants only */
@@ -22,6 +29,7 @@ typedef struct VStage {
     uint32_t local[3];
     VSmp smp[64];
     VkShaderModule mod; struct VStage *next, *next_h;
+    uint64_t spv; int mod_refs, mod_drop;          /* 2026-10-22 (lazy modules, stage_mod_get): spv = the hash of ..\cache\vk\spv\<spv>.spv; refs / drop under g_mod_lock */
     VkPipeline lib, lib2; volatile LONG lib_state, lib2_state;      /* session 9 (SSBU_VK_GPL=2): the stage's pipeline library; lib2: a vertex stage with the empty fragment shader state */
 } VStage;
 #define MX_VK_VERSION 6u                        /* part of every hash: change it when mx_translate's Vulkan text or these records change */
@@ -160,6 +168,68 @@ static VkShaderModule module_from_glsl(int stage, const char *glsl, const char *
     InterlockedIncrement64(&R.modules);
     return mod;
 }
+/* 2026-10-22, lazy modules (SSBU_VK_LAZYMOD; on by default on Android, off elsewhere). The driver keeps a copy of the SPIR-V
+ * in every VkShaderModule: on the Marble (Turnip) a fight had 10,429 modules of 93 KB on average, ~950 MB of the process's
+ * private memory, while a stage's module is used only to make its pipeline library (or a whole pipeline / its compute
+ * pipeline) and then not again. Now a stage's module is destroyed once its library or compute pipeline is made, and made
+ * again from ..\cache\vk\spv\<spv>.spv for every later pipeline that needs it (stage_mod_get / stage_mod_put; the
+ * driver's pipeline cache keys on the SPIR-V, so the same pipeline is found). A module is dropped only when its file is
+ * there; one that is in use is dropped when its last user puts it back (g_mod_lock). */
+static CRITICAL_SECTION g_mod_lock;
+static LONG64 g_mod_dropped, g_mod_loads, g_mod_load_tk, g_mod_load_max, g_mod_lost;
+static int lazymod_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("SSBU_VK_LAZYMOD");
+#ifdef SSBU_ANDROID
+        on = !(e && !atoi(e));
+#else
+        on = e && atoi(e);
+#endif
+        if (on) InitializeCriticalSection(&g_mod_lock);
+    }
+    return on && !g_offline;
+}
+static VkShaderModule stage_mod_get(VStage *v) {   /* any thread, no lock held: the module for one pipeline creation; give it back with stage_mod_put */
+    if (!lazymod_on()) return v->mod;
+    EnterCriticalSection(&g_mod_lock);
+    VkShaderModule m = v->mod;
+    if (m) v->mod_refs++;
+    LeaveCriticalSection(&g_mod_lock);
+    if (m || !v->spv) return m;
+    LONG64 t0 = tk();
+    if (!(m = module_from_spv(v->spv))) {
+        InterlockedIncrement64(&g_mod_lost);
+        vkd_fail("the SPIR-V file %s/spv/%016llx.spv of a stage whose module was released is gone or damaged (was the shader cache deleted while the game ran?)", vkc_dir(), (unsigned long long)v->spv);
+    }
+    LONG64 dt = tk() - t0;
+    InterlockedIncrement64(&g_mod_loads); InterlockedAdd64(&g_mod_load_tk, dt);
+    if (dt > g_mod_load_max) g_mod_load_max = dt;
+    return m;
+}
+static void stage_mod_put(VStage *v, VkShaderModule m) {
+    VkShaderModule kill = NULL;
+    if (!lazymod_on() || !m) return;
+    EnterCriticalSection(&g_mod_lock);
+    if (m == v->mod) { if (--v->mod_refs <= 0 && v->mod_drop) { kill = v->mod; v->mod = NULL; v->mod_refs = 0; } }
+    else kill = m;                                 /* made for this one creation */
+    LeaveCriticalSection(&g_mod_lock);
+    if (kill) vkDestroyShaderModule(V.device, kill, NULL);
+}
+static void stage_mod_release(VStage *v) {         /* the stage's library or compute pipeline is made: its module is not kept */
+    VkShaderModule kill = NULL;
+    char path[128];
+    if (!lazymod_on() || v->temp || !v->spv || !v->mod || v->mod_drop) return;
+    snprintf(path, sizeof path, "%s/spv/%016llx.spv", vkc_dir(), (unsigned long long)v->spv);
+    if (GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES) return;      /* not written (disk full?): the module stays */
+    EnterCriticalSection(&g_mod_lock);
+    if (!v->mod_drop) {
+        v->mod_drop = 1;
+        if (v->mod && v->mod_refs <= 0) { kill = v->mod; v->mod = NULL; }
+    }
+    LeaveCriticalSection(&g_mod_lock);
+    if (kill) { vkDestroyShaderModule(V.device, kill, NULL); InterlockedIncrement64(&g_mod_dropped); }
+}
 static int stage_rec_read(int s, uint64_t vh, StageRec *r) {
     char path[128];
     snprintf(path, sizeof path, "%s/stage/%d_%016llx.st", vkc_dir(), s, (unsigned long long)vh);
@@ -175,7 +245,7 @@ static void vstage_from_rec(VStage *v, const StageRec *r, uint64_t vh, VkShaderM
     v->h = vh; v->hb = r->hb; v->code_len = r->code_len; memcpy(v->key, r->key, 16); v->fo = r->fo;
     v->cbufs = r->cbufs; v->ssbos = r->ssbos; v->ssbo_w = r->ssbo_w; v->images = r->images; v->dep = r->dep; v->tex_units = r->tex_units; v->in_attr = r->in_attr; v->out_attr = r->out_attr;
     v->uses_alpha = r->uses_alpha; v->nsmp = r->nsmp; memcpy(v->smp, r->smp, sizeof v->smp);
-    v->mod = mod; v->ok = 1;
+    v->mod = mod; v->spv = r->spv; v->ok = 1;
 }
 static int key_fits(int s, const uint32_t *want, const uint32_t *have, uint32_t dep, uint32_t tex) {
     uint32_t da = s == 0 ? dep | dep << 16 : 0;      /* 2026-10-20: bit 16 + n of key[0] = attribute n decoded from A2B10G10R10 SNORM (records made before carry no such bits) */
@@ -234,6 +304,7 @@ static void vstage_build(VStage *v, const SSrc *src) {
             uint64_t spv_hash = 0;
             if (in.screen_scale) { InterlockedIncrement64(&g_rs_stages); if (strstr(out.glsl, "mx_fcs)")) InterlockedIncrement64(&g_rs_fcs); if (strstr(out.glsl, "mx_tf(")) InterlockedIncrement64(&g_rs_tf); }
             v->mod = module_from_glsl(s, out.glsl, what, &spv_hash);
+            v->spv = spv_hash;
             v->cbufs = out.cbufs; v->ssbos = out.ssbos; v->ssbo_w = out.ssbo_written; v->images = out.images; v->in_attr = out.in_attr; v->out_attr = out.out_attr;
             v->dep = s == 0 ? out.int_dep : 0; v->tex_units = out.tex_units; v->uses_alpha = out.uses_alpha; v->nsmp = out.nsmp;
             for (int i = 0; i < out.nsmp && i < 64; i++) {
@@ -457,8 +528,8 @@ static PairLib *pairlib_ensure(VStage *vs, VStage *fs, int samples, int sshade, 
     VkPipelineShaderStageCreateInfo st[2];
     memset(st, 0, sizeof st);
     st[0].sType = st[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    st[0].stage = VK_SHADER_STAGE_VERTEX_BIT; st[0].module = vs->mod; st[0].pName = "main";
-    st[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT; st[1].module = fs ? fs->mod : NULL; st[1].pName = "main";
+    st[0].stage = VK_SHADER_STAGE_VERTEX_BIT; st[0].module = stage_mod_get(vs); st[0].pName = "main";
+    st[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT; st[1].module = fs ? stage_mod_get(fs) : NULL; st[1].pName = "main";
     VkPipelineViewportStateCreateInfo vp = {VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
     vp.viewportCount = 1; vp.scissorCount = 1;
     VkPipelineRasterizationProvokingVertexStateCreateInfoEXT pv = {VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_PROVOKING_VERTEX_STATE_CREATE_INFO_EXT};
@@ -480,6 +551,7 @@ static PairLib *pairlib_ensure(VStage *vs, VStage *fs, int samples, int sshade, 
     gi.pNext = &gl; gi.flags = VK_PIPELINE_CREATE_LIBRARY_BIT_KHR | VK_PIPELINE_CREATE_RETAIN_LINK_TIME_OPTIMIZATION_INFO_BIT_EXT; gi.stageCount = fs ? 2 : 1; gi.pStages = st; gi.pViewportState = &vp; gi.pRasterizationState = &rs; gi.pMultisampleState = &ms;
     gi.pDepthStencilState = &ds; gi.pDynamicState = &dy; gi.layout = l->layout;
     VkResult r = pw_graphics(g_pcache, &gi, &l->lib);
+    stage_mod_put(vs, st[0].module); if (fs) stage_mod_put(fs, st[1].module);
     if (r != VK_SUCCESS) vkd_fail("vkCreateGraphicsPipelines, pair library (vertex stage %u, fragment stage %u): %s", vs->id, fs ? fs->id : 0, vk_result_name(r));
     LONG64 dt = tk() - t0;
     EnterCriticalSection(&g_sh_lock);
@@ -600,7 +672,7 @@ static VkPipeline stagelib_ensure(VStage *v, int alone, int *how) {
     *how = 1;
     int isfs = v->stage == 1;
     VkPipelineShaderStageCreateInfo st = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
-    st.stage = isfs ? VK_SHADER_STAGE_FRAGMENT_BIT : VK_SHADER_STAGE_VERTEX_BIT; st.module = v->mod; st.pName = "main";
+    st.stage = isfs ? VK_SHADER_STAGE_FRAGMENT_BIT : VK_SHADER_STAGE_VERTEX_BIT; st.module = stage_mod_get(v); st.pName = "main";
     VkPipelineViewportStateCreateInfo vp = {VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
     vp.viewportCount = 1; vp.scissorCount = 1;
     VkPipelineRasterizationProvokingVertexStateCreateInfoEXT pv = {VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_PROVOKING_VERTEX_STATE_CREATE_INFO_EXT};
@@ -634,6 +706,7 @@ static VkPipeline stagelib_ensure(VStage *v, int alone, int *how) {
         Sleep(50 << t);
         r = pw_graphics(t == 2 ? VK_NULL_HANDLE : g_pcache, &gi, lib);
     }
+    stage_mod_put(v, st.module);
     if (r != VK_SUCCESS) {
         FILE *mk = fopen("../cache/vk/no_stage_libraries.txt", "w");
         if (mk) { fprintf(mk, "The graphics driver refused a stage library (%s): the game uses whole pipelines from the next start. Delete this file to try the libraries again.\n", vk_result_name(r)); fclose(mk); }
@@ -645,6 +718,7 @@ static VkPipeline stagelib_ensure(VStage *v, int alone, int *how) {
     *state = 2;
     WakeAllConditionVariable(&g_sh_cv);
     LeaveCriticalSection(&g_sh_lock);
+    stage_mod_release(v);                          /* lazy modules: made again from its file when another pipeline needs it */
     if (GetCurrentThreadId() == g_render_tid) {
         g_gpl_draw++; g_gpl_draw_tk += dt; if (dt > g_gpl_draw_max) g_gpl_draw_max = dt;
         if (holdlog_on()) { LARGE_INTEGER fq; QueryPerformanceFrequency(&fq); printf("nvn_vk_hold: frame %lld (%s): STAGE LIBRARY compiled at the draw, %.2f ms: %s code %016llx (key %x %x %x %x, forced outputs %x)%s\n", (long long)nvn_front_frame_next(), g_in_fight ? "fight" : "no fight",
@@ -769,8 +843,8 @@ static double pipe_build(Pipe *p) {
     VkPipelineShaderStageCreateInfo st[2];
     memset(st, 0, sizeof st);
     st[0].sType = st[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    st[0].stage = VK_SHADER_STAGE_VERTEX_BIT; st[0].module = vs->mod; st[0].pName = "main";
-    st[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT; st[1].module = fs ? fs->mod : NULL; st[1].pName = "main";
+    st[0].stage = VK_SHADER_STAGE_VERTEX_BIT; st[0].module = stage_mod_get(vs); st[0].pName = "main";
+    st[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT; st[1].module = fs ? stage_mod_get(fs) : NULL; st[1].pName = "main";
     VkPipelineInputAssemblyStateCreateInfo ia = {VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
     ia.topology = k->topo_class == 0 ? VK_PRIMITIVE_TOPOLOGY_POINT_LIST : k->topo_class == 1 ? VK_PRIMITIVE_TOPOLOGY_LINE_LIST : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
     VkPipelineViewportStateCreateInfo vp = {VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
@@ -819,6 +893,7 @@ static double pipe_build(Pipe *p) {
     gi.pNext = &ri; gi.stageCount = fs ? 2 : 1; gi.pStages = st; gi.pInputAssemblyState = &ia; gi.pViewportState = &vp; gi.pRasterizationState = &rs; gi.pMultisampleState = &ms;
     gi.pDepthStencilState = &ds; gi.pColorBlendState = &cb; gi.pDynamicState = &dy; gi.layout = p->layout; NVK_VI_PIPE(k, dyn, &gi)
     VkResult r = pw_graphics(g_pcache, &gi, &p->p);
+    stage_mod_put(vs, st[0].module); if (fs) stage_mod_put(fs, st[1].module);
     if (r != VK_SUCCESS) vkd_fail("vkCreateGraphicsPipelines (vertex stage %u, fragment stage %u, %d colour targets, depth format %d): %s", k->vs, k->fs, k->ncolor, k->dfmt, vk_result_name(r));
     InterlockedIncrement64(&R.pipelines);
     EnterCriticalSection(&g_sh_lock);
@@ -1022,6 +1097,7 @@ static int compute_pipe_ensure(VStage *v) {
     LeaveCriticalSection(&g_sh_lock);
     if (how == 1) {
         compute_pipe_make(v);
+        stage_mod_release(v);
         EnterCriticalSection(&g_sh_lock);
         v->cp_state = 2;
         WakeAllConditionVariable(&g_sh_cv);
@@ -1635,13 +1711,30 @@ static void prewarm_start(void) {
         snprintf(g_pcache_path, sizeof g_pcache_path, "%s/pipelines_%04x_%04x_%08x.bin", vkc_dir(), (unsigned)V.props.vendorID, (unsigned)V.props.deviceID, (unsigned)V.props.driverVersion);
         LONG64 tp0 = tk(), tp1;
         LARGE_INTEGER pfq; QueryPerformanceFrequency(&pfq);
-        FILE *fp = getenv("SSBU_VK_PCACHE_LOAD") && !atoi(getenv("SSBU_VK_PCACHE_LOAD")) ? NULL : fopen(g_pcache_path, "rb");
+        int load = !(getenv("SSBU_VK_PCACHE_LOAD") && !atoi(getenv("SSBU_VK_PCACHE_LOAD")));
+        void *map = NULL;
+        size_t map_n = 0;
+#ifdef SSBU_ANDROID
+        if (load && !(getenv("SSBU_VK_PCMAP") && !atoi(getenv("SSBU_VK_PCMAP")))) {      /* 2026-10-22: mapped, not copied into a buffer of its size (pcache_map_get) */
+            int fd = open(g_pcache_path, O_RDONLY | O_CLOEXEC);
+            struct stat st;
+            if (fd >= 0) {
+                if (!fstat(fd, &st) && st.st_size > 0 && (map = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0)) != MAP_FAILED) { map_n = (size_t)st.st_size; madvise(map, map_n, MADV_SEQUENTIAL); ci.initialDataSize = map_n; ci.pInitialData = map; }
+                else map = NULL;
+                close(fd);
+            }
+        }
+#endif
+        FILE *fp = !load || map ? NULL : fopen(g_pcache_path, "rb");
         if (fp) { _fseeki64(fp, 0, SEEK_END); long long n = _ftelli64(fp); _fseeki64(fp, 0, SEEK_SET); if (n > 0 && (data = malloc((size_t)n)) && fread(data, 1, (size_t)n, fp) == (size_t)n) { ci.initialDataSize = (size_t)n; ci.pInitialData = data; } fclose(fp); }
         tp1 = tk();
         if (vkCreatePipelineCache(V.device, &ci, NULL, &g_pcache) != VK_SUCCESS) { ci.initialDataSize = 0; ci.pInitialData = NULL; VKC(vkCreatePipelineCache(V.device, &ci, NULL, &g_pcache)); }
         /* session 11: what the whole-file read costs at every start (file read, then the driver taking the data) */
         printf("nvn_vk: pipeline cache %s: %llu KB read (file read %.0f ms, driver took it in %.0f ms: start-up time on the thread that creates the device)\n", g_pcache_path, (unsigned long long)(ci.initialDataSize >> 10), (double)(tp1 - tp0) * 1000.0 / (double)pfq.QuadPart, (double)(tk() - tp1) * 1000.0 / (double)pfq.QuadPart);
         free(data);
+#ifdef SSBU_ANDROID
+        if (map) munmap(map, map_n);
+#endif
     }
     /* Blind prediction (pair x most used pass signatures) is OFF unless SSBU_VK_PREDICT=1: measured on a first run it made
      * 8,418 pipelines of which draws used 324, and kept the workers from the programs being handed over. The look-ahead
@@ -1858,15 +1951,49 @@ static volatile LONG g_pcsave_want;                /* the preparation finished: 
 static volatile LONG64 g_gap_prev, g_gap_max;      /* nvn_vk_draw.c vk_present2: the longest time between two frames that reached the window since g_gap_max was cleared */
 static int g_prep_limited;                         /* SSBU_VK_PREP_LIMIT (test): not the whole game: no marker */
 static HANDLE g_pcw_thread;
-typedef struct { void *data; size_t n; int marker, where, one_call, prio; LONG64 t_get, t_q; } PcWrite;
+typedef struct { void *data; size_t n; int marker, where, one_call, prio; LONG64 t_get, t_q; size_t map_len; int map_fd; } PcWrite;
+#ifdef SSBU_ANDROID
+/* 2026-10-22, Android: the cache is read out straight into the .tmp file, mapped (MAP_SHARED), instead of into a malloc'd
+ * buffer of its whole size (212-457 MB on the Marble) that was then written: those pages are the file's, written back and
+ * dropped by the kernel, not private memory of the game at the moment it is largest (the exit path, a fight's loading
+ * screen); lmkd killed other apps on such peaks. Measured with 220 MB on the Marble's /sdcard (FUSE): filling the mapping
+ * 205-220 ms against 65 ms filling memory + 160 ms fwrite. Needs the space on the disk first (a write into a mapping past
+ * a full disk is a SIGBUS); otherwise, or with SSBU_VK_PCMAP=0, the malloc'd buffer as before. */
+static void *pcache_map_get(size_t *n, int *fd_out, size_t *len_out) {
+    char tmp[176];
+    struct statvfs fs;
+    size_t len = *n, got = len;
+    if (getenv("SSBU_VK_PCMAP") && !atoi(getenv("SSBU_VK_PCMAP"))) return NULL;
+    snprintf(tmp, sizeof tmp, "%s.tmp", g_pcache_path);
+    if (statvfs(vkc_dir(), &fs) || (uint64_t)fs.f_bavail * fs.f_frsize < (uint64_t)len + (256u << 20)) return NULL;
+    int fd = open(tmp, O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0660);
+    if (fd < 0) return NULL;
+    void *m = ftruncate(fd, (off_t)len) ? MAP_FAILED : mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (m != MAP_FAILED && vkGetPipelineCacheData(V.device, g_pcache, &got, m) == VK_SUCCESS) { *n = got; *fd_out = fd; *len_out = len; return m; }
+    if (m != MAP_FAILED) munmap(m, len);
+    close(fd); unlink(tmp);
+    return NULL;
+}
+#endif
 static void pcache_write(PcWrite *w) {
     LARGE_INTEGER fq; QueryPerformanceFrequency(&fq);
     char tmp[176];
     LONG64 t0 = tk();
     int ok = 0;
     snprintf(tmp, sizeof tmp, "%s.tmp", g_pcache_path);
-    FILE *fp = fopen(tmp, "wb");
-    if (fp) { ok = fwrite(w->data, 1, w->n, fp) == w->n; fclose(fp); if (ok) ok = MoveFileExA(tmp, g_pcache_path, MOVEFILE_REPLACE_EXISTING) != 0; }
+#ifdef SSBU_ANDROID
+    if (w->map_len) {                              /* already in the .tmp file (pcache_map_get): cut to its size */
+        ok = !munmap(w->data, w->map_len);
+        ok = !ftruncate(w->map_fd, (off_t)w->n) && ok;
+        ok = !close(w->map_fd) && ok;
+        w->data = NULL;
+        if (ok) ok = MoveFileExA(tmp, g_pcache_path, MOVEFILE_REPLACE_EXISTING) != 0; else unlink(tmp);
+    } else
+#endif
+    {
+        FILE *fp = fopen(tmp, "wb");
+        if (fp) { ok = fwrite(w->data, 1, w->n, fp) == w->n; fclose(fp); if (ok) ok = MoveFileExA(tmp, g_pcache_path, MOVEFILE_REPLACE_EXISTING) != 0; }
+    }
     LONG64 t1 = tk();
     if (w->where == 2) Sleep(300);                 /* the frame that was held behind the driver's lock has been presented by now */
     printf("nvn_vk: pipeline cache %s: %llu KB, %s; vkGetPipelineCacheData %.0f ms (%s), on a thread of priority %d; file written in %.0f ms%s; longest time between two presented frames while the cache was read out: %.0f ms (frame %lld, %s)\n",
@@ -1891,13 +2018,14 @@ static DWORD WINAPI pcprobe_main(void *arg) {
     VStage *src = NULL;
     (void)arg;
     EnterCriticalSection(&g_sh_lock);
-    for (int i = 0; i < 4096 && !src; i++) for (VStage *v = g_vstage[i]; v; v = v->next) if (v->ok && v->stage == 1 && v->lib_state == 2 && v->mod && !v->temp) { src = v; break; }
+    for (int i = 0; i < 4096 && !src; i++) for (VStage *v = g_vstage[i]; v; v = v->next) if (v->ok && v->stage == 1 && v->lib_state == 2 && (v->mod || v->spv) && !v->temp) { src = v; break; }
     LeaveCriticalSection(&g_sh_lock);
     if (!src) return 0;
     for (int round = 0; !g_pcprobe_stop || round < 20; round++) {
         static VStage t;
         int how;
         t = *src; t.lib = NULL; t.lib2 = NULL; t.lib_state = 0; t.lib2_state = 0; t.temp = 1;
+        if (lazymod_on()) { t.mod = NULL; t.mod_refs = 0; }      /* lazy modules: src's module may be released meanwhile; the copy makes its own from the file */
         LONG64 t0 = tk();
         stagelib_ensure(&t, 0, &how);
         LONG64 dt = tk() - t0;
@@ -1910,7 +2038,8 @@ static DWORD WINAPI pcprobe_main(void *arg) {
 }
 /* where: 0 the exit path, 1 the render thread inside a held loading screen, 2 the preparation thread at once (old behaviour) */
 static void pcache_save_at(int where, int marker) {
-    size_t n = 0;
+    size_t n = 0, map_len = 0;
+    int map_fd = -1;
     VkResult r = VK_INCOMPLETE;
     void *data = NULL;
     int one = 0;
@@ -1938,6 +2067,10 @@ static void pcache_save_at(int where, int marker) {
         if (GetFileAttributesExA(g_pcache_path, GetFileExInfoStandard, &fa) && (fa.nFileSizeLow || fa.nFileSizeHigh)) {
             n = (size_t)(((uint64_t)fa.nFileSizeHigh << 32) | fa.nFileSizeLow);
             n += n / 8 + (64u << 20);
+#ifdef SSBU_ANDROID
+            if ((data = pcache_map_get(&n, &map_fd, &map_len)) != NULL) one = 1;
+            else
+#endif
             if ((data = malloc(n)) != NULL) { r = vkGetPipelineCacheData(V.device, g_pcache, &n, data); if (r == VK_SUCCESS) one = 1; else { free(data); data = NULL; } }
         }
     }
@@ -1954,7 +2087,7 @@ static void pcache_save_at(int where, int marker) {
                (double)g_pcprobe_before * 1000.0 / (double)fq.QuadPart, (double)g_pcprobe_max * 1000.0 / (double)fq.QuadPart, (long long)g_pcprobe_n, (double)(tk() - t0) * 1000.0 / (double)fq.QuadPart);
     }
     PcWrite *w = calloc(1, sizeof *w);
-    w->data = data; w->n = n; w->marker = marker; w->where = where; w->one_call = one; w->prio = GetThreadPriority(GetCurrentThread()); w->t_get = tk() - t0;
+    w->data = data; w->n = n; w->map_len = map_len; w->map_fd = map_fd; w->marker = marker; w->where = where; w->one_call = one; w->prio = GetThreadPriority(GetCurrentThread()); w->t_get = tk() - t0;
     if (where == 1 && (g_pcw_thread = CreateThread(NULL, 0, pcw_main, w, 0, NULL)) != NULL) return;
     pcache_write(w); free(w);
 }

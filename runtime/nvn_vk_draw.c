@@ -2514,9 +2514,10 @@ static void compute_pipe_make(VStage *v) {         /* any thread */
         pl.setLayoutCount = 2; pl.pSetLayouts = v->cdl;
         VKC(vkCreatePipelineLayout(V.device, &pl, NULL, &v->cl));
         VkComputePipelineCreateInfo ci = {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
-        ci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO; ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT; ci.stage.module = v->mod; ci.stage.pName = "main"; ci.layout = v->cl;
+        ci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO; ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT; ci.stage.module = stage_mod_get(v); ci.stage.pName = "main"; ci.layout = v->cl;
         VkPipeline cp = NULL;
         VkResult r = pw_compute(&ci, &cp);         /* PR #33: vkCreateComputePipelines (g_pcache), measured with SSBU_VK_PREWARM_PROFILE=1 */
+        stage_mod_put(v, ci.stage.module);
         if (r != VK_SUCCESS) vkd_fail("vkCreateComputePipelines (compute stage %u): %s", v->id, vk_result_name(r));
         v->cp = cp;
         InterlockedIncrement64(&R.pipelines);
@@ -4105,6 +4106,11 @@ swap: ;
         printf("nvn_vk: totals at frame %lld: %lld images made (%lld live, %lld views), %lld uploads (%lld MB), %lld shader modules, %lld pipelines, %lld descriptor sets, %lld command buffers, %lld ring wraps, %lld feedback passes, %lld MB device memory\n",
                (long long)frame, (long long)R.images, (long long)R.images_live, (long long)R.views, (long long)R.uploads, (long long)(R.upload_bytes >> 20), (long long)R.modules, (long long)R.pipelines, (long long)R.sets,
                (long long)R.flushes, (long long)R.ring_wraps, (long long)R.feedback, (long long)(g_mem_total >> 20));
+    if (frame % 600 == 0 && lazymod_on()) {        /* nvn_vk_m4.c, lazy modules */
+        LARGE_INTEGER fq; QueryPerformanceFrequency(&fq);
+        printf("nvn_vk_lazymod: frame %lld: %lld shader modules released after their library / compute pipeline was made (%lld still held), %lld made again from their file for a later pipeline (%.0f ms in all, longest %.1f ms)\n",
+               (long long)frame, (long long)g_mod_dropped, (long long)(R.modules - g_mod_dropped), (long long)g_mod_loads, (double)g_mod_load_tk * 1000.0 / (double)fq.QuadPart, (double)g_mod_load_max * 1000.0 / (double)fq.QuadPart);
+    }
     if (frame % 600 == 0 && R.dispatches) {
         LARGE_INTEGER fq; QueryPerformanceFrequency(&fq);
         printf("nvn_vk: compute at frame %lld: %lld dispatches, %lld KB copied back to guest memory, draws using a vertex buffer written by compute in the same batch: %lld, copy-backs forced inside a batch: %lld, waits for the GPU before a copy-back: %lld (%.1f ms in all), %lld buffers made; words the guest wrote into a range pending copy-back: %lld (also written by compute: %lld)\n",
