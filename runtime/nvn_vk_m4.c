@@ -167,8 +167,8 @@ static uint64_t ssrc_hb(const SSrc *o) {
     uint64_t h = fnv(0xcbf29ce484222325ULL ^ (uint64_t)o->stage, o->code, (size_t)o->code_len);
     if (o->stage == 5) { h = fnv(h, o->local, sizeof o->local); h = fnv(h, &o->smem, 4); h = fnv(h, &o->lmem, 4); }
     if (o->cdata) h = fnv(h ^ o->cdata_size, o->cdata, o->cdata_size);
-    if (o->stage == 1 && RS_ON) h = fnv(h, "rs1", 3);
-    if (WIDE_ON && (o->stage == 0 || o->stage == 1)) h = fnv(h, "wide1", 5);      /* aspect = wide: the vertex and fragment stages are another translation (MxIn.screen_wide) */      /* track O: the fragment stages of a run with an internal resolution scale are another translation (MxIn.screen_scale); at 1.0 the hash is the one it always was */
+    if (o->stage == 1 && RS_ON) h = fnv(h, "rs1", 3);      /* track O: the fragment stages of a run with an internal resolution scale are another translation (MxIn.screen_scale); at 1.0 the hash is the one it always was */
+    if (WIDE_ON && (o->stage == 0 || o->stage == 1)) h = fnv(h, "wide1", 5);      /* aspect = wide: the vertex and fragment stages are another translation (MxIn.screen_wide) */
     return fnv(h, &ver, 4);
 }
 static VkShaderModule module_from_spv(uint64_t h) {              /* any thread; NULL when the file is not there */
