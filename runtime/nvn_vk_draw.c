@@ -1995,6 +1995,11 @@ static void cb_ring_wrap(void) { if (g_cb_pending) cb_land(0); else cb_masks(); 
  * submission that ended that batch has finished (busy). */
 static void cb_kept_land(CB *c, int cause) {
     LONG64 t0 = tk();
+    if (R.done < c->kserial) {                     /* kept before its batch had finished (cb_keep_early): its bytes are read below */
+        if (R.recording && c->kserial > R.serial) cmd_submit(NULL, NULL);
+        for (int i = 0; i < NSLOT; i++) if (R.slot[i].pending && R.slot[i].serial <= c->kserial) slot_wait(&R.slot[i]);
+        if (R.done < c->kserial) R.done = c->kserial;
+    }
     cg_unguard((int)(c - g_cb));
     cb_keep_back(c, NULL);
     c->state = 0; c->stale = c->dirty = 0; c->busy = c->touch ? R.serial + 2 : c->kserial; c->touch = 0;      /* touch: a draw of this batch names the buffer (buf_ref): it may be in the command buffer after the one being recorded */
@@ -2202,6 +2207,34 @@ static void cb_mid_note(int why) {                 /* cb_sync is about to land t
     }
 }
 static int g_cb_midcopy = -1;                      /* SSBU_VK_CBMIDCOPY=0: a landing inside a batch reads the buffer with the CPU as before */
+/* At the start of a batch (vk_submit), with SSBU_VK_CBKEEP: the last batch's compute buffers become "kept" WITHOUT
+ * waiting for the GPU to finish that batch. Kept buffers are not copied back anyway; later batches use them on the same
+ * queue, after the work that wrote them. What is not known yet is which of them a dispatch REALLY wrote (the mask words in
+ * the ring): every buffer a dispatch MAY write counts as written (more landings at worst, never fewer), and a landing that
+ * reads a buffer whose batch has not finished waits for it first (cb_kept_land). Waiting here was ~11.6 ms of every fight
+ * frame on the render thread on stages with many dispatches (the Marble, Spirit Train: 24 dispatches a frame).
+ * SSBU_VK_CBEARLYKEEP=1 turns it on (test); default off: the wait as before. */
+#define VK_CBEARLYKEEP_DEFAULT 0                   /* NOT measured yet (2026-10-22: the device locked before the test ran): off until it is */
+static LONG64 g_ck_early;
+static int cb_keep_early(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("SSBU_VK_CBEARLYKEEP"); on = e ? atoi(e) != 0 : VK_CBEARLYKEEP_DEFAULT; printf("nvn_vk: compute buffers kept at the batch start %s (SSBU_VK_CBEARLYKEEP)\n", on ? "without waiting for the GPU" : "after waiting for the GPU"); }
+    if (!on || g_cb_keep <= 0 || g_cb_live || !g_cb_pending || R.done >= g_cb_serial) return 0;
+    for (int i = 0; i < g_ncdisp; i++)
+        for (int k = 0; k < 16; k++) if ((g_cdisp[i].written >> k & 1) && g_cdisp[i].cb[k] >= 0) g_cb[g_cdisp[i].cb[k]].dirty = 1;
+    g_ncdisp = 0;
+    for (int i = 0; i < 256; i++) {
+        CB *c = &g_cb[i];
+        if (c->state != 2) continue;
+        c->stale |= c->dirty; c->dirty = 0; c->state = 3; c->age = 0; g_cb_nkept++;
+        if (c->addr < g_kept_lo) g_kept_lo = c->addr;
+        if (c->addr + c->size > g_kept_hi) g_kept_hi = c->addr + c->size;
+    }
+    g_cb_pending = 0; g_live_lo = ~0ull; g_live_hi = 0;
+    g_cb_epoch++;
+    g_ck_early++;
+    return 1;
+}
 static void cb_sync(void) {                        /* guest memory must hold what compute wrote, now */
     int mid = g_cb_live != 0, why = g_cbw;
     g_cbw = CBW_OTHER;
@@ -3375,7 +3408,7 @@ static void vk_submit(void *arg) {
     if (!V.alive) return;                          /* after the shutdown at exit: the device is gone */
     prewarm_wait();
     LONG64 t0 = tk();
-    cb_sync();                                     /* what the last batch's dispatches wrote is in guest memory before this batch reads it */
+    if (!cb_keep_early()) cb_sync();               /* what the last batch's dispatches wrote is in guest memory before this batch reads it */
     g_cb_batch++;
     if (g_cb_nkept) cb_kept_age();
     cb_kept_index();
