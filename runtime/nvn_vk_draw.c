@@ -2213,8 +2213,12 @@ static int g_cb_midcopy = -1;                      /* SSBU_VK_CBMIDCOPY=0: a lan
  * the ring): every buffer a dispatch MAY write counts as written (more landings at worst, never fewer), and a landing that
  * reads a buffer whose batch has not finished waits for it first (cb_kept_land). Waiting here was ~11.6 ms of every fight
  * frame on the render thread on stages with many dispatches (the Marble, Spirit Train: 24 dispatches a frame).
- * SSBU_VK_CBEARLYKEEP=1 turns it on (test); default off: the wait as before. */
-#define VK_CBEARLYKEEP_DEFAULT 0                   /* NOT measured yet (2026-10-22: the device locked before the test ran): off until it is */
+ * SSBU_VK_CBEARLYKEEP=0: the wait as before. Default on for Android. */
+#ifdef SSBU_ANDROID                                /* measured 2026-10-22 on the Marble: Spirit Train 55.7 -> 59.3 fps, Big Battlefield 58.1 -> 59.2; 0 white flashes, pictures right */
+#define VK_CBEARLYKEEP_DEFAULT 1
+#else
+#define VK_CBEARLYKEEP_DEFAULT 0
+#endif
 static LONG64 g_ck_early;
 static int cb_keep_early(void) {
     static int on = -1;
