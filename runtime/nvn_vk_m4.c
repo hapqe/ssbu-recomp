@@ -58,6 +58,38 @@ static int wd_enter(const char *fn, int line) {
 static void wd_leave(int i) { if (i >= 0) g_wd_wait[i].tid = 0; }
 #define WD_SLEEP(cv, lock, ms) do { int wd_i_ = wd_enter(__func__, __LINE__); SleepConditionVariableCS(cv, lock, ms); wd_leave(wd_i_); } while (0)
 static VkPipelineCache g_pcache;
+/* 2026-10-22 (memory footprint), SSBU_VK_PCHOT (default: on once minilib_on's files are all written, i.e. on Android after
+ * the preparation): the driver's shared pipeline cache is a file of its own, ../cache/vk/pipelines_hot_<gpu>.bin, holding
+ * only what recent runs added outside the stage libraries (compute pipelines, links, pair libraries), instead of the old
+ * file of every stage library of every container (Marble: 212 MB). Mesa deserialises EVERY entry of the file at start and
+ * Turnip uploads each shader to device memory: that file cost ~250 MB of private memory and ~150 MB of device memory in
+ * every fight (a run without it: anon + swap 1.93 -> 1.75 GB, kgsl 764 -> 620 MB). The libraries have files of their own
+ * (minilib_on). The hot file is written at exit as before (new entries); above SSBU_VK_PCHOT_MB (default 64) it is
+ * started again empty at the next start. The old file stays on disk, unused. */
+static int g_mini_ready;
+static int gpl_sep(void);
+static int minilib_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("SSBU_VK_MINILIB");
+#ifdef SSBU_ANDROID
+        on = e ? atoi(e) != 0 : 1;
+#else
+        on = e && atoi(e);
+#endif
+    }
+    return on && D.has_gpl && gpl_sep();         /* (the offline translation, --prepare-shaders, has no device: it never asks) */
+}
+static int pchot_on(void) {                        /* by default: once the preparation has given every library its own file (minilib_on) */
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("SSBU_VK_PCHOT");
+        on = e ? atoi(e) != 0 : minilib_on() && g_mini_ready;
+    }
+    return on;
+}
+static void prep_marker_path(char *out, size_t n, int mini);
+static int g_prep_migrate;                         /* minilib_on: the old marker is there, the new one not: prepared again in the background */
 #ifdef SSBU_ANDROID
 static long anon_kb(void) {                        /* 2026-10-22 (memory footprint): RssAnon + VmSwap of the process, KB */
     FILE *f = fopen("/proc/self/status", "r");
@@ -480,7 +512,7 @@ static void fb_note(int kind, const FbRec *f, LONG64 ticks) {
      * 2026-10-22: Turnip never sets the cache-hit flag (Marble: 12,743 libraries "compiled now" in 100 ms of driver time,
      * 8 us each), so every exit rewrote the whole file (212-457 MB): a miss with feedback counts only when the driver took
      * over 0.5 ms, which no real compilation is under */
-    if (kind == 0 && !hit && (!valid || f->duration > 500000)) InterlockedIncrement64(&g_pc_dirty);
+    if (kind == 0 && !hit && (!valid || f->duration > 500000) && !minilib_on()) InterlockedIncrement64(&g_pc_dirty);      /* minilib_on: the library went into a file of its own */
     if (valid && !hit) InterlockedAdd64(&g_fb_miss_ns[kind], (LONG64)f->duration);
     if (GetCurrentThreadId() == g_render_tid && g_in_fight) {
         static int nl;
@@ -695,6 +727,59 @@ static int liblazy_on(void) {
     }
     return on;
 }
+/* 2026-10-22 (memory footprint), SSBU_VK_MINILIB (default on Android, off elsewhere): every stage library has a pipeline
+ * cache of its own, ../cache/vk/lib_<gpu>/<spv>_<alone>.bin: made from that file into a throwaway VkPipelineCache, or
+ * compiled into an empty one whose data is then written there. The shared cache never sees a library's shader, so the
+ * driver keeps it only as long as the library lives, and nothing needs the preparation's file of every container's
+ * libraries (Mesa deserialises all of it at start and Turnip uploads every shader: ~250 MB private + ~150 MB device
+ * memory on the Marble). The preparation writes these files (its marker is then "..._mlib_..."); until that marker is
+ * there the old shared file is still read and a library without its own file is made from it, so a first run after the
+ * change compiles nothing in a fight. With the marker the shared cache is the small hot file (pchot_on: compute and
+ * other pipelines only). */
+/* g_mini_ready: the "_mlib_" marker exists: every container's libraries have their own file */
+static LONG64 g_mini_loads, g_mini_saves, g_mini_load_tk;
+static void minilib_path(char *out, size_t n, const VStage *v, int alone) {
+    snprintf(out, n, "%s/lib_%04x_%04x_%08x/%016llx_%d.bin", vkc_dir(), (unsigned)V.props.vendorID, (unsigned)V.props.deviceID, (unsigned)V.props.driverVersion, (unsigned long long)v->spv, alone);
+}
+static VkPipelineCache minilib_cache(const VStage *v, int alone, int *had_file) {      /* NULL: use the shared cache */
+    char path[300];
+    *had_file = 0;
+    if (!minilib_on() || !v->spv) return NULL;
+    minilib_path(path, sizeof path, v, alone);
+    VkPipelineCacheCreateInfo ci = {VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
+    void *data = NULL;
+    LONG64 t0 = tk();
+    FILE *f = fopen(path, "rb");
+    if (f) {
+        fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
+        if (n > 0 && (data = malloc((size_t)n)) && fread(data, 1, (size_t)n, f) == (size_t)n) { ci.initialDataSize = (size_t)n; ci.pInitialData = data; *had_file = 1; }
+        fclose(f);
+    }
+    if (!*had_file && !g_mini_ready && !v->temp) { free(data); return NULL; }      /* before the preparation wrote the files: the shared (old) cache has it */
+    VkPipelineCache c = NULL;
+    if (vkCreatePipelineCache(V.device, &ci, NULL, &c) != VK_SUCCESS) c = NULL;
+    free(data);
+    if (*had_file) { InterlockedIncrement64(&g_mini_loads); InterlockedAdd64(&g_mini_load_tk, tk() - t0); }
+    return c;
+}
+static void minilib_save(const VStage *v, int alone, VkPipelineCache c) {
+    char path[300], tmp[310];
+    size_t n = 0;
+    if (vkGetPipelineCacheData(V.device, c, &n, NULL) != VK_SUCCESS || !n) return;
+    void *data = malloc(n);
+    if (!data) return;
+    if (vkGetPipelineCacheData(V.device, c, &n, data) == VK_SUCCESS) {
+        minilib_path(path, sizeof path, v, alone);
+        snprintf(tmp, sizeof tmp, "%s.%lu.tmp", path, (unsigned long)GetCurrentThreadId());
+        FILE *f = fopen(tmp, "wb");
+        if (f) {
+            int ok = fwrite(data, 1, n, f) == n;
+            ok = !fclose(f) && ok;
+            if (ok && MoveFileExA(tmp, path, MOVEFILE_REPLACE_EXISTING)) InterlockedIncrement64(&g_mini_saves); else DeleteFileA(tmp);
+        }
+    }
+    free(data);
+}
 static int reclazy_on(void) {
     static int on = -1;
     if (on < 0) {
@@ -746,7 +831,13 @@ static VkPipeline stagelib_ensure(VStage *v, int alone, int *how) {
     FbRec fb_all = {0, 0}, fb_st = {0, 0};
     FbInfo fbi = {(VkStructureType)1000192000, NULL, &fb_all, 1, &fb_st};
     ri.pNext = &fbi;
-    VkResult r = pw_graphics(g_pcache, &gi, lib);
+    int mfile = 0;
+    VkPipelineCache mc = minilib_cache(v, alone, &mfile);      /* 2026-10-22: the library's own cache file (minilib_on) */
+    VkResult r = pw_graphics(mc ? mc : g_pcache, &gi, lib);
+    if (mc) {
+        if (r == VK_SUCCESS && (!mfile || ((fb_all.flags & 1) && fb_all.duration > 500000))) minilib_save(v, alone, mc);      /* compiled now: the file is (re)written */
+        vkDestroyPipelineCache(V.device, mc, NULL);
+    }
     /* (2026-10-21, tester: AMD RX 6750 XT, VK_ERROR_INITIALIZATION_FAILED during the first-run preparation) tried again, then
      * without the pipeline cache; if the driver still refuses, the next start uses whole pipelines (no stage libraries):
      * the marker file ../cache/vk/no_stage_libraries.txt (vk_gpl_mode), deleted by hand to try the libraries again */
@@ -775,6 +866,41 @@ static VkPipeline stagelib_ensure(VStage *v, int alone, int *how) {
                                    (double)dt * 1000.0 / (double)fq.QuadPart, isfs ? "fragment" : "vertex", (unsigned long long)v->hb, v->key[0], v->key[1], v->key[2], v->key[3], v->fo, alone ? " (a vertex stage drawn without a fragment stage)" : ""); }
     } else { InterlockedIncrement64(&g_gpl_made); InterlockedAdd64(&g_gpl_made_tk, dt); }
     return *lib;
+}
+/* minilib_on, migration (g_prep_migrate): the stage variants of the records of earlier runs get their library files too,
+ * on a thread of their own at the lowest priority (paused in fights). The preparation writes those of every container's
+ * variations only; the old shared file had also gathered every variant ever drawn (forced outputs, keys), and without
+ * their files a later run compiled them at their draws (Marble: 126 holds of 40-170 ms in one fight). The library made
+ * here is destroyed at once: only the file is wanted. */
+static int g_m4_quit;
+static struct { VStage *v; int alone; } *g_mig;
+static int g_nmig, g_mig_cap;
+static LONG64 g_mig_made;
+static void mig_note(VStage *v, int alone) {       /* g_sh_lock held */
+    if (!g_prep_migrate || !v || !v->spv) return;
+    if (g_nmig == g_mig_cap) { g_mig_cap = g_mig_cap ? g_mig_cap * 2 : 4096; g_mig = realloc(g_mig, sizeof *g_mig * (size_t)g_mig_cap); }
+    g_mig[g_nmig].v = v; g_mig[g_nmig++].alone = alone;
+}
+static DWORD WINAPI mig_main(void *arg) {
+    (void)arg;
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
+    LONG64 t0 = tk();
+    for (int i = 0; i < g_nmig && !g_m4_quit; i++) {
+        while (g_in_fight && !g_m4_quit) Sleep(100);
+        VStage *v = g_mig[i].v;
+        char path[300];
+        minilib_path(path, sizeof path, v, g_mig[i].alone);
+        if (GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES || !v->ok || !stage_fits_universal(v)) continue;
+        VStage t = *v;
+        t.lib = t.lib2 = NULL; t.lib_state = t.lib2_state = 0; t.temp = 1; t.mod = NULL; t.mod_refs = 0; t.mod_drop = 1;      /* the module from its file, for this one creation */
+        int how;
+        VkPipeline l = stagelib_ensure(&t, g_mig[i].alone, &how);
+        if (l) vkDestroyPipeline(V.device, l, NULL);
+        g_mig_made++;
+    }
+    LARGE_INTEGER fq; QueryPerformanceFrequency(&fq);
+    printf("nvn_vk: stage library files of the recorded variants: %lld written of %d looked at, %.0f s\n", (long long)g_mig_made, g_nmig, (double)(tk() - t0) / (double)fq.QuadPart);
+    return 0;
 }
 static void gpl_destroy(void) {
     for (int i = 0; i < 4096; i++) for (VStage *v = g_vstage[i]; v; v = v->next) { if (v->lib) { vkDestroyPipeline(V.device, v->lib, NULL); v->lib = NULL; } if (v->lib2) { vkDestroyPipeline(V.device, v->lib2, NULL); v->lib2 = NULL; } }
@@ -1607,7 +1733,7 @@ static PrepSt prep_stage(const SSrc *src, uint32_t fo, int alone) {
     LONG64 t1 = tk();
     InterlockedIncrement64(&g_prep_stages); if (t->from_rec) InterlockedIncrement64(&g_prep_fromrec);
     InterlockedAdd64(&g_prep_tr_tk, t1 - t0);
-    if (t->ok && D.has_gpl && gpl_sep() && stage_fits_universal(t)) {
+    if (t->ok && D.has_gpl && gpl_sep() && stage_fits_universal(t) && (minilib_on() || !pchot_on())) {      /* with the hot cache alone nothing goes into a cache ahead; with minilib_on each library into its own file */
         int lh;
         stagelib_ensure(t, 0, &lh); InterlockedIncrement64(&g_prep_libs);
         if (alone) { stagelib_ensure(t, 1, &lh); InterlockedIncrement64(&g_prep_libs); }
@@ -1650,6 +1776,7 @@ static DWORD WINAPI pw_main(void *arg) {           /* arg: the worker's number (
             r->k.vs = vs->id; r->k.fs = fs ? fs->id : 0;
             uint64_t h = fnv(0xcbf29ce484222325ULL, &r->k, sizeof r->k);
             if (!pipe_find(&r->k, h)) { p = pipe_new(&r->k, vs, fs, h, 1); p->recorded = 1; if (def_add(p)) p = NULL; }
+            mig_note(vs, !fs); mig_note(fs, 0);
             int idx;
             sig_note(&r->k, &idx);
             PairRec *pr0 = pair_get(vs, fs);
@@ -1664,7 +1791,7 @@ static DWORD WINAPI pw_main(void *arg) {           /* arg: the worker's number (
     }
     g_pw_profile = NULL;                           /* phase 2 is not measured */
     InterlockedExchange64(&g_pw_t1, tk());
-    if (InterlockedDecrement(&g_pw_left) == 0) SetEvent(g_pw_gate);
+    if (InterlockedDecrement(&g_pw_left) == 0) { SetEvent(g_pw_gate); if (g_nmig) CloseHandle(CreateThread(NULL, 0, mig_main, NULL, 0, NULL)); }
     int prio = THREAD_PRIORITY_NORMAL;
     for (;;) {                                     /* 2. what the game hands over while it runs */
         {   /* Session 7: in a fight the workers run BELOW the game's threads (measured, run s7fn1 frames 2101-2118: the 16
@@ -1809,6 +1936,29 @@ static void prewarm_start(void) {
         VkPipelineCacheCreateInfo ci = {VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
         void *data = NULL;
         snprintf(g_pcache_path, sizeof g_pcache_path, "%s/pipelines_%04x_%04x_%08x.bin", vkc_dir(), (unsigned)V.props.vendorID, (unsigned)V.props.deviceID, (unsigned)V.props.driverVersion);
+        if (minilib_on()) {
+            char mk[240], dir[240];
+            prep_marker_path(mk, sizeof mk, 1);
+            g_mini_ready = GetFileAttributesA(mk) != INVALID_FILE_ATTRIBUTES;
+            if (!g_mini_ready) { prep_marker_path(mk, sizeof mk, 0); g_prep_migrate = GetFileAttributesA(mk) != INVALID_FILE_ATTRIBUTES; }      /* before the history workers start (mig_note) */
+            snprintf(dir, sizeof dir, "%s/lib_%04x_%04x_%08x", vkc_dir(), (unsigned)V.props.vendorID, (unsigned)V.props.deviceID, (unsigned)V.props.driverVersion);
+            CreateDirectoryA(vkc_dir(), NULL); CreateDirectoryA(dir, NULL);
+            printf("nvn_vk: stage libraries have pipeline caches of their own (%s, SSBU_VK_MINILIB): %s\n", dir,
+                   g_mini_ready ? "the preparation wrote them all: the shared cache is the small hot file" : "the preparation has not written them all yet: the shared file is still read this time");
+        }
+        if (pchot_on()) {                          /* see pchot_on: the file of what recent runs compiled, started again above its limit */
+            snprintf(g_pcache_path, sizeof g_pcache_path, "%s/pipelines_hot_%04x_%04x_%08x.bin", vkc_dir(), (unsigned)V.props.vendorID, (unsigned)V.props.deviceID, (unsigned)V.props.driverVersion);
+            WIN32_FILE_ATTRIBUTE_DATA fa;
+            const char *e = getenv("SSBU_VK_PCHOT_MB");
+            long long cap = (e && atoll(e) > 0 ? atoll(e) : 64) << 20, sz = 0;
+            if (GetFileAttributesExA(g_pcache_path, GetFileExInfoStandard, &fa)) sz = (long long)fa.nFileSizeHigh << 32 | fa.nFileSizeLow;
+            if (sz > cap) {
+                char old[176];
+                snprintf(old, sizeof old, "%s.old", g_pcache_path);
+                MoveFileExA(g_pcache_path, old, MOVEFILE_REPLACE_EXISTING);
+                printf("nvn_vk: pipeline cache %s: %lld MB, over the limit of %lld MB (SSBU_VK_PCHOT_MB): started again empty (kept as .old); what this run needs is compiled at its loading screens\n", g_pcache_path, sz >> 20, cap >> 20);
+            }
+        }
         LONG64 tp0 = tk(), tp1;
         LARGE_INTEGER pfq; QueryPerformanceFrequency(&pfq);
         int load = !(getenv("SSBU_VK_PCACHE_LOAD") && !atoi(getenv("SSBU_VK_PCACHE_LOAD")));
@@ -2787,6 +2937,12 @@ static DWORD WINAPI sweep_main(void *arg) {
     }
     return 0;
 }
+#define VK_KEYS_VERSION 1                          /* see prep_start */
+static void prep_marker_path(char *out, size_t n, int mini) {
+    char kv[16] = "";
+    if (VK_KEYS_VERSION > 1) snprintf(kv, sizeof kv, "_k%d", VK_KEYS_VERSION);
+    snprintf(out, n, "%s/prepared_v%u%s_s%d_%s_%04x_%04x_%08x.txt", vkc_dir(), MX_VK_VERSION, kv, RS_ON ? 1 : 0, mini ? "mlib" /* libraries in files of their own (minilib_on) */ : D.has_gpl && gpl_sep() ? "lib" : D.has_vids ? "nolib" : "novi" /* a pass without libraries (SSBU_VK_PREP=1, run s10n0) must not make a later run with libraries skip theirs */, (unsigned)V.props.vendorID, (unsigned)V.props.deviceID, (unsigned)V.props.driverVersion);
+}
 static void prep_start(void) {
     const char *e = getenv("SSBU_VK_PREP");
     if (getenv("SSBU_VK_SWEEP_LOG") && atoi(getenv("SSBU_VK_SWEEP_LOG"))) CloseHandle(CreateThread(NULL, 0, sweep_main, NULL, 0, NULL));
@@ -2799,10 +2955,13 @@ static void prep_start(void) {
      * (the one-layout sets: 66 buffers, 128 samplers) and the dynamic-state list. RAISE IT when either changes: every stage
      * library then misses in the driver's cache, and without a new marker name the old marker would suppress the preparation.
      * Version 1 keeps the marker name of sessions 10-13 (no "_k" part), so a PC prepared before today is not prepared again. */
-#define VK_KEYS_VERSION 1
-    char kv[16] = "";
-    if (VK_KEYS_VERSION > 1) snprintf(kv, sizeof kv, "_k%d", VK_KEYS_VERSION);
-    snprintf(g_prep_marker, sizeof g_prep_marker, "%s/prepared_v%u%s_s%d_%s_%04x_%04x_%08x.txt", vkc_dir(), MX_VK_VERSION, kv, RS_ON ? 1 : 0, D.has_gpl && gpl_sep() ? "lib" : D.has_vids ? "nolib" : "novi" /* a pass without libraries (SSBU_VK_PREP=1, run s10n0) must not make a later run with libraries skip theirs */, (unsigned)V.props.vendorID, (unsigned)V.props.deviceID, (unsigned)V.props.driverVersion);
+    prep_marker_path(g_prep_marker, sizeof g_prep_marker, minilib_on());
+    if (minilib_on() && GetFileAttributesA(g_prep_marker) == INVALID_FILE_ATTRIBUTES) {      /* prepared before the libraries had files of their own: */
+        char old[240];                             /* the shared file still has everything, so their files are written in the background (no first-run screen) */
+        prep_marker_path(old, sizeof old, 0);
+        g_prep_migrate = GetFileAttributesA(old) != INVALID_FILE_ATTRIBUTES;
+        if (g_prep_migrate) printf("nvn_vk_prep: prepared by an earlier version (%s): the stage libraries' own files are written in the background this time\n", old);
+    }
     if (on && GetFileAttributesA(g_prep_marker) != INVALID_FILE_ATTRIBUTES && !(e && atoi(e) == 2)) {
         /* 2026-10-16, the owner's order ("all of them during the white screen at the start, with a small loading screen"):
          * graphics.ini shader_load = start (default; SSBU_VK_LOAD_AT_START=0/1 wins, SSBU_VK_PREP_KEEP=<n> too): EVERY

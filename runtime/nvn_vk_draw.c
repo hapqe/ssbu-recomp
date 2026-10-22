@@ -3864,7 +3864,7 @@ static void prep_first_hold(LONG64 frame) {
      * says "LOADING SHADERS": the game's first present waits until every container is in memory (the work began at the
      * device's creation, during the white screen of the game's own boot; this shows what is left) */
     int loadall = g_prep_marked && g_prep_loadall;
-    if ((mode && !loadall) || !g_prep_thread || (g_prep_marked && !loadall) || g_prep_limited || !g_ovl.bar_arg) { done = 1; if (frame < 3) printf("nvn_vk_prep: first-run screen not shown: %s\n", mode == 1 ? "shader_prepare = background" : mode == 2 ? "shader_prepare = off" : !g_prep_thread ? "no preparation on this device (no stage libraries)" : g_prep_marked ? "the marker of an earlier run is there: everything was prepared for this GPU, driver and version; straight to the game (shader_load = loading)" : "test limit"); return; }
+    if ((mode && !loadall) || g_prep_migrate || !g_prep_thread || (g_prep_marked && !loadall) || g_prep_limited || !g_ovl.bar_arg) { done = 1; if (frame < 3) printf("nvn_vk_prep: first-run screen not shown: %s\n", g_prep_migrate ? "the libraries' own files are written in the background (prepared by an earlier version)" : mode == 1 ? "shader_prepare = background" : mode == 2 ? "shader_prepare = off" : !g_prep_thread ? "no preparation on this device (no stage libraries)" : g_prep_marked ? "the marker of an earlier run is there: everything was prepared for this GPU, driver and version; straight to the game (shader_load = loading)" : "test limit"); return; }
     if (g_prep_state == 2 || g_prep_state == 3) { done = 1; if (loadall) printf("nvn_vk_prep: SHADERS LOADED AT START: everything was in memory before the game's first frame (%lld): no wait\n", (long long)frame); return; }
     LARGE_INTEGER fq; QueryPerformanceFrequency(&fq);
     LONG64 t0 = tk(), tlog = t0, tprog = t0, dn_last = -1;
@@ -4268,6 +4268,8 @@ swap: ;
         LARGE_INTEGER fq; QueryPerformanceFrequency(&fq);
         printf("nvn_vk_lazymod: frame %lld: %lld shader modules released after their library / compute pipeline was made (%lld still held), %lld made again from their file for a later pipeline (%.0f ms in all, longest %.1f ms)\n",
                (long long)frame, (long long)g_mod_dropped, (long long)(R.modules - g_mod_dropped), (long long)g_mod_loads, (double)g_mod_load_tk * 1000.0 / (double)fq.QuadPart, (double)g_mod_load_max * 1000.0 / (double)fq.QuadPart);
+        if (minilib_on()) printf("nvn_vk_minilib: frame %lld: %lld stage libraries made from their own files (%.0f ms reading and taking them in), %lld files written (compiled now)%s\n", (long long)frame, (long long)g_mini_loads,
+                                 (double)g_mini_load_tk * 1000.0 / (double)fq.QuadPart, (long long)g_mini_saves, g_mini_ready ? "" : "; the shared file is still read (the preparation has not written them all)");
         int nl = 0, nlinked = 0;
         EnterCriticalSection(&g_sh_lock);
         for (int i = 0; i < 4096; i++) for (VStage *v = g_vstage[i]; v; v = v->next) { if (v->lib || v->lib2) { nl++; nlinked += v->linked; } }
