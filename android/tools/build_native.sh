@@ -47,7 +47,7 @@ print(' '.join(src))
 EOF
 )"
 COMPAT_SOURCES="win32_compat.c compat_hash.c gl_stub.c waveout_aaudio.c"
-ANDROID_SOURCES="android_main.c osk_android.c vk_driver.c"
+ANDROID_SOURCES="android_main.c osk_android.c vk_driver.c gpu_boost.c adpf.c"
 
 compile() {    # src obj [extra flags]
   local src="$1" obj="$2"; shift 2

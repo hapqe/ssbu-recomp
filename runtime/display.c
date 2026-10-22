@@ -1011,6 +1011,10 @@ void display_present_plan(int vulkan) {
     g_latch = at;
     InterlockedExchange(&g_latch_pending, iv != 0);
     if (iv && !on_time) g_hold_late++;
+#ifdef SSBU_ANDROID
+    { void android_gpu_boost_frame(int late); android_gpu_boost_frame(iv && !on_time); }      /* android/runtime/gpu_boost.c */
+    { void android_adpf_frame_end(void); android_adpf_frame_end(); }                          /* android/runtime/adpf.c */
+#endif
     l1_plan(iv && !on_time && now_n > prev + iv);      /* L1 (a frame queued after the tick it was due at = late) */
     InterlockedExchange64(&g_hold_target, on_time && g_hold_on && !g_lockstep ? at : 0);
     InterlockedExchange(&g_planned, 1);
@@ -1165,6 +1169,9 @@ int display_wait_refresh(void) {
     }
     lat_release();                                         /* L1: latency = low / lowest; the release time */
     hitch_pacing(0);
+#ifdef SSBU_ANDROID
+    { void android_adpf_frame_begin(void); android_adpf_frame_begin(); }      /* android/runtime/adpf.c */
+#endif
     QueryPerformanceCounter(&b);
     nvn_pf_pace(b.QuadPart - a.QuadPart);
     return 1;

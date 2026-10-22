@@ -3813,6 +3813,9 @@ static DWORD WINAPI render_thread(LPVOID arg) {
     int pfd = 0;
 #endif
     g_render_tid = GetCurrentThreadId();
+#ifdef SSBU_ANDROID
+    { void android_adpf_register_thread(void); android_adpf_register_thread(); }      /* android/runtime/adpf.c: the render thread works on every frame */
+#endif
     {   /* Round 17, MEASUREMENT: SSBU_RENDER_PRIO=1 above normal, 2 highest (default: normal, as before). The game's own
          * threads run above normal when the game asked for a priority under 16 (os_threads.c host_priority). */
         const char *e = getenv("SSBU_RENDER_PRIO");
@@ -4986,8 +4989,8 @@ static void job_fence(void *arg) { SyncJob *j = arg; fence_now(j->o, j->flags); 
 static void queue_fence_sync(Ctx *c) {                  /* (queue, sync, condition, flags) */
     L1T("fence sync %llx", (unsigned long long)A1);
     SyncObj *o = hobj(A1, K_SYNC);
-    SyncJob j = {o, (int)A3, 0, 0};
-    if (o) { if (gl_async_on()) gl_post(g_rb->fence, &j, sizeof j); else gl_run(g_rb->fence, &j); }
+    SyncJob j = {o, (int)A3, 0, 0, 0};
+    if (o) { j.gen = InterlockedIncrement(&o->posted); if (gl_async_on()) gl_post(g_rb->fence, &j, sizeof j); else gl_run(g_rb->fence, &j); }
 }
 static void job_sync_wait(void *arg) {
     SyncJob *j = arg;
@@ -4998,8 +5001,10 @@ static void job_sync_wait(void *arg) {
 static void sync_wait(Ctx *c) {                         /* (sync, timeoutNs) -> NVNsyncWaitResult */
     L1T("sync wait %llx%s", (unsigned long long)A0, hobj(A0, K_SYNC) == g_window_sync ? " (WINDOW texture)" : "");
     SyncObj *o = hobj(A0, K_SYNC);
-    SyncJob j = {o, 0, A1, 3};
-    if (o) gl_run(g_rb->sync_wait, &j);
+    SyncJob j = {o, 0, A1, 3, 0};
+    int nvn_vk_sync_fast(SyncObj *o);                  /* nvn_vk_draw.c: answered here, without a trip through the render thread's queue */
+    if (o && g_vk && nvn_vk_sync_fast(o)) j.result = 1;
+    else if (o) gl_run(g_rb->sync_wait, &j);
     if (o && o == g_window_sync && A1 && j.result == 3) {      /* P3 round 3: the window texture's sync (never fenced by us): it is free at the refresh that shows the queued frame (display.c) */
         if (l1_pipe_wait()) j.result = 1; else {      /* L1 round 2: pipe mode does not hold here */
         l1_early_present();                                    /* L1 (latency = early / SSBU_L1_EARLY=1): the picture the game finished before this wait goes to the window now (at its tick) */
@@ -5413,7 +5418,7 @@ static void cmd_render_enable_cond(Ctx *c) { Cmd *m = rec(c, OP_RENDER_ENABLE, 0
 static void cmd_reset_counter(Ctx *c) { rec(c, OP_COUNTER_RESET, 0); }
 static void cmd_report_counter(Ctx *c) { rec(c, OP_COUNTER_REPORT, 0); }
 static void cmd_report_value(Ctx *c) { rec(c, OP_REPORT_VALUE, 0); }
-static void cmd_fence_sync(Ctx *c) { SyncObj *o = hobj(A1, K_SYNC); rec(c, OP_FENCE, 0)->a[0] = (uint64_t)(uintptr_t)o; }      /* (cmdbuf, sync, condition, flags) */
+static void cmd_fence_sync(Ctx *c) { SyncObj *o = hobj(A1, K_SYNC); if (o) InterlockedExchange(&o->in_cmdbuf, 1); rec(c, OP_FENCE, 0)->a[0] = (uint64_t)(uintptr_t)o; }      /* (cmdbuf, sync, condition, flags) */
 static void cmd_wait_sync(Ctx *c) { SyncObj *o = hobj(A1, K_SYNC); rec(c, OP_WAITSYNC, 0)->a[0] = (uint64_t)(uintptr_t)o; }
 static void cmd_signal_event(Ctx *c) { uint64_t a = A1 ? rd64(A1 + 16) : 0; rec(c, OP_EVENT_SIGNAL, 0)->a[0] = a; }            /* (cmdbuf, event, mode, location, flags, value) */
 static void cmd_wait_event(Ctx *c) { uint64_t a = A1 ? rd64(A1 + 16) : 0; rec(c, OP_EVENT_WAIT, 0)->a[0] = a; }                /* (cmdbuf, event, waitMode, value) */

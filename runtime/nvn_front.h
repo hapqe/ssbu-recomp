@@ -64,7 +64,9 @@ typedef struct {
     int recording, callback_off, in_callback, dispatches;
 } CmdBuf;
 typedef struct { int count, interval, nactive; Tex *tex[8]; int crop[4]; uint64_t native; } Window;
-typedef struct { void *s; volatile LONG dead; } SyncObj;       /* s: GL sync object; Vulkan: the number of the submission the fence follows */
+typedef struct { void *s; volatile LONG dead; volatile LONG posted, done, in_cmdbuf; } SyncObj;       /* s: GL sync object; Vulkan: the number of the submission the fence follows.
+                                                                * posted / done: queue fences issued by the game / run by the render thread (Vulkan: a wait can be answered
+                                                                * on the game's thread once done == posted, nvn_vk_sync_fast); in_cmdbuf: fenced inside a command buffer too */
 
 /* ---------------------------------------------------------------- command lists */
 enum {
@@ -83,7 +85,7 @@ typedef struct { Tex *tex; View view; } TargetRef;
 /* ---------------------------------------------------------------- render-thread jobs (arguments of RBackend members) */
 typedef struct { int count; const uint64_t *handles; } SubmitJob;
 typedef struct { Window *win; int index; int shot_fight; } PresentJob;      /* shot_fight (session 13, test): fight frame whose picture this present is, 0 = none; set when the game queues the present */
-typedef struct { SyncObj *o; int flags; uint64_t timeout; int result; } SyncJob;
+typedef struct { SyncObj *o; int flags; uint64_t timeout; int result; LONG gen; } SyncJob;
 typedef struct { Tex *tex; View view; int has_view; int region[6]; const void *data; int64_t row_stride; } WriteJob;
 typedef struct { Tex *tex; View view; int has_view, to_pool; int region[6]; void *out; int64_t row_stride, image_stride; } ReadJob;      /* to_pool: nvnTextureInvalidateTexels */
 

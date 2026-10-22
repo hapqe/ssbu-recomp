@@ -797,7 +797,29 @@ BOOL InitializeCriticalSectionAndSpinCount(LPCRITICAL_SECTION cs, DWORD spin) { 
 BOOL InitializeCriticalSectionEx(LPCRITICAL_SECTION cs, DWORD spin, DWORD flags) { (void)flags; return InitializeCriticalSectionAndSpinCount(cs, spin); }
 void DeleteCriticalSection(LPCRITICAL_SECTION cs) { if (cs->init == 2) pthread_mutex_destroy(&cs->m); cs->init = 0; }
 static void cs_owned(LPCRITICAL_SECTION cs) { if (cs->RecursionCount++ == 0) cs->OwningThread = (HANDLE)(uintptr_t)gettid(); }
-void EnterCriticalSection(LPCRITICAL_SECTION cs) { cs_lazy(cs); pthread_mutex_lock(&cs->m); cs_owned(cs); }
+/* A taken lock is watched for a short while before the thread sleeps in the kernel, as Windows' critical sections and
+ * the console's mutexes do: the game hands its locks between the main thread and its workers many times a frame, and a
+ * futex sleep costs the wake-up besides (Marble, SSBU_HITCH=18 in fights: 7.2 s of 40 s in slow frames was the main
+ * thread blocked in std::mutex::lock with the mutex already free again at the sample). SSBU_CS_SPIN_US (default 20; 0 off). */
+static int64_t cs_spin_ns(void) {
+    static int64_t ns = -1;
+    if (ns < 0) { const char *e = getenv("SSBU_CS_SPIN_US"); ns = (e ? atoi(e) : 20) * 1000ll; }
+    return ns;
+}
+void EnterCriticalSection(LPCRITICAL_SECTION cs) {
+    cs_lazy(cs);
+    if (pthread_mutex_trylock(&cs->m)) {
+        int64_t limit = cs_spin_ns(), t0 = limit ? mono_ns() : 0;
+        int got = 0;
+        for (int i = 1; limit && !got; i++) {
+            __asm__ volatile("yield");
+            if (!__atomic_load_n(&cs->OwningThread, __ATOMIC_RELAXED)) got = !pthread_mutex_trylock(&cs->m);   /* looks free: one try */
+            if (!got && !(i & 63) && mono_ns() - t0 > limit) break;
+        }
+        if (!got) pthread_mutex_lock(&cs->m);
+    }
+    cs_owned(cs);
+}
 BOOL TryEnterCriticalSection(LPCRITICAL_SECTION cs) { cs_lazy(cs); if (pthread_mutex_trylock(&cs->m)) return FALSE; cs_owned(cs); return TRUE; }
 void LeaveCriticalSection(LPCRITICAL_SECTION cs) { if (--cs->RecursionCount == 0) cs->OwningThread = NULL; pthread_mutex_unlock(&cs->m); }
 
