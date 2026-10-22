@@ -1,6 +1,7 @@
 package me.hapke.opensmash;
 
 import android.app.Activity;
+import android.app.ActivityManager;
 import android.app.AlertDialog;
 import android.content.Intent;
 import android.content.SharedPreferences;
@@ -38,7 +39,9 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.io.RandomAccessFile;
+import java.text.SimpleDateFormat;
 import java.util.ArrayList;
+import java.util.Date;
 import java.util.List;
 import java.util.Locale;
 import java.util.TimeZone;
@@ -51,14 +54,18 @@ import java.util.zip.ZipInputStream;
  * in the APK: the folder is made on a PC from the user's own dump (android/tools/export_for_android.py).
  * Also the GPU driver: the system's, or a custom one from an AdrenoTools driver package (a .zip with meta.json and the
  * driver .so, e.g. Mesa Turnip for Adreno) installed into private storage and loaded by android/runtime/vk_driver.c.
+ * And the import of save data (a folder or .zip holding save_data, e.g. from JKSV / Checkpoint / an emulator) into
+ * <game folder>/saves/save, where android_main.c points SSBU_USERDATA (runtime/nnfs.c MountSaveData).
  */
 public class LauncherActivity extends Activity {
     static final String PREFS = "opensmash";
     static final int REQ_TREE = 1;
     static final int REQ_DRIVER = 2;
+    static final int REQ_SAVE_TREE = 3;
+    static final int REQ_SAVE_ZIP = 4;
 
     private EditText folder, extraEnv;
-    private TextView checks, device, status, driverInfo;
+    private TextView checks, device, status, driverInfo, saveInfo;
     private Button start, access, copy;
     private ProgressBar progress;
     private Spinner touch, resolution, aspect;
@@ -159,6 +166,27 @@ public class LauncherActivity extends Activity {
         log.setText("Show the last game log");
         log.setOnClickListener(v -> showLog());
         col.addView(log);
+
+        col.addView(label("Save data"));
+        LinearLayout saveRow = new LinearLayout(this);
+        saveRow.setOrientation(LinearLayout.HORIZONTAL);
+        Button saveTree = new Button(this);
+        saveTree.setText("Import from a folder…");
+        saveTree.setOnClickListener(v -> startActivityForResult(new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE), REQ_SAVE_TREE));
+        saveRow.addView(saveTree, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1));
+        Button saveZip = new Button(this);
+        saveZip.setText("Import from a .zip…");
+        saveZip.setOnClickListener(v -> {
+            Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+            i.addCategory(Intent.CATEGORY_OPENABLE);
+            i.setType("*/*");
+            i.putExtra(Intent.EXTRA_MIME_TYPES, new String[] {"application/zip", "application/x-zip-compressed", "application/octet-stream"});
+            startActivityForResult(i, REQ_SAVE_ZIP);
+        });
+        saveRow.addView(saveZip, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1));
+        col.addView(saveRow);
+        saveInfo = new TextView(this);
+        col.addView(saveInfo);
 
         col.addView(label("GPU driver"));
         driverInfo = new TextView(this);
@@ -320,14 +348,119 @@ public class LauncherActivity extends Activity {
         super.onActivityResult(req, res, data);
         if (res != RESULT_OK || data == null || data.getData() == null) return;
         if (req == REQ_DRIVER) { installDriver(data.getData()); return; }
+        if (req == REQ_SAVE_TREE) { importSave(new File(treePath(data.getData())), null); return; }
+        if (req == REQ_SAVE_ZIP) { importSave(null, data.getData()); return; }
         if (req != REQ_TREE) return;
-        String id = DocumentsContract.getTreeDocumentId(data.getData());       /* "primary:OpenSmash" or "1234-ABCD:Games/OpenSmash" */
+        folder.setText(treePath(data.getData()));
+        save();
+        refresh();
+    }
+    /** The file system path of a folder chosen with ACTION_OPEN_DOCUMENT_TREE (read through the all-files access). */
+    private static String treePath(Uri tree) {
+        String id = DocumentsContract.getTreeDocumentId(tree);                 /* "primary:OpenSmash" or "1234-ABCD:Games/OpenSmash" */
         int colon = id.indexOf(':');
         String vol = colon >= 0 ? id.substring(0, colon) : id, rel = colon >= 0 ? id.substring(colon + 1) : "";
         String base = "primary".equalsIgnoreCase(vol) ? Environment.getExternalStorageDirectory().getAbsolutePath() : "/storage/" + vol;
-        folder.setText(rel.isEmpty() ? base : base + "/" + rel);
-        save();
-        refresh();
+        return rel.isEmpty() ? base : base + "/" + rel;
+    }
+
+    /* ---------------------------------------------------------------- importing save data */
+    /** The game's own process (GameActivity, android:process=":game") is running. */
+    private boolean gameRunning() {
+        List<ActivityManager.RunningAppProcessInfo> ps = ((ActivityManager) getSystemService(ACTIVITY_SERVICE)).getRunningAppProcesses();
+        if (ps != null) for (ActivityManager.RunningAppProcessInfo p : ps) if ((getPackageName() + ":game").equals(p.processName)) return true;
+        return false;
+    }
+    /** The save_data folder below dir: the folder holding system_data.bin (as JKSV / Checkpoint / yuzu / Ryujinx keep
+     *  it, at any depth up to 6); of several (Ryujinx's 0\ and 1\) the one written last. Null: none. */
+    private static File findSaveData(File dir, int depth) {
+        File sys = new File(dir, "system_data.bin"), best = sys.isFile() && sys.length() > 0 ? dir : null;
+        File[] fs = depth > 0 ? dir.listFiles() : null;
+        if (fs != null) for (File f : fs) {
+            if (!f.isDirectory()) continue;
+            File d = findSaveData(f, depth - 1);
+            if (d != null && (best == null || new File(d, "system_data.bin").lastModified() > new File(best, "system_data.bin").lastModified())) best = d;
+        }
+        return best;
+    }
+    private static void copyTree(File from, File to) throws IOException {
+        if (!to.isDirectory() && !to.mkdirs()) throw new IOException("cannot create " + to);
+        File[] fs = from.listFiles();
+        if (fs == null) throw new IOException("cannot read " + from);
+        byte[] buf = new byte[1 << 16];
+        for (File f : fs) {
+            File t = new File(to, f.getName());
+            if (f.isDirectory()) { copyTree(f, t); continue; }
+            try (InputStream in = new FileInputStream(f); OutputStream out = new FileOutputStream(t)) {
+                int n;
+                while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
+            }
+        }
+    }
+    private static void unzip(Uri zip, File to, Activity a) throws IOException {
+        String root = to.getCanonicalPath() + File.separator;
+        byte[] buf = new byte[1 << 16];
+        try (ZipInputStream in = new ZipInputStream(a.getContentResolver().openInputStream(zip))) {
+            ZipEntry e;
+            while ((e = in.getNextEntry()) != null) {
+                File t = new File(to, e.getName());
+                if (!t.getCanonicalPath().startsWith(root)) continue;                /* no paths out of the folder */
+                if (e.isDirectory()) { t.mkdirs(); continue; }
+                t.getParentFile().mkdirs();
+                try (OutputStream out = new FileOutputStream(t)) {
+                    int n;
+                    while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
+                }
+            }
+        }
+    }
+    /** Replaces <game>/saves/save with the save_data found in folder (or in the .zip): the old save is renamed to
+     *  saves/save_backup_<date>, and the session files of earlier runs (save.work.<pid>, save.journal.<pid>, and
+     *  save.commit, which the next mount would otherwise apply onto the imported save) are removed. */
+    private void importSave(File folder, Uri zip) {
+        if (!allFiles()) { saveInfo.setText("file access not allowed yet (button at the top)"); return; }
+        if (gameRunning()) {
+            new AlertDialog.Builder(this).setTitle("The game is running").setMessage("Quit the game before importing save data.").setPositiveButton("OK", null).show();
+            return;
+        }
+        File saves = new File(game(), "saves");
+        String stamp = new SimpleDateFormat("yyyyMMdd-HHmmss", Locale.ROOT).format(new Date());
+        File cur = new File(saves, "save"), backup = new File(saves, "save_backup_" + stamp);
+        new AlertDialog.Builder(this).setTitle("Import save data")
+                .setMessage("This replaces the game's save data in " + cur + (cur.isDirectory() ? ".\n\nThe current save is kept as " + backup.getName() + "." : "."))
+                .setNegativeButton("Cancel", null)
+                .setPositiveButton("Import", (d, w) -> {
+                    saveInfo.setText("importing the save data…");
+                    new Thread(() -> {
+                        String msg;
+                        File raw = new File(saves, "save.import.zip"), imp = new File(saves, "save.import");
+                        try {
+                            saves.mkdirs();
+                            deleteTree(raw);
+                            deleteTree(imp);
+                            File src = folder;
+                            if (zip != null) { unzip(zip, raw, this); src = raw; }
+                            File sd = findSaveData(src, 6);
+                            if (sd == null) throw new IOException("no save_data (a folder holding system_data.bin) in " + (zip != null ? "the .zip" : folder));
+                            copyTree(sd, new File(imp, "save_data"));
+                            File[] old = saves.listFiles();
+                            if (old != null) for (File f : old) {
+                                String n = f.getName();
+                                if (n.startsWith("save.work.") || n.startsWith("save.journal.") || n.equals("save.commit")) deleteTree(f);
+                            }
+                            if (cur.exists() && !cur.renameTo(backup)) throw new IOException("cannot rename " + cur);
+                            if (!imp.renameTo(cur)) throw new IOException("cannot rename " + imp);
+                            msg = "save data imported from " + sd + (backup.exists() ? "\nthe old save: " + backup : "");
+                        } catch (IOException e) {
+                            deleteTree(imp);
+                            msg = "import failed: " + e.getMessage();
+                        }
+                        deleteTree(raw);
+                        if (zip != null) msg = msg.replace(raw.getPath(), "the .zip");
+                        final String m = msg;
+                        ui.post(() -> saveInfo.setText(m));
+                    }).start();
+                }).show();
     }
 
     File game() { return new File(folder.getText().toString().trim()); }
