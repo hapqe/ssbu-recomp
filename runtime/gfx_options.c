@@ -130,8 +130,15 @@ static const char *const k_default_ini =
 "\r\n"
 "; frame_time_overlay = off | on\r\n"
 ";   on: the average frame time of the last second in the window title ('.. fps - 16.67 ms per frame') and as a\r\n"
-";   'frame-time:' line in the log. (Bars drawn into the picture are not implemented yet.)\r\n"
+";   'frame-time:' line in the log; drawn over the picture too (the settings menu's box, or without the menu the frame\r\n"
+";   display of the Vulkan renderer: frames per second, mean and longest frame time, top left). SSBU_FPS=1 / 0 wins.\r\n"
 "frame_time_overlay = off\r\n"
+"\r\n"
+"; aspect = keep | stretch\r\n"
+";   keep: the game's 16:9 picture keeps its shape, with black bars when the window or screen has another shape.\r\n"
+";   stretch: the picture fills the whole window or screen (a phone's 20:9, a 21:9 monitor): nothing is cut off, but\r\n"
+";   it is widened (or heightened) to that shape. SSBU_ASPECT=keep / stretch wins.\r\n"
+"aspect = keep\r\n"
 "\r\n"
 "; menu = on | off (default on)\r\n"
 ";   on: the settings menu over the game, opened with F1 or the Home / Guide (or Capture / Share) button of\r\n"
@@ -216,6 +223,7 @@ static BOOL CALLBACK opt_load(PINIT_ONCE once, PVOID arg, PVOID *ctx) {
         else if (!_stricmp(key, "console_mode")) o->handheld = !_stricmp(val, "handheld");
         else if (!_stricmp(key, "resolution_scale")) { float v = (float)atof(val); if (v > 0) o->scale = v; }
         else if (!_stricmp(key, "anisotropic_filtering")) { int v = atoi(val); o->aniso = v == 2 || v == 4 || v == 8 || v == 16 ? v : 0; }
+        else if (!_stricmp(key, "aspect")) o->aspect = !_stricmp(val, "stretch") || !_stricmp(val, "fill") || !strcmp(val, "1");
         else if (!_stricmp(key, "frame_time_overlay")) o->overlay = !_stricmp(val, "on") || !strcmp(val, "1");
         else if (!_stricmp(key, "profile")) o->profile = !_stricmp(val, "low");
         else if (!_stricmp(key, "shader_wait")) o->shader_skip = !_stricmp(val, "skip");

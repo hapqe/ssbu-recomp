@@ -23,6 +23,7 @@ import android.widget.ArrayAdapter;
 import android.widget.Button;
 import android.widget.EditText;
 import android.widget.LinearLayout;
+import android.widget.CheckBox;
 import android.widget.ProgressBar;
 import android.widget.ScrollView;
 import android.widget.Spinner;
@@ -60,7 +61,8 @@ public class LauncherActivity extends Activity {
     private TextView checks, device, status, driverInfo;
     private Button start, access, copy;
     private ProgressBar progress;
-    private Spinner touch, resolution;
+    private Spinner touch, resolution, aspect;
+    private CheckBox fps;
     /* the game's render resolution: resolution_scale of graphics.ini against the Switch's 1920x1080 (SSBU_VK_SCALE) */
     private static final String[] RES_NAMES = {"From graphics.ini", "540p (0.5x)", "720p (0.67x)", "900p (0.83x)", "1080p (native)", "1440p (1.33x)", "2160p (2x)"};
     private static final String[] RES_SCALE = {null, "0.5", "0.6667", "0.8333", "1.0", "1.3333", "2.0"};
@@ -132,6 +134,14 @@ public class LauncherActivity extends Activity {
         col.addView(label("Render resolution (lower = faster)"));
         resolution = spinner(RES_NAMES, p.getInt("resolution", 0));
         col.addView(resolution);
+        /* the game's picture is 16:9; aspect = keep | stretch of graphics.ini (SSBU_ASPECT, display.c display_fit) */
+        col.addView(label("Picture shape"));
+        aspect = spinner(new String[] {"From graphics.ini", "16:9 with black bars (the game's own shape)", "Fill the screen (" + screenShape() + ", stretched)"}, p.getInt("aspect", 0));
+        col.addView(aspect);
+        fps = new CheckBox(this);
+        fps.setText("Show the frame rate (frames per second and frame time, top left)");
+        fps.setChecked(p.getBoolean("fps", false));
+        col.addView(fps);
         col.addView(label("Extra settings (one NAME=VALUE per line, e.g. SSBU_VK_MISSING=warn)"));
         extraEnv = new EditText(this);
         extraEnv.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
@@ -259,7 +269,18 @@ public class LauncherActivity extends Activity {
     private void save() {
         getSharedPreferences(PREFS, MODE_PRIVATE).edit().putString("folder", folder.getText().toString().trim())
                 .putString("env", extraEnv.getText().toString()).putInt("touch_mode", touch.getSelectedItemPosition())
-                .putInt("resolution", resolution.getSelectedItemPosition()).apply();
+                .putInt("resolution", resolution.getSelectedItemPosition())
+                .putInt("aspect", aspect.getSelectedItemPosition()).putBoolean("fps", fps.isChecked()).apply();
+    }
+
+    /** The screen's shape held in landscape, e.g. "20:9" (2400x1080), the cut-out of a camera included. */
+    private String screenShape() {
+        android.graphics.Rect r = getWindowManager().getMaximumWindowMetrics().getBounds();
+        int w = Math.max(r.width(), r.height()), h = Math.min(r.width(), r.height());
+        if (h <= 0) return "the screen's shape";
+        String n = String.format(Locale.ROOT, "%.2f", w * 9.0 / h);
+        if (n.endsWith(".00")) n = n.substring(0, n.length() - 3);
+        return n + ":9";
     }
 
     private Spinner spinner(String[] items, int sel) {
@@ -441,6 +462,9 @@ public class LauncherActivity extends Activity {
         if (driver != null) env.add("SSBU_VK_DRIVER=" + driver.getAbsolutePath());     /* first: an extra setting can override it */
         String scale = RES_SCALE[resolution.getSelectedItemPosition()];
         if (scale != null) env.add("SSBU_VK_SCALE=" + scale);                       /* before the extra settings: one of them can override it */
+        int as = aspect.getSelectedItemPosition();
+        if (as > 0) env.add("SSBU_ASPECT=" + (as == 2 ? "stretch" : "keep"));
+        if (fps.isChecked()) env.add("SSBU_FPS=1");
         for (String l : extraEnv.getText().toString().split("\n")) { l = l.trim(); if (l.contains("=") && !l.startsWith("#")) env.add(l); }
         env.add("SSBU_LOCALE=" + Locale.getDefault().toLanguageTag());
         env.add("SSBU_REGION=" + Locale.getDefault().getCountry());

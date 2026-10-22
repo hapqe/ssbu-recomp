@@ -325,9 +325,26 @@ int oe_exit_request(void);                            /* nnmisc.c */
  * borderless window over the whole monitor it is on. */
 #define ASPECT_W 16
 #define ASPECT_H 9
+/* 2026-10-22: aspect = stretch (graphics.ini; SSBU_ASPECT=keep|stretch wins): the picture fills the window or the device's
+ * screen whatever its shape, no bars (a phone's 20:9 is filled by the 16:9 picture widened by 25 %). */
+static volatile int g_aspect = -1;
+int display_aspect_stretch(void);
+void display_set_aspect(int stretch) { display_aspect_stretch(); g_aspect = stretch != 0; }      /* the settings menu (menu.cpp): live */
+int display_aspect_stretch(void) {
+    int v = g_aspect;
+    if (v < 0) {
+        const char *e = getenv("SSBU_ASPECT");
+        v = e && e[0] ? (!_stricmp(e, "stretch") || !_stricmp(e, "fill") || !strcmp(e, "1")) : gfx_options()->aspect;
+        printf("display: aspect %s (%s)\n", v ? "stretch: the picture fills the window or screen" : "keep: the 16:9 picture, black bars beside or above it", e && e[0] ? "SSBU_ASPECT" : "graphics.ini aspect");
+        fflush(stdout);
+        g_aspect = v;
+    }
+    return v;
+}
 void display_fit(int sw, int sh, int dw, int dh, int out[4]) {      /* the largest rectangle of sw:sh in dw x dh, centred: x, y, w, h */
     out[0] = 0; out[1] = 0; out[2] = dw; out[3] = dh;
     if (sw <= 0 || sh <= 0 || dw <= 0 || dh <= 0) return;
+    if (sw == ASPECT_W && sh == ASPECT_H && display_aspect_stretch()) return;      /* the game's picture, stretched: the whole of dw x dh */
     if ((long long)dw * sh > (long long)dh * sw) { out[2] = (int)((long long)dh * sw / sh); out[0] = (dw - out[2]) / 2; }      /* wider: bars left and right */
     else if ((long long)dw * sh < (long long)dh * sw) { out[3] = (int)((long long)dw * sh / sw); out[1] = (dh - out[3]) / 2; }  /* taller: bars above and below */
     if (dw - out[2] <= 2 && dh - out[3] <= 2) { out[0] = 0; out[1] = 0; out[2] = dw; out[3] = dh; }   /* within 2 px of 16:9 (1366x768): fill, no bars */
@@ -458,7 +475,7 @@ static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM w, LPARAM l) {
         if (!g_frames) { RECT rc; GetClientRect(h, &rc); FillRect((HDC)w, &rc, (HBRUSH)GetStockObject(BLACK_BRUSH)); }
         return 1;
     }
-    if (m == WM_SIZING && !g_full) { sizing_keep_aspect(h, w, (RECT *)l); return TRUE; }
+    if (m == WM_SIZING && !g_full && !display_aspect_stretch()) { sizing_keep_aspect(h, w, (RECT *)l); return TRUE; }
     if (m == WM_KEYDOWN && w == VK_F11 && !(l & (1 << 30))) { toggle_fullscreen(h); return 0; }      /* bit 30: auto-repeat of a held key */
     if (m == WM_APP + 0x51) { window_mode_set(h, (int)w); return 0; }                                 /* U1: the settings menu (menu.cpp) */
     if (m == WM_APP + 0x52) { window_size_set(h, (int)w, (int)l); return 0; }

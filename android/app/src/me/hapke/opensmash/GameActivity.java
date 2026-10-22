@@ -48,6 +48,14 @@ public class GameActivity extends SDLActivity {
             int eq = kv.indexOf('=');
             if (eq > 0) try { Os.setenv(kv.substring(0, eq), kv.substring(eq + 1), true); } catch (Exception ignored) { }
         }
+        /* aspect = stretch (SSBU_ASPECT, display.c): the picture fills the whole screen, the camera's cut-out included
+         * (without this the window in landscape stops short of the cut-out's edge of the screen) */
+        String as = Os.getenv("SSBU_ASPECT");
+        if (as != null && (as.equalsIgnoreCase("stretch") || as.equalsIgnoreCase("fill") || as.equals("1"))) {
+            WindowManager.LayoutParams lp = getWindow().getAttributes();
+            lp.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
+            getWindow().setAttributes(lp);
+        }
         super.onCreate(saved);
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         /* touch_mode (LauncherActivity): 0 auto = shown while no controller is connected, 1 on, 2 off. A controller that
