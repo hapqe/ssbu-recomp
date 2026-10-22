@@ -193,6 +193,29 @@ static void ww_reset(Alloc *x, uintptr_t a, uintptr_t e) {
         p = q;
     }
 }
+/* 2026-10-22 (memory footprint), SSBU_VA_NAMES=1 (diagnosis): every new VirtualAlloc mapping is named "va <caller>" in
+ * /proc/self/smaps (the caller's offset in its library), so that the process's anonymous memory can be told apart.
+ * The names stay allocated (the 5.10 kernels keep the user pointer). */
+#include <sys/prctl.h>
+#include <dlfcn.h>
+static void va_name(void *m, size_t len, void *ra) {
+    static int on = -1;
+    static struct { void *ra; char *name; } tab[512];
+    static int n;
+    if (on < 0) on = getenv("SSBU_VA_NAMES") && atoi(getenv("SSBU_VA_NAMES"));
+    if (!on) return;
+    char *name = NULL;
+    for (int i = 0; i < n; i++) if (tab[i].ra == ra) { name = tab[i].name; break; }
+    if (!name) {
+        Dl_info di;
+        char b[96];
+        if (dladdr(ra, &di) && di.dli_fname) { const char *f = strrchr(di.dli_fname, '/'); snprintf(b, sizeof b, "va %s+%lx", f ? f + 1 : di.dli_fname, (unsigned long)((uintptr_t)ra - (uintptr_t)di.dli_fbase)); }
+        else snprintf(b, sizeof b, "va %p", ra);
+        name = strdup(b);
+        if (n < 512) { tab[n].ra = ra; tab[n++].name = name; }
+    }
+    prctl(0x53564d41, 0, m, len, name);
+}
 LPVOID VirtualAlloc(LPVOID addr, SIZE_T size, DWORD type, DWORD prot) {
     if (!size) { t_last_error = ERROR_INVALID_PARAMETER; return NULL; }
     uintptr_t a = (uintptr_t)addr & ~(PAGE - 1);
@@ -224,6 +247,7 @@ LPVOID VirtualAlloc(LPVOID addr, SIZE_T size, DWORD type, DWORD prot) {
         pthread_mutex_unlock(&g_alloc_mu);
         return NULL;
     }
+    if (!guest) va_name(m, len, __builtin_return_address(0));
     x = calloc(1, sizeof *x);
     x->base = (uintptr_t)m; x->size = len; x->prot0 = prot;
     x->page = malloc(len / PAGE);

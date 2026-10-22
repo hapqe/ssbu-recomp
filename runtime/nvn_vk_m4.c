@@ -57,6 +57,16 @@ static int wd_enter(const char *fn, int line) {
 static void wd_leave(int i) { if (i >= 0) g_wd_wait[i].tid = 0; }
 #define WD_SLEEP(cv, lock, ms) do { int wd_i_ = wd_enter(__func__, __LINE__); SleepConditionVariableCS(cv, lock, ms); wd_leave(wd_i_); } while (0)
 static VkPipelineCache g_pcache;
+#ifdef SSBU_ANDROID
+static long anon_kb(void) {                        /* 2026-10-22 (memory footprint): RssAnon + VmSwap of the process, KB */
+    FILE *f = fopen("/proc/self/status", "r");
+    char line[128]; long a = 0, w = 0, v;
+    if (!f) return 0;
+    while (fgets(line, sizeof line, f)) { if (sscanf(line, "RssAnon: %ld", &v) == 1) a = v; else if (sscanf(line, "VmSwap: %ld", &v) == 1) w = v; }
+    fclose(f);
+    return a + w;
+}
+#endif
 static LONG64 g_pw_stages, g_pw_pipes, g_pw_failed, g_pipe_miss;
 #include "nvn_vk_prewarm.h"                         /* PR #33: SSBU_VK_PREWARM_PROFILE=1, the prewarm's measurements; pw_graphics / pw_compute */
 static VStage *g_vstage[4096], *g_vh[4096];        /* by hb, by h */
@@ -1736,12 +1746,16 @@ static void prewarm_start(void) {
         FILE *fp = !load || map ? NULL : fopen(g_pcache_path, "rb");
         if (fp) { _fseeki64(fp, 0, SEEK_END); long long n = _ftelli64(fp); _fseeki64(fp, 0, SEEK_SET); if (n > 0 && (data = malloc((size_t)n)) && fread(data, 1, (size_t)n, fp) == (size_t)n) { ci.initialDataSize = (size_t)n; ci.pInitialData = data; } fclose(fp); }
         tp1 = tk();
+#ifdef SSBU_ANDROID
+        long anon0 = anon_kb();
+#endif
         if (vkCreatePipelineCache(V.device, &ci, NULL, &g_pcache) != VK_SUCCESS) { ci.initialDataSize = 0; ci.pInitialData = NULL; VKC(vkCreatePipelineCache(V.device, &ci, NULL, &g_pcache)); }
         /* session 11: what the whole-file read costs at every start (file read, then the driver taking the data) */
         printf("nvn_vk: pipeline cache %s: %llu KB read (file read %.0f ms, driver took it in %.0f ms: start-up time on the thread that creates the device)\n", g_pcache_path, (unsigned long long)(ci.initialDataSize >> 10), (double)(tp1 - tp0) * 1000.0 / (double)pfq.QuadPart, (double)(tk() - tp1) * 1000.0 / (double)pfq.QuadPart);
         free(data);
 #ifdef SSBU_ANDROID
         if (map) munmap(map, map_n);
+        printf("nvn_vk_mem: the driver's pipeline cache took %ld MB of private memory (anon + swap %ld -> %ld MB)\n", (anon_kb() - anon0) >> 10, anon0 >> 10, anon_kb() >> 10);
 #endif
     }
     /* Blind prediction (pair x most used pass signatures) is OFF unless SSBU_VK_PREDICT=1: measured on a first run it made

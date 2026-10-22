@@ -312,7 +312,7 @@ static VkBuffer vbuf_new(uint64_t size, VkFlags usage, VMem *mem) {
 
 /* ---------------------------------------------------------------- command buffers in flight */
 #define NSLOT 8
-typedef struct { VkCommandBuffer cmd; VkFence fence; VkDescriptorPool pool[16]; int npool, ipool, pending; uint64_t serial; LONG64 ts_frame; } Slot;
+typedef struct { VkCommandBuffer cmd; VkFence fence; VkDescriptorPool pool[64]; int npool, ipool, pending, pool_need, pool_quiet; uint64_t serial; LONG64 ts_frame; } Slot;
 typedef struct VTex VTex;
 static struct {
     Slot slot[NSLOT]; int cur, recording; uint64_t serial, done;      /* serial: number of the last submission; done: every submission up to here has finished */
@@ -461,6 +461,10 @@ static void cmd_begin(void) {
     if (evpoll_on()) {
         if (!g_slot_ev[R.cur]) { VkEventCreateInfo ei = {VK_STRUCTURE_TYPE_EVENT_CREATE_INFO}; if (vkCreateEvent(V.device, &ei, NULL, &g_slot_ev[R.cur]) != VK_SUCCESS) g_slot_ev[R.cur] = NULL; }
         if (g_slot_ev[R.cur]) vkResetEvent(V.device, g_slot_ev[R.cur]);
+    }
+    if (s->npool > 1) {                            /* 2026-10-22: pools a loading screen needed go once 300 uses of the slot did with fewer (its last use has finished) */
+        if (s->ipool + 1 > s->pool_need) s->pool_need = s->ipool + 1;
+        if (++s->pool_quiet >= 300) { while (s->npool > s->pool_need) vkDestroyDescriptorPool(V.device, s->pool[--s->npool], NULL); s->pool_quiet = 0; s->pool_need = 1; }
     }
     for (int i = 0; i < s->npool; i++) VKC(vkResetDescriptorPool(V.device, s->pool[i], 0));
     s->ipool = 0;
@@ -1655,10 +1659,13 @@ static VkDescriptorSet set_alloc(VkDescriptorSetLayout layout) {
             s->ipool++;
             continue;
         }
-        if (s->npool == 16) vkd_fail("more than 16 descriptor pools in one command buffer");
-        VkDescriptorPoolSize ps[2] = {{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 32768}, {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 32768}};
+        /* 2026-10-22 (memory footprint): a quarter of the old pool (32768 + 32768 descriptors, 8192 sets: ~6 MB of device
+         * memory each on Turnip, one per command buffer in flight = 48 MB; a fight frame needs a small part of one), up to 64
+         * of them per command buffer (the old capacity: 16 of the large ones) */
+        if (s->npool == 64) vkd_fail("more than 64 descriptor pools in one command buffer");
+        VkDescriptorPoolSize ps[2] = {{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 8192}, {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 8192}};
         VkDescriptorPoolCreateInfo pi = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-        pi.maxSets = 8192; pi.poolSizeCount = 2; pi.pPoolSizes = ps;
+        pi.maxSets = 2048; pi.poolSizeCount = 2; pi.pPoolSizes = ps;
         VKC(vkCreateDescriptorPool(V.device, &pi, NULL, &s->pool[s->npool++]));
     }
 }
@@ -3949,6 +3956,10 @@ static void mem_report(LONG64 frame) {
     printf(" | blocks (MB, free inside):");
     static const char *cname[5] = {"images", "buffers", "host compute", "device compute", "large"};
     for (int c = 0; c < 5; c++) if (cn[c]) printf(" %s %d = %lld (%lld free)", cname[c], cn[c], (long long)(cs[c] >> 20), (long long)(cf[c] >> 20));
+    {   int np = 0, mx = 0;
+        for (int i = 0; i < NSLOT; i++) { np += R.slot[i].npool; if (R.slot[i].npool > mx) mx = R.slot[i].npool; }
+        printf(" | descriptor pools %d (at most %d in one command buffer)", np, mx);
+    }
     printf(" | largest:");
     for (int i = 0; i < 6 && top[i]; i++) printf(" %dx%dx%d L%d l%d fmt %d %s %.1f MB;", top[i]->w, top[i]->h, top[i]->d, top[i]->levels, top[i]->layers, (int)top[i]->fmt,
                                                 top[i]->t && top[i]->t->gpu_written ? "gpu" : "tex", (double)top[i]->mem.size / 1048576.0);
