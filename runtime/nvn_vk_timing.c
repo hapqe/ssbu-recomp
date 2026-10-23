@@ -65,7 +65,11 @@ static void dtl_line(FILE *out) {
  * 98 % were ready a whole refresh before they were taken (presentMargin). So the picture is even and the delay is the
  * smallest the frame times allow. Only when the refresh is under 12 ms (a 60 Hz panel shows every frame for one refresh
  * anyway). NOT VERIFIED YET: the one test run (SSBU_FRAME_RATE=120, 2026-10-23) lost its log to a crash, so it is off unless
- * SSBU_VK_EVEN=1 (with SSBU_FRAME_RATE=120 on a 120 Hz panel). */
+ * SSBU_VK_EVEN=1 (with SSBU_FRAME_RATE=120 on a 120 Hz panel).
+ * Measured in fights on the Marble (2026-10-23), fight frames shown for 1 / 2 / 3 refreshes: plain 120 Hz 15 / 70 / 14 %;
+ * EVN rounding each poll + D up alone 7 / 86 / 7 %; with the cadence held (evn_desired) 2.3 / 95.6 / 1.9 %, poll -> on
+ * screen 32.3 ms mean (60 Hz: 45.3, plain 120 Hz: 24.5). D still swings 16.7 <-> 41.8 ms: the lowering test reads
+ * presentMargin, which a held frame always shows as early. */
 static struct {
     int want, on;
     PFN_vkGetRefreshCycleDurationGOOGLE rcd;
@@ -120,7 +124,13 @@ static LONG64 evn_desired(uint32_t id, LONG64 poll, LONG64 now) {
     LONG64 t = (poll ? poll : now) + EVN.D, R = EVN.R;
     LONG64 n = (t - EVN.anchor + R - 1) / R;                         /* up onto the refresh grid (true present times) */
     t = EVN.anchor + n * R;
-    if (EVN.last_desired && t < EVN.last_desired + EVN.P - R / 2) t = EVN.last_desired + EVN.P;
+    /* the cadence holds: one game frame after the last one, also when poll + D lands up to a refresh past it (the polls
+     * jitter by a few ms; rounding each one up alone showed 14 % of the frames for 8 / 25 ms on the Marble, 2026-10-23),
+     * as long as that time is still a refresh away. A late frame moves the cadence (a raise of D shifts it a refresh). */
+    if (EVN.last_desired) {
+        LONG64 next = EVN.last_desired + EVN.P;
+        if (t < next - R / 2 || (t <= next + R && next >= now + R)) t = next;
+    }
     if (t < now) return 0;
     EVN.last_desired = t;
     EVN.desired[id & 255] = t;
