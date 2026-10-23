@@ -645,6 +645,16 @@ static void fill_pad(uint64_t out, uint32_t id, int kind) {
     if (ry > STICK_MAX / 2) buttons |= 1ull << (BTN_SL_UP + 4);
     if (rx > STICK_MAX / 2) buttons |= 1ull << (BTN_SL_RIGHT + 4);
     if (ry < -STICK_MAX / 2) buttons |= 1ull << (BTN_SL_DOWN + 4);
+    {   /* 2026-10-23, SSBU_L1IN=1 (test, input latency): a player's pad as the game's poll saw it change (QPC = CLOCK_MONOTONIC ns
+         * on Android: the same clock as an injector's write and as nvn_vk_timing.c's "l1in-frame:" lines) */
+        static int l1in = -1; static uint64_t pb[8]; static int pl[8][2];
+        if (l1in < 0) l1in = getenv("SSBU_L1IN") && atoi(getenv("SSBU_L1IN"));
+        if (l1in && (buttons != pb[id] || lx != pl[id][0] || ly != pl[id][1])) {
+            LARGE_INTEGER q; QueryPerformanceCounter(&q);
+            printf("l1in-poll: %lld player %u buttons %llx lx %d ly %d\n", (long long)q.QuadPart, (unsigned)id + 1, (unsigned long long)buttons, lx, ly);
+            pb[id] = buttons; pl[id][0] = lx; pl[id][1] = ly;
+        }
+    }
     wr64(out + 8, buttons);
     if (g_test_vk && (int)id == g_keyboard_player) { InterlockedIncrement(&g_test_polls); InterlockedOr64(&g_test_seen, (LONG64)buttons); }      /* U1 test only */
     if (id == 0) { void display_l1_poll(uint64_t buttons, long long fight_ticks, long long poll); int r1_ra_phase(void); if (r1_ra_phase() != 1) display_l1_poll(buttons, l1_ticks, (long long)g_seq_polls); }      /* (R1 run-ahead: the speculative pass's poll is not a poll of the real timeline) */      /* L1 (input latency): the time of player 1's poll, the press it saw */

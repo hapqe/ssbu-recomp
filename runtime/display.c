@@ -976,6 +976,9 @@ static void l1_done(int fight, LONG64 shown) {
     }
     f->call = 0;
 }
+/* render thread, before vkQueuePresentKHR (nvn_vk_timing.c, 2026-10-23): player 1's poll of the frame presented now (0 = it
+ * did not read the pad after its release), to set against the time the display really showed it */
+LONG64 display_l1_cur_poll(void) { return g_l1_cur.call ? g_l1_cur.poll : 0; }
 /* game thread, end of display_wait_refresh (normal speed): latency = low / lowest delays the release */
 static void lat_release(void) {
     static HANDLE timer;
@@ -1038,6 +1041,32 @@ static int late_go(void) {
     }
     return on;
 }
+/* 2026-10-23, QUEUE DRAIN (the owner's "input latency is sometimes more, sometimes less" on Android). Measured on the
+ * Marble with the true times on screen (nvn_vk_timing.c): the compositor shows ONE buffer per refresh in order (it does not
+ * drop an older one for a newer, mailbox or not), so a late frame followed by its catch-up frame (SSBU_PACE_LATE) puts two
+ * presents into one refresh and from then on every frame waits a whole refresh in the queue: +16.7 ms from the pad to the
+ * screen, for 10-60 s, until a late frame without a catch-up empties the queue again. In 7,000 menu frames the two states
+ * alternated in runs of hundreds to 1,500 frames: frames ready 2-8 ms before the compositor took them, or 16-25 ms.
+ * Here: nvn_vk_timing.c reports for every frame whether it was ready longer than 0.6 of a game frame before it was latched
+ * (display_queue_report); after DRAIN_RUN such frames in a row the game is held for one tick more at its next present
+ * (display_present_plan): one picture stays on screen for two refreshes (as at any late frame; the game steps its logic by
+ * the refreshes it counts, so its time is not changed) and the queue is empty again. At most one drain per DRAIN_GAP frames.
+ * SSBU_QUEUE_DRAIN=0 off; default on where the true times are known (Android). */
+#define DRAIN_RUN 12
+#define DRAIN_GAP 120
+static volatile LONG g_drain_req, g_drain_run;
+static LONG64 g_drains, g_drain_last, g_drain_deep, g_drain_seen;
+static int g_drain_on = -1;
+void display_queue_report(LONG64 margin_ns) {
+    if (g_drain_on < 0) { const char *e = getenv("SSBU_QUEUE_DRAIN"); g_drain_on = e ? atoi(e) != 0 : 1; printf("display: queue drain %s (SSBU_QUEUE_DRAIN)%c", g_drain_on ? "on: a frame that waited a whole refresh in the compositor's queue for 12 frames in a row empties it (one tick held)" : "off", 10); }
+    double per = g_lock_k ? (double)g_lock_k * g_vb_period : (double)g_freq.QuadPart / 60.0;
+    int deep = (double)margin_ns * (double)g_freq.QuadPart / 1e9 > 0.6 * per;
+    g_drain_seen++;
+    if (deep) g_drain_deep++;
+    if (!g_drain_on || g_lockstep) return;
+    if (!deep) { g_drain_run = 0; return; }
+    if (++g_drain_run >= DRAIN_RUN && g_frames - g_drain_last >= DRAIN_GAP && !g_drain_req) InterlockedExchange(&g_drain_req, 1);
+}
 /* Session 14, game thread, BEFORE the present job goes to the render thread (Vulkan only; OpenGL keeps the path above):
  * the refresh that shows this frame, by the same rule as frame_queued, and whether the present is held for it. A frame
  * queued before the tick it is due at (on time) is held until that tick; a late one is presented at once. */
@@ -1050,6 +1079,10 @@ void display_present_plan(int vulkan) {
     if (!iv) at = now_n;
     else if (at < prev + iv) at = prev + iv;
     else if (!on_time && late_go()) at = now_n;            /* late: the game goes on at once (see late_go) */
+    if (iv && g_drain_req && InterlockedExchange(&g_drain_req, 0)) {      /* queue drain (above): one tick more for the next frame */
+        at += 1; g_drains++; g_drain_last = g_frames; g_drain_run = 0;
+        if (g_drains <= 20) printf("display: queue drain %lld at presented frame %lld: frames waited a whole refresh in the compositor's queue; the game is held one tick%c", (long long)g_drains, (long long)g_frames, 10);
+    }
     g_latch = at;
     InterlockedExchange(&g_latch_pending, iv != 0);
     if (iv && !on_time) g_hold_late++;
@@ -1279,6 +1312,7 @@ void display_report(FILE *out) {
         fprintf(out, "display-timing: presents by tenth of a refresh after the vblank before them: %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld\n", (long long)g_ps_phase[0], (long long)g_ps_phase[1], (long long)g_ps_phase[2], (long long)g_ps_phase[3],
                 (long long)g_ps_phase[4], (long long)g_ps_phase[5], (long long)g_ps_phase[6], (long long)g_ps_phase[7], (long long)g_ps_phase[8], (long long)g_ps_phase[9]);
     }
+    if (g_drain_seen) fprintf(out, "display: queue drain: %lld of %lld frames with true times waited a whole refresh in the compositor's queue; %lld drains%s\n", (long long)g_drain_deep, (long long)g_drain_seen, (long long)g_drains, g_drain_on ? "" : " (off)");
     l1_report(out);
     nvn_gl_report(out);
 }

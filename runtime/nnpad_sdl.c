@@ -551,6 +551,18 @@ static void check_config(int force) {             /* lock held */
     if (memcmp(before, g_cfg.pguid, sizeof before) || memcmp(bn, g_cfg.pnone, sizeof bn)) reassign_all();
 }
 
+/* SSBU_L1IN=1: the time (QPC = CLOCK_MONOTONIC ns on Android) at which a controller's change reached SDL: on Android this
+ * runs on the UI thread inside SDL's JNI call (SDLControllerManager -> Android_OnJoy / Android_OnPadDown), so it is the
+ * moment the app was handed the input event; set against an injector's write time and the game's poll (nnhid.c l1in-poll) */
+static bool SDLCALL l1in_watch(void *user, SDL_Event *e) {
+    LARGE_INTEGER q;
+    (void)user;
+    QueryPerformanceCounter(&q);
+    if (e->type == SDL_EVENT_JOYSTICK_AXIS_MOTION) printf("l1in-ev: %lld js %u axis %d value %d\n", (long long)q.QuadPart, (unsigned)e->jaxis.which, e->jaxis.axis, e->jaxis.value);
+    else if (e->type == SDL_EVENT_JOYSTICK_BUTTON_DOWN || e->type == SDL_EVENT_JOYSTICK_BUTTON_UP) printf("l1in-ev: %lld js %u button %d %s\n", (long long)q.QuadPart, (unsigned)e->jbutton.which, e->jbutton.button, e->jbutton.down ? "down" : "up");
+    else if (e->type == SDL_EVENT_JOYSTICK_HAT_MOTION) printf("l1in-ev: %lld js %u hat %d value %d\n", (long long)q.QuadPart, (unsigned)e->jhat.which, e->jhat.hat, e->jhat.value);
+    return true;
+}
 int nnpad_init(void) {
     lock();
     if (g_inited) { unlock(); return g_sdl_ok; }
@@ -562,6 +574,10 @@ int nnpad_init(void) {
     SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS, "1");
     if (!SDL_Init(SDL_INIT_GAMEPAD | SDL_INIT_JOYSTICK | SDL_INIT_EVENTS)) { printf("nn::pad: SDL_Init failed: %s\n", SDL_GetError()); unlock(); return 0; }
     SDL_SetJoystickEventsEnabled(false); SDL_SetGamepadEventsEnabled(false);       /* state is read directly; events would only fill a queue */
+    if (getenv("SSBU_L1IN") && atoi(getenv("SSBU_L1IN"))) {          /* 2026-10-23, test (input latency): when each change reached SDL */
+        SDL_SetJoystickEventsEnabled(true);
+        SDL_AddEventWatch(l1in_watch, NULL);
+    }
     g_sdl_ok = 1;
     if (!g_only_virtual) gca_start();                    /* the GameCube adapter over WinUSB (nnpad_gca.c); its ports come in as virtual gamepads */
     poll_devices();

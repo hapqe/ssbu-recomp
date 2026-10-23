@@ -8,7 +8,10 @@ import android.os.Bundle;
 import android.system.Os;
 import android.text.InputFilter;
 import android.text.InputType;
+import android.util.Log;
 import android.view.InputDevice;
+import android.view.KeyEvent;
+import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.WindowManager;
@@ -63,8 +66,12 @@ public class GameActivity extends SDLActivity {
          * (hat) and analog triggers to the app as joystick MotionEvents, and those are batched until the UI thread's next
          * frame (Choreographer), so SDL's state (SDLControllerManager -> Android_OnJoy) took them 0..1 refresh late, by
          * chance (0-8.4 ms on the Marble's 120 Hz panel, 0-16.7 ms at 60 Hz). Buttons are KeyEvents and were never
-         * batched. Unbuffered dispatch delivers every joystick sample to the focused surface as it arrives. */
-        if (mSurface != null) mSurface.requestUnbufferedDispatch(InputDevice.SOURCE_CLASS_JOYSTICK);
+         * batched. Unbuffered dispatch delivers every joystick sample to the focused surface as it arrives.
+         * SSBU_INPUT_UNBUFFERED=0: batched as before (test). SSBU_L1IN=1: every controller event's age when the app got it in logcat (tag OpenSmashL1). */
+        String ub = Os.getenv("SSBU_INPUT_UNBUFFERED"), li = Os.getenv("SSBU_L1IN");
+        unbuffered = ub == null || !ub.equals("0");
+        l1in = li != null && !li.equals("0");
+        requestUnbuffered();
         /* touch_mode (LauncherActivity): 0 auto = shown while no controller is connected, 1 on, 2 off. A controller that
          * connects takes player 1 from the on-screen pad (nnpad_sdl.c); one that was there at the start left it out (touch) */
         int mode = i.getIntExtra("touch_mode", i.getBooleanExtra("touch", true) ? 1 : 2);
@@ -81,6 +88,31 @@ public class GameActivity extends SDLActivity {
             };
             ((InputManager) getSystemService(Context.INPUT_SERVICE)).registerInputDeviceListener(padWatch, null);
         }
+    }
+
+    private boolean unbuffered, l1in;
+
+    /* a view's request counts only while it is the focused one (ViewGroup.onDescendantUnbufferedRequested reads the focused
+     * child) and a repeated request with the same source returns at once: asked again, through NONE, whenever the window
+     * gets the focus, so that it reaches the window after the surface really took the focus */
+    private void requestUnbuffered() {
+        if (mSurface == null) return;
+        mSurface.requestUnbufferedDispatch(InputDevice.SOURCE_CLASS_NONE);
+        if (unbuffered) mSurface.requestUnbufferedDispatch(InputDevice.SOURCE_CLASS_JOYSTICK);
+    }
+
+    @Override
+    public boolean dispatchGenericMotionEvent(MotionEvent ev) {
+        if (l1in && (ev.getSource() & InputDevice.SOURCE_CLASS_JOYSTICK) != 0)
+            Log.i("OpenSmashL1", "motion age " + (System.nanoTime() - ev.getEventTimeNanos()) + " ns, history " + ev.getHistorySize() + ", x " + ev.getAxisValue(MotionEvent.AXIS_X) + " hatx " + ev.getAxisValue(MotionEvent.AXIS_HAT_X) + ", now " + System.nanoTime());
+        return super.dispatchGenericMotionEvent(ev);
+    }
+
+    @Override
+    public boolean dispatchKeyEvent(KeyEvent ev) {
+        if (l1in && (ev.getSource() & InputDevice.SOURCE_GAMEPAD) == InputDevice.SOURCE_GAMEPAD)
+            Log.i("OpenSmashL1", "key age " + (System.nanoTime() - ev.getEventTime() * 1000000L) + " ns, code " + ev.getKeyCode() + " action " + ev.getAction() + ", now " + System.nanoTime());
+        return super.dispatchKeyEvent(ev);
     }
 
     private void padsChanged() {
@@ -102,6 +134,7 @@ public class GameActivity extends SDLActivity {
     @Override
     public void onWindowFocusChanged(boolean hasFocus) {
         super.onWindowFocusChanged(hasFocus);
+        if (hasFocus) requestUnbuffered();
         if (hasFocus) getWindow().getDecorView().setSystemUiVisibility(View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY | View.SYSTEM_UI_FLAG_FULLSCREEN
                 | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION | View.SYSTEM_UI_FLAG_LAYOUT_STABLE | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN);
     }
