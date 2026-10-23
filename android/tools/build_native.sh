@@ -77,7 +77,7 @@ $CC -c "$ROOT/android/compat/win32_compat_fiber.S" -o "$OBJ/compat_fiber.o"
 objs+=("$OBJ/compat_fiber.o")
 
 echo "== link libmain.so (${#objs[@]} objects)"
-$CC -shared -o "$LIB/libmain.so" "${objs[@]}" -L"$DEPS/sdl3/install/lib" -lSDL3 -L"$DEPS/adrenotools/install/lib" -ladrenotools -llog -landroid -laaudio -lmediandk -lm -ldl \
+$CC -shared -o "$LIB/libmain.so" "${objs[@]}" -L"$DEPS/sdl3/install/lib" -lSDL3 -L"$DEPS/adrenotools/install/lib" -ladrenotools -llog -landroid -lnativewindow -laaudio -lmediandk -lm -ldl \
     -Wl,--gc-sections -Wl,--no-dependent-libraries -Wl,-z,max-page-size=16384 -Wl,--no-undefined -Wl,-soname,libmain.so
 
 echo "== link libssbu_glslang.so"

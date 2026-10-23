@@ -70,6 +70,11 @@ folder (the runtime's `nn::aoc`, `runtime/nnmisc.c`). At the next start the game
 | Show the frame rate | frames per second and frame time in the top left corner |
 | Extra settings | any `SSBU_*` variable, one per line |
 
+The game asks the system for 60 Hz (`SSBU_FRAME_RATE`, default 60; 0 leaves the choice to the system). Phones with a
+120 Hz screen otherwise switch to 120 Hz whenever the screen is touched, and a 60 fps game then looks uneven: frames stay
+on screen for 8, 17 or 25 ms instead of always 17 ms, although the frame counter shows 60. The game log's
+`nvn_vk_timing:` lines report how long each frame was really on screen (from the display, `VK_GOOGLE_display_timing`).
+
 Controllers: Android gamepads through SDL3 (an Xbox 360-type pad was tested); a connected controller is player 1.
 
 ## Known limits

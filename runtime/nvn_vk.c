@@ -240,6 +240,24 @@ static int surface_remake(void) {
     V.surface_lost = 0;
     return 1;
 }
+/* 2026-10-23, the owner: "60 fps, yet it feels choppier". Measured on the Marble (dumpsys SurfaceFlinger --latency): with
+ * no finger on the screen its panel runs at 60 Hz and every frame is on screen for 16.7 ms; while the screen is touched
+ * (the on-screen controls: always, in play) the system raises it to 120 Hz, and frames that are ready a little earlier
+ * or later than usual then take the refresh before or after their slot: 33 / 60 / 32 of 125 frames on screen for 8.4 /
+ * 16.7 / 25 ms, in a menu. The surface now asks for the game's rate (ANativeWindow_setFrameRate, compatibility
+ * "default": an explicit vote that the system's touch boost leaves alone), so the panel stays at 60 Hz and every frame
+ * is on screen for one refresh. SSBU_FRAME_RATE=<Hz>, 0 = no request (the system's choice, as before). */
+static void frame_rate_vote(void) {
+    static ANativeWindow *done;
+    static float hz = -1;
+    ANativeWindow *w = (ANativeWindow *)V.hwnd;
+    if (hz < 0) { const char *e = getenv("SSBU_FRAME_RATE"); hz = e ? (float)atof(e) : 60.0f; if (hz < 0) hz = 0; }
+    if (!w || w == done) return;
+    done = w;
+    int r = ANativeWindow_setFrameRate(w, hz, ANATIVEWINDOW_FRAME_RATE_COMPATIBILITY_DEFAULT);
+    if (hz > 0) printf("nvn_vk: the window asks the display for %.2f frames per second (ANativeWindow_setFrameRate: %d; SSBU_FRAME_RATE): a 120 Hz panel stays at 60 Hz while the screen is touched\n", (double)hz, r);
+    else printf("nvn_vk: the window asks the display for no rate (SSBU_FRAME_RATE=0): the system's choice\n");
+}
 #endif
 /* Returns 0 when there is nothing to present to (a minimised window has a zero-sized surface, a lost one is made again
  * at the next call). */
@@ -320,6 +338,9 @@ static int swapchain_create(void) {
     memcpy(V.images, V.sc_images, sizeof V.images);     /* V.rot: rot_images (nvn_vk_draw.c) puts the landscape ones in their place */
     V.extent = ext;
     if (V.rot) { V.extent.width = ext.height; V.extent.height = ext.width; }
+#ifdef SSBU_ANDROID
+    frame_rate_vote();
+#endif
     return 1;
 }
 
@@ -694,7 +715,9 @@ void nvn_vk_shutdown(void) {
     fflush(stdout);
 }
 
+static void dtm_report(FILE *out);                     /* nvn_vk_timing.c */
 void nvn_vk_report(FILE *out) {
+    dtm_report(out);
     fprintf(out, "nvn_vk: %lld frames presented, %lld not presented (no surface area or a failed call), swapchain made again %lld times, %lld Vulkan call failures, %lld validation messages (%s), %lld calls of operations that are not implemented\n",
             (long long)g_vk_frames, (long long)g_vk_skipped, (long long)g_vk_recreated, (long long)g_vk_errors, (long long)g_vk_messages, V.validate ? "layer on" : "layer off", (long long)g_vk_missing_calls);
 }

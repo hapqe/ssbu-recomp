@@ -52,8 +52,8 @@ static struct {
 #ifdef VK_KHR_portability_subset
     VkPhysicalDevicePortabilitySubsetFeaturesKHR port; int has_port;
 #endif
-    const char *exts[16]; uint32_t next;
-    int has_vids, has_cbc, has_pv, has_iu8, has_plr, has_vad, has_push, has_eds3, debug;
+    const char *exts[20]; uint32_t next;
+    int has_vids, has_cbc, has_pv, has_iu8, has_plr, has_vad, has_push, has_eds3, debug, has_dtm;
     int has_gpl, ext_gpl, ext_so, has_fault, has_ckpt;
     VkPhysicalDeviceMemoryProperties mp;
 } D;
@@ -94,6 +94,7 @@ static int vk_gpl_mode(void) {
 }
 
 /* ---------------------------------------------------------------- device features */
+static int dtm_want(void);                          /* nvn_vk_timing.c */
 static void vkd_device_info(VkDeviceCreateInfo *di, const VkExtensionProperties *dext, uint32_t ndext) {
     void **tail;
     vkGetPhysicalDeviceFeatures2 = vk_sym("vkGetPhysicalDeviceFeatures2");
@@ -132,6 +133,7 @@ static void vkd_device_info(VkDeviceCreateInfo *di, const VkExtensionProperties 
 #undef EXT
     if (getenv("SSBU_VK_CHECKPOINTS") && atoi(getenv("SSBU_VK_CHECKPOINTS")) && has_name(dext, ndext, "VK_NV_device_diagnostic_checkpoints")) { D.has_ckpt = 1; D.exts[D.next++] = "VK_NV_device_diagnostic_checkpoints"; }
     if (has_name(dext, ndext, "VK_KHR_push_descriptor") && !(getenv("SSBU_VK_PUSH") && !atoi(getenv("SSBU_VK_PUSH")))) { D.has_push = 1; D.exts[D.next++] = "VK_KHR_push_descriptor"; }
+    { if (dtm_want() && has_name(dext, ndext, "VK_GOOGLE_display_timing")) { D.has_dtm = 1; D.exts[D.next++] = "VK_GOOGLE_display_timing"; } }      /* nvn_vk_timing.c */
     vkGetPhysicalDeviceFeatures2(V.gpu, &D.f2);                    /* every supported feature of these structures is enabled */
     D.has_fault = D.has_fault && D.fault.deviceFault; D.fault.deviceFaultVendorBinary = VK_FALSE;
     D.has_vids = D.has_vids && D.vids.vertexInputDynamicState; D.has_cbc = D.has_cbc && D.cbc.customBorderColors && D.cbc.customBorderColorWithoutFormat;
@@ -3878,6 +3880,7 @@ static void present_flush(void) {
 void nvn_vk_present_flush_job(void *arg) { (void)arg; if (V.alive) present_flush(); }
 #include "nvn_vk_menu.c"                          /* U1: the settings menu over the picture (menu.cpp builds it) */
 #include "nvn_vk_rot.c"                           /* Android: the frame turned into the portrait swapchain (rot_images, rot_draw) */
+#include "nvn_vk_timing.c"                        /* 2026-10-23: true times on screen (VK_GOOGLE_display_timing: dtm_present, dtm_report) */
 #include "nvn_vk_flash.c"                         /* session 13: the white-flash detector (fl_pass, fl_capture, fl_shutdown) */
 /* nvn_vk_m4.c m4_barrier, render thread, g_sh_lock NOT held: the held loading screen once more, with the bar at `frac` */
 static void present_progress(float frac) { if (!g_ovl.bar_arg) return; g_ovl.frac = frac; g_ovl.thick = 8; vk_present2(g_ovl.bar_arg, 1); g_ovl.thick = 0; }
@@ -4183,12 +4186,14 @@ swap: ;
         tp[4] = tk();
         VkPresentInfoKHR pr = {VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
         pr.waitSemaphoreCount = 1; pr.pWaitSemaphores = &rend; pr.swapchainCount = 1; pr.pSwapchains = &V.swapchain; pr.pImageIndices = &index;
+        VkPresentTimesInfoGOOGLE pti; VkPresentTimeGOOGLE ptm;
         g_wd_where = 4;
         if (!progress && display_present_defer()) {      /* session 14: the finished frame goes to the window AT THE TICK (display.c): kept here, presented by present_flush */
             g_pend.sc = V.swapchain; g_pend.index = index; g_pend.rend = rend; g_pend.suboptimal = suboptimal; g_pend.fight = g_in_fight; g_pend.on = 1;
             if (display_present_due()) present_flush();
             r = VK_SUCCESS;
         } else {
+        if (!progress) dtm_present(&pr, &pti, &ptm);      /* 2026-10-23: an id, for the true time on screen (nvn_vk_timing.c) */
         r = vkQueuePresentKHR(V.queue, &pr);
         if (!progress) display_present_done(g_in_fight);
         if (r == VK_ERROR_OUT_OF_DATE_KHR || VK_SUBOPT(r) || suboptimal) { cmd_wait_all(); swapchain_destroy(); InterlockedIncrement64(&g_vk_recreated); }
@@ -4511,6 +4516,7 @@ static void vkd_init(void) {
         vkCmdSetCheckpointNV = (PFN_vkCmdSetCheckpointNV)vkGetDeviceProcAddr(V.device, "vkCmdSetCheckpointNV"); vkGetQueueCheckpointDataNV = (PFN_vkGetQueueCheckpointDataNV)vkGetDeviceProcAddr(V.device, "vkGetQueueCheckpointDataNV");
         D.has_ckpt = vkCmdSetCheckpointNV && vkGetQueueCheckpointDataNV;
     }
+    dtm_init();
     printf("nvn_vk: device loss report: fault information %s, a marker before most commands %s\n", D.has_fault ? "yes (VK_EXT_device_fault)" : "no", D.has_ckpt ? "YES (SSBU_VK_CHECKPOINTS=1)" : "no (SSBU_VK_CHECKPOINTS=1)");
     if (D.has_eds3) {
 #define X3(n) n = (PFN_##n)vkGetDeviceProcAddr(V.device, #n); if (!n) vkd_fail("the device has VK_EXT_extended_dynamic_state3 but no " #n);
