@@ -8,6 +8,7 @@ import android.os.Bundle;
 import android.system.Os;
 import android.text.InputFilter;
 import android.text.InputType;
+import android.view.InputDevice;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.WindowManager;
@@ -58,6 +59,12 @@ public class GameActivity extends SDLActivity {
         }
         super.onCreate(saved);
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        /* 2026-10-23, input latency that "is sometimes more and sometimes less": Android hands a controller's sticks, d-pad
+         * (hat) and analog triggers to the app as joystick MotionEvents, and those are batched until the UI thread's next
+         * frame (Choreographer), so SDL's state (SDLControllerManager -> Android_OnJoy) took them 0..1 refresh late, by
+         * chance (0-8.4 ms on the Marble's 120 Hz panel, 0-16.7 ms at 60 Hz). Buttons are KeyEvents and were never
+         * batched. Unbuffered dispatch delivers every joystick sample to the focused surface as it arrives. */
+        if (mSurface != null) mSurface.requestUnbufferedDispatch(InputDevice.SOURCE_CLASS_JOYSTICK);
         /* touch_mode (LauncherActivity): 0 auto = shown while no controller is connected, 1 on, 2 off. A controller that
          * connects takes player 1 from the on-screen pad (nnpad_sdl.c); one that was there at the start left it out (touch) */
         int mode = i.getIntExtra("touch_mode", i.getBooleanExtra("touch", true) ? 1 : 2);
