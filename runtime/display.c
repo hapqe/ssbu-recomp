@@ -1047,7 +1047,7 @@ static int late_go(void) {
  * presents into one refresh and from then on every frame waits a whole refresh in the queue: +16.7 ms from the pad to the
  * screen, for 10-60 s, until a late frame without a catch-up empties the queue again. In 7,000 menu frames the two states
  * alternated in runs of hundreds to 1,500 frames: frames ready 2-8 ms before the compositor took them, or 16-25 ms.
- * Here: nvn_vk_timing.c reports for every frame whether it was ready longer than 0.6 of a game frame before it was latched
+ * Here: nvn_vk_timing.c reports for every frame whether it was ready a whole game frame (0.94) before it was latched
  * (display_queue_report); after DRAIN_RUN such frames in a row the game is held for one tick more at its next present
  * (display_present_plan): one picture stays on screen for two refreshes (as at any late frame; the game steps its logic by
  * the refreshes it counts, so its time is not changed) and the queue is empty again. At most one drain per DRAIN_GAP frames.
@@ -1060,7 +1060,7 @@ static int g_drain_on = -1;
 void display_queue_report(LONG64 margin_ns) {
     if (g_drain_on < 0) { const char *e = getenv("SSBU_QUEUE_DRAIN"); g_drain_on = e ? atoi(e) != 0 : 1; printf("display: queue drain %s (SSBU_QUEUE_DRAIN)%c", g_drain_on ? "on: a frame that waited a whole refresh in the compositor's queue for 12 frames in a row empties it (one tick held)" : "off", 10); }
     double per = g_lock_k ? (double)g_lock_k * g_vb_period : (double)g_freq.QuadPart / 60.0;
-    int deep = (double)margin_ns * (double)g_freq.QuadPart / 1e9 > 0.6 * per;
+    int deep = (double)margin_ns * (double)g_freq.QuadPart / 1e9 > 0.94 * per;      /* without a queue a frame is latched within one refresh of being ready (a heavy menu frame: up to ~12 ms) */
     g_drain_seen++;
     if (deep) g_drain_deep++;
     if (!g_drain_on || g_lockstep) return;

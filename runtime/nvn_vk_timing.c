@@ -7,7 +7,7 @@
  * (vkGetPastPresentationTimingGOOGLE, actualPresentTime): a frame's time on screen = the next frame's actual present
  * time - its own, counted in 8.33 ms steps (a 120 Hz refresh; at 60 Hz only the even counts occur). An even 60 fps is
  * every frame at 16.7 ms. A present the display never reported was replaced before it was shown (0).
- * One "nvn_vk_timing:" line per 1800 frames and one in the report at the exit. No desired present times are set.
+ * One "nvn_vk_timing:" line per 1800 frames and one in the report at the exit. Desired present times: EVN below.
  * SSBU_VK_DTIMING=0 off, 1 on (default on Android, off elsewhere). */
 #define DTM_STEP 8333333.0                           /* ns: a 120 Hz refresh, the unit of the counts */
 static struct {
@@ -55,6 +55,77 @@ static void dtl_line(FILE *out) {
                 dtl_q(k, 0.05), dtl_q(k, 0.5), dtl_q(k, 0.95), dtl_q(k, 0.99));
     }
 }
+/* 2026-10-23, EVEN CADENCE ON A FAST PANEL (EVN). On the Marble at 120 Hz the game's poll -> on screen was 24.5 ms in a
+ * fight against 45 ms at 60 Hz (the compositor's latch and scan-out are half as long), but a frame presented when it is
+ * ready is shown at whichever 120 Hz refresh comes after it: 21-45 % of the frames were on screen for 8 or 25 ms instead of
+ * 17 (render + composition took 11-13 ms for most frames and 21-30 ms for a tenth of them). Here every game frame gets a
+ * desired present time (VK_GOOGLE_display_timing): its poll + D, put on the panel's refresh grid (the reported true times
+ * are refreshes), never closer than one game frame to the one before. D moves in whole refreshes: up when more than 3 %
+ * of 120 frames were shown after their time, down when for 600 frames (and 1,800 after a raise) at most one was late and
+ * 98 % were ready a whole refresh before they were taken (presentMargin). So the picture is even and the delay is the
+ * smallest the frame times allow. Only when the refresh is under 12 ms (a 60 Hz panel shows every frame for one refresh
+ * anyway). NOT VERIFIED YET: the one test run (SSBU_FRAME_RATE=120, 2026-10-23) lost its log to a crash, so it is off unless
+ * SSBU_VK_EVEN=1 (with SSBU_FRAME_RATE=120 on a 120 Hz panel). */
+static struct {
+    int want, on;
+    PFN_vkGetRefreshCycleDurationGOOGLE rcd;
+    LONG64 R, P, D, anchor, last_desired, frames, late, early, n, since_raise, raises, lowers;
+    LONG64 desired[256];
+} EVN = {.want = -1};
+static void evn_refresh(void) {
+    VkRefreshCycleDurationGOOGLE rc;
+    if (!EVN.rcd || EVN.rcd(V.device, V.swapchain, &rc) != VK_SUCCESS || !rc.refreshDuration) return;
+    LONG64 R = (LONG64)rc.refreshDuration, k = (LONG64)(16666667.0 / (double)R + 0.5);
+    int on = EVN.want && R < 12000000 && k >= 2 && fabs((double)(k * R) - 16666667.0) < 300000.0;
+    LONG64 dn = EVN.R ? (EVN.D + EVN.R / 2) / EVN.R : 4;                /* the delay in refreshes (first guess: two game frames of 120 Hz) */
+    int same = EVN.R && R > EVN.R * 99 / 100 && R < EVN.R * 101 / 100;      /* the reported duration wobbles by a microsecond */
+    if (!same || on != EVN.on) {
+        printf("nvn_vk_timing: refresh %.3f ms: even cadence %s (SSBU_VK_EVEN)\n", (double)R / 1e6, on ? "on: every game frame is given a desired present time on the refresh grid" : "off");
+        EVN.n = EVN.late = EVN.early = 0;
+    }
+    EVN.R = R; EVN.P = k * R; EVN.on = on; EVN.D = dn * R;
+}
+/* a frame the display reported (dtm_poll) */
+static void evn_seen(const VkPastPresentationTimingGOOGLE *t) {
+    EVN.anchor = (LONG64)t->actualPresentTime;
+    LONG64 d = EVN.desired[t->presentID & 255];
+    EVN.desired[t->presentID & 255] = 0;
+    if (!EVN.on || !d) return;
+    int late = (LONG64)t->actualPresentTime > d + EVN.R / 2;
+    EVN.n++; EVN.since_raise++;
+    if (late) EVN.late++;
+    else if ((LONG64)t->presentMargin > EVN.R + 1000000 && t->presentMargin < 1000000000ull) EVN.early++;
+    if (EVN.n % 120 == 0 && EVN.late * 100 > 3 * EVN.n && EVN.D < 8 * EVN.R) {
+        EVN.D += EVN.R; EVN.raises++; EVN.since_raise = 0;
+        if (EVN.raises + EVN.lowers <= 30) printf("nvn_vk_timing: even cadence: %lld of %lld frames late: the delay from the poll goes up to %.1f ms\n", (long long)EVN.late, (long long)EVN.n, (double)EVN.D / 1e6);
+        EVN.n = EVN.late = EVN.early = 0;
+    } else if (EVN.n >= 600) {
+        if (EVN.late <= 1 && EVN.early * 100 >= 98 * EVN.n && EVN.since_raise >= 1800 && EVN.D > EVN.R) {
+            EVN.D -= EVN.R; EVN.lowers++;
+            if (EVN.raises + EVN.lowers <= 30) printf("nvn_vk_timing: even cadence: frames ready early: the delay from the poll goes down to %.1f ms\n", (double)EVN.D / 1e6);
+        }
+        EVN.n = EVN.late = EVN.early = 0;
+    }
+}
+/* the desired present time of the frame presented now (0 = as soon as it is ready) */
+static LONG64 evn_desired(uint32_t id, LONG64 poll, LONG64 now) {
+    if (EVN.want < 0) {
+        const char *e = getenv("SSBU_VK_EVEN");
+        EVN.want = e && atoi(e) != 0;                                /* opt-in: measured once (2026-10-23), see the comment above */
+        EVN.rcd = (PFN_vkGetRefreshCycleDurationGOOGLE)vkGetDeviceProcAddr(V.device, "vkGetRefreshCycleDurationGOOGLE");
+    }
+    if (EVN.frames++ % 120 == 0) evn_refresh();
+    EVN.desired[id & 255] = 0;
+    if (!EVN.on || !EVN.anchor) return 0;
+    LONG64 t = (poll ? poll : now) + EVN.D, R = EVN.R;
+    LONG64 n = (t - EVN.anchor + R - 1) / R;                         /* up onto the refresh grid (true present times) */
+    t = EVN.anchor + n * R;
+    if (EVN.last_desired && t < EVN.last_desired + EVN.P - R / 2) t = EVN.last_desired + EVN.P;
+    if (t < now) return 0;
+    EVN.last_desired = t;
+    EVN.desired[id & 255] = t;
+    return t - R / 4;                                                /* a little before the refresh: the compositor takes it for that one */
+}
 static int dtm_want(void) {
     if (!DTM.want) {
         const char *e = getenv("SSBU_VK_DTIMING");
@@ -94,7 +165,14 @@ static void dtm_poll(void) {
         }
         DTM.last_seen = t->presentID;
         dtl_seen(t);
-        { void display_queue_report(LONG64 margin_ns); if (t->presentMargin < 1000000000ull) display_queue_report((LONG64)t->presentMargin); }      /* display.c: queue drain */
+        {   /* display.c: queue drain. With a desired present time a frame is held on purpose: there the queue shows as frames
+             * shown a whole game frame after their time */
+            void display_queue_report(LONG64 margin_ns);
+            LONG64 d = EVN.desired[t->presentID & 255];
+            if (d) display_queue_report((LONG64)t->actualPresentTime - d >= EVN.P * 94 / 100 ? 1000000000 : 0);
+            else if (t->presentMargin < 1000000000ull) display_queue_report((LONG64)t->presentMargin);
+        }
+        evn_seen(t);
         if (DTM.prev_actual && t->actualPresentTime > DTM.prev_actual) {
             double steps = (double)(t->actualPresentTime - DTM.prev_actual) / DTM_STEP;
             if (steps < 12.0) { int b = (int)(steps + 0.5); dtm_count(b < 1 ? 1 : b > 6 ? 6 : b, 1); }      /* a gap of 100 ms or more (a load) is not counted */
@@ -109,7 +187,8 @@ static void dtm_present(VkPresentInfoKHR *pr, VkPresentTimesInfoGOOGLE *pti, VkP
     if (!++DTM.id) ++DTM.id;
     ptm->presentID = DTM.id; ptm->desiredPresentTime = 0;
     {   LARGE_INTEGER q; QueryPerformanceCounter(&q);
-        DTL[DTM.id & 255].id = DTM.id; DTL[DTM.id & 255].poll = display_l1_cur_poll(); DTL[DTM.id & 255].qp = q.QuadPart; DTL[DTM.id & 255].fight = g_in_fight; }
+        DTL[DTM.id & 255].id = DTM.id; DTL[DTM.id & 255].poll = display_l1_cur_poll(); DTL[DTM.id & 255].qp = q.QuadPart; DTL[DTM.id & 255].fight = g_in_fight;
+        ptm->desiredPresentTime = (uint64_t)evn_desired(DTM.id, DTL[DTM.id & 255].poll, q.QuadPart); }
     memset(pti, 0, sizeof *pti);
     pti->sType = VK_STRUCTURE_TYPE_PRESENT_TIMES_INFO_GOOGLE; pti->swapchainCount = 1; pti->pTimes = ptm; pti->pNext = pr->pNext;
     pr->pNext = pti;
@@ -117,6 +196,7 @@ static void dtm_present(VkPresentInfoKHR *pr, VkPresentTimesInfoGOOGLE *pti, VkP
 }
 static void dtm_report(FILE *out) {
     if (!DTM.on) return;
+    if (EVN.R) fprintf(out, "nvn_vk_timing: even cadence %s: refresh %.3f ms, delay from the poll %.1f ms (raised %lld, lowered %lld times)\n", EVN.on ? "on" : "off", (double)EVN.R / 1e6, (double)EVN.D / 1e6, (long long)EVN.raises, (long long)EVN.lowers);
     dtm_line(out, "all frames", DTM.hist_all, DTM.n_all);
     dtl_line(out);
 }
