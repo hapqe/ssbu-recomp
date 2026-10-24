@@ -112,6 +112,7 @@ public class GameActivity extends SDLActivity {
     public boolean dispatchKeyEvent(KeyEvent ev) {
         if (l1in && (ev.getSource() & InputDevice.SOURCE_GAMEPAD) == InputDevice.SOURCE_GAMEPAD)
             Log.i("OpenSmashL1", "key age " + (System.nanoTime() - ev.getEventTime() * 1000000L) + " ns, code " + ev.getKeyCode() + " action " + ev.getAction() + ", now " + System.nanoTime());
+        if (ControllerPanel.onKey(this, ev)) return true;
         return super.dispatchKeyEvent(ev);
     }
 
@@ -141,6 +142,7 @@ public class GameActivity extends SDLActivity {
 
     @Override
     protected void onDestroy() {
+        ControllerPanel.close();
         if (padWatch != null) ((InputManager) getSystemService(Context.INPUT_SERVICE)).unregisterInputDeviceListener(padWatch);
         super.onDestroy();
         /* the runtime cannot be restarted inside a process: the game process ends with its activity */

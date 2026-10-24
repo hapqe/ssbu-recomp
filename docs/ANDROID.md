@@ -37,10 +37,11 @@ network share). Build the APK with `android/build_apk.sh` (Android SDK + NDK, no
 Open **OpenSmash** and:
 
 1. **Allow access to files** when asked (the game folder, default `/sdcard/OpenSmash`, is on the shared storage).
-2. **Game files > Set up from Switch files**: choose the folder holding your keys, base game, update and DLC (sub-folders
-   are searched). The launcher identifies the packages by their names or, failing that, by their headers, then unpacks
-   the update's code and the game data (RomFS, ~15 GB; it can be stopped and started again, finished files stay). Your
-   DLC is unlocked in the same step.
+2. **Game files > Set up from Switch files**: a walkthrough that asks for your files one step at a time, each step can be
+   skipped: (1) the base game `.nsp`; (2) the update `.nsp` (13.0.4 or 13.0.5) or DLC `.nsp` files, as many as you have,
+   then Next; (3) `prod.keys` (a `title.keys` beside it is used too). A review then shows what was taken and where it goes;
+   **Set up** unpacks the update's code and the game data (RomFS, ~15 GB; it can be stopped and started again, finished
+   files stay). Your DLC is unlocked in the same step. A first setup needs the base game, the update and the keys.
 3. **Game files > Import libraries (.zip)**: the file from step 1. They are copied into the app's private storage.
 4. **GPU driver > Install a driver (.zip)**: a Turnip package, on Adreno.
 5. Optional: **Save data > Import** a folder or `.zip` holding `save_data` (JKSV, Checkpoint, yuzu / Eden / Ryujinx).

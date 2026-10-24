@@ -22,6 +22,7 @@ import android.provider.Settings;
 import android.text.InputType;
 import android.view.Gravity;
 import android.view.InputDevice;
+import android.view.KeyEvent;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.WindowManager;
@@ -57,7 +58,7 @@ import java.util.zip.ZipInputStream;
 /**
  * The launcher. Everything the game needs is set up here, on the device:
  *  - the game folder from the user's own Switch files (keys, base game, update 13.0.4 / 13.0.5, add-on content) found in
- *    a folder the user picks: GameSetup with libswitchimport.so (android/tools/romfs_extract.c) makes romfs/, binaries/,
+ *    files the user picks one step at a time (the setup walkthrough): GameSetup with libswitchimport.so (android/tools/romfs_extract.c) makes romfs/, binaries/,
  *    state.json and config/dlc.txt; the game libraries (the game's code, recompiled on a PC from the same dump:
  *    android/tools/build_game_android.py --package) are imported from a .zip;
  *  - their copy into the app's private storage (Android runs no code from shared storage);
@@ -70,7 +71,8 @@ import java.util.zip.ZipInputStream;
  */
 public class LauncherActivity extends Activity {
     static final String PREFS = "opensmash";
-    static final int REQ_TREE = 1, REQ_DRIVER = 2, REQ_SAVE_TREE = 3, REQ_SAVE_ZIP = 4, REQ_SETUP_TREE = 5, REQ_DLC_FILES = 6, REQ_DLC_TREE = 7, REQ_LIBS_ZIP = 8;
+    static final int REQ_TREE = 1, REQ_DRIVER = 2, REQ_SAVE_TREE = 3, REQ_SAVE_ZIP = 4, REQ_DLC_FILES = 6, REQ_DLC_TREE = 7, REQ_LIBS_ZIP = 8,
+            REQ_WIZ_BASE = 9, REQ_WIZ_PICK = 10, REQ_WIZ_KEYS = 11;      /* the setup walkthrough: main game, update or DLC, keys */
 
     private Ui u;
     private EditText extraEnv;
@@ -310,6 +312,17 @@ public class LauncherActivity extends Activity {
         save();
     }
 
+    @Override
+    public boolean dispatchKeyEvent(KeyEvent ev) {
+        return ControllerPanel.onKey(this, ev) || super.dispatchKeyEvent(ev);
+    }
+
+    @Override
+    protected void onDestroy() {
+        ControllerPanel.close();
+        super.onDestroy();
+    }
+
     private void save() {
         getSharedPreferences(PREFS, MODE_PRIVATE).edit().putString("folder", folderPath)
                 .putString("env", extraEnv.getText().toString()).putInt("touch_mode", touch.getSelectedItemPosition())
@@ -365,6 +378,7 @@ public class LauncherActivity extends Activity {
     @Override
     protected void onActivityResult(int req, int res, Intent data) {
         super.onActivityResult(req, res, data);
+        if (req >= REQ_WIZ_BASE && req <= REQ_WIZ_KEYS) { wizardResult(req, res == RESULT_OK && data != null ? data.getData() : null); return; }
         if (res != RESULT_OK || data == null) return;
         if (req == REQ_DLC_FILES) {
             List<Uri> uris = new ArrayList<>();
@@ -378,8 +392,7 @@ public class LauncherActivity extends Activity {
         if (req == REQ_DRIVER) { installDriver(data.getData()); return; }
         if (req == REQ_SAVE_TREE) { importSave(new File(treePath(data.getData())), null); return; }
         if (req == REQ_SAVE_ZIP) { importSave(null, data.getData()); return; }
-        if (req == REQ_SETUP_TREE) { scanForSetup(new File(treePath(data.getData())), false); return; }
-        if (req == REQ_DLC_TREE) { scanForSetup(new File(treePath(data.getData())), true); return; }
+        if (req == REQ_DLC_TREE) { scanForDlc(new File(treePath(data.getData()))); return; }
         if (req == REQ_LIBS_ZIP) { importLibraries(data.getData()); return; }
         if (req != REQ_TREE) return;
         folderPath = treePath(data.getData());
@@ -388,8 +401,9 @@ public class LauncherActivity extends Activity {
         refresh();
     }
     /** The file system path of a folder chosen with ACTION_OPEN_DOCUMENT_TREE (read through the all-files access). */
-    private static String treePath(Uri tree) {
-        String id = DocumentsContract.getTreeDocumentId(tree);                 /* "primary:OpenSmash" or "1234-ABCD:Games/OpenSmash" */
+    private static String treePath(Uri tree) { return idPath(DocumentsContract.getTreeDocumentId(tree)); }
+    /** A document id of the shared storage as a path: "primary:OpenSmash" or "1234-ABCD:Games/OpenSmash". */
+    private static String idPath(String id) {
         int colon = id.indexOf(':');
         String vol = colon >= 0 ? id.substring(0, colon) : id, rel = colon >= 0 ? id.substring(colon + 1) : "";
         String base = "primary".equalsIgnoreCase(vol) ? Environment.getExternalStorageDirectory().getAbsolutePath() : "/storage/" + vol;
@@ -447,36 +461,117 @@ public class LauncherActivity extends Activity {
         };
     }
 
-    /* ---------------------------------------------------------------- setting up from Switch files */
+    /* ---------------------------------------------------------------- setting up: the walkthrough */
+    /** What the walkthrough has taken so far (keys, base game, update, add-on content). */
+    private GameSetup.Found wizard;
+
+    /** Step 1 of 3: the main game; step 2: the update or DLC; step 3: the keys. Every step can be skipped. */
     private void askSetup() {
         if (!needFiles()) return;
-        new AlertDialog.Builder(this).setTitle("Set up from Switch files")
-                .setMessage("Choose the folder that holds your own dump: prod.keys (and title.keys), the base game (.nsp / .xci), its update 13.0.4 or "
-                        + "13.0.5 and any add-on content (.nsp, or a .rar / .zip of them). Sub-folders are searched too.\n\n"
-                        + "OpenSmash then unpacks the game data into " + game() + " (about 16 GB free space needed).")
-                .setNegativeButton("Cancel", null)
-                .setPositiveButton("Choose a folder…", (d, w) -> startActivityForResult(new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE), REQ_SETUP_TREE)).show();
+        wizard = new GameSetup.Found();
+        wizardBase();
     }
-    /** Searches dir; dlcOnly: the add-on content import (a folder), else the whole setup. */
-    private void scanForSetup(File dir, boolean dlcOnly) {
+    private void wizardBase() {
+        new AlertDialog.Builder(this).setTitle("1 of 3 · The main game")
+                .setMessage("Choose the base game of Super Smash Bros. Ultimate (.nsp).\n\n" + wizard.summary())
+                .setPositiveButton("Choose .nsp…", (d, w) -> pickWizardFile(REQ_WIZ_BASE))
+                .setNeutralButton("Skip", (d, w) -> wizardUpdate())
+                .setNegativeButton("Cancel", null).show();
+    }
+    private void wizardUpdate() {
+        new AlertDialog.Builder(this).setTitle("2 of 3 · Update or add-on content")
+                .setMessage("Choose the update (13.0.4 or 13.0.5) or a DLC package (.nsp). Choose as many packages as you have, then Next.\n\n" + wizard.summary())
+                .setPositiveButton("Choose .nsp…", (d, w) -> pickWizardFile(REQ_WIZ_PICK))
+                .setNeutralButton("Next", (d, w) -> wizardKeys())
+                .setNegativeButton("Cancel", null).show();
+    }
+    private void wizardKeys() {
+        new AlertDialog.Builder(this).setTitle("3 of 3 · The keys")
+                .setMessage("Choose prod.keys (a title.keys beside it is used too).\n\n" + wizard.summary())
+                .setPositiveButton("Choose prod.keys…", (d, w) -> pickWizardFile(REQ_WIZ_KEYS))
+                .setNeutralButton("Skip", (d, w) -> wizardReview())
+                .setNegativeButton("Cancel", null).show();
+    }
+    private void wizardStep(int req) {
+        if (req == REQ_WIZ_BASE) wizardBase();
+        else if (req == REQ_WIZ_PICK) wizardUpdate();
+        else wizardKeys();
+    }
+    private void pickWizardFile(int req) {
+        Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+        i.addCategory(Intent.CATEGORY_OPENABLE);
+        i.setType("*/*");
+        startActivityForResult(i, req);
+    }
+    /** A file the walkthrough asked for came back (uri null: none chosen). The file is taken, then the walkthrough goes on. */
+    private void wizardResult(int req, Uri uri) {
+        if (uri == null) { wizardStep(req); return; }
+        String path = filePath(uri);
+        if (path == null) { wizardRefused(req, displayName(uri) + " is not on the shared storage: copy it to Download or to the game folder, then choose it again."); return; }
+        File file = new File(path);
+        String name = file.getName(), low = name.toLowerCase(Locale.ROOT);
+        if (req == REQ_WIZ_KEYS) {
+            if (!low.endsWith(".keys")) { wizardRefused(req, name + " is not a keys file (.keys)."); return; }
+            wizard.prodKeys = file;
+            File t = new File(file.getParentFile(), "title.keys");
+            wizard.titleKeys = t.isFile() ? t : null;
+            wizardReview();
+            return;
+        }
+        if (low.endsWith(".nsz") || low.endsWith(".xcz")) { wizardRefused(req, name + " is compressed (.nsz / .xcz): decompress it first, then choose it."); return; }
+        if (!SwitchFiles.isPackage(name)) { wizardRefused(req, name + " is not a .nsp package."); return; }
+        List<Long> ids = SwitchFiles.titleIds(name);
+        if (ids.isEmpty()) ids = GameSetup.idsInside(file, GameSetup.tool(this), wizard);
+        if (ids.isEmpty()) { wizardRefused(req, name + ": the game cannot tell which title it is (its name has no title id)."); return; }
+        if (req == REQ_WIZ_BASE) {
+            if (!ids.contains(SwitchFiles.APP)) { wizardRefused(req, name + " is not the base game (title 0100…6E000)."); return; }
+            wizard.bases.clear();
+            wizard.bases.add(file);
+        } else if (ids.contains(SwitchFiles.UPDATE)) {
+            if (!wizard.updates.contains(file)) wizard.updates.add(file);
+        } else {
+            int before = wizard.dlc.size();
+            SwitchFiles.addDlc(SwitchFiles.titleIds(name).isEmpty() ? String.format(Locale.ROOT, "[%016X]", ids.get(0)) : name, wizard.dlc);
+            if (wizard.dlc.size() == before) { wizardRefused(req, name + " is neither the update nor add-on content of this game."); return; }
+            wizard.dlcPackages++;
+        }
+        wizardStep(req == REQ_WIZ_BASE ? REQ_WIZ_PICK : req);
+    }
+    private void wizardRefused(int req, String why) {
+        new AlertDialog.Builder(this).setTitle("Not this file").setMessage(why)
+                .setPositiveButton("OK", (d, w) -> wizardStep(req)).show();
+    }
+    /** The file system path of a file chosen with ACTION_OPEN_DOCUMENT, if it is on the shared storage (or Downloads); else null. */
+    private String filePath(Uri uri) {
+        if (!DocumentsContract.isDocumentUri(this, uri)) return null;
+        String id = DocumentsContract.getDocumentId(uri), path = null;
+        if (id.startsWith("raw:")) path = id.substring(4);
+        else if ("com.android.externalstorage.documents".equals(uri.getAuthority()) && id.indexOf(':') >= 0) path = idPath(id);
+        return path != null && new File(path).isFile() ? path : null;
+    }
+    /** The last step: what was taken, and the setup if it can run (the main game, its update and the keys). */
+    private void wizardReview() {
+        GameSetup.Found f = wizard;
+        File g = game();
+        boolean can = f.prodKeys != null && !f.bases.isEmpty() && !f.updates.isEmpty();
+        boolean dlcOnly = f.bases.isEmpty() && f.updates.isEmpty() && !f.dlc.isEmpty();
+        long free = new StatFs(g.getParentFile() != null && g.getParentFile().exists() ? g.getParentFile().getPath() : Environment.getExternalStorageDirectory().getPath()).getAvailableBytes();
+        boolean haveRomfs = new File(g, "romfs/data.arc").isFile();
+        String msg = f.summary() + "\n\nInto: " + g + "\nFree space: " + (free >> 30) + " GB" + (!haveRomfs && free < (17L << 30) ? "  (about 16 GB are needed: free some space first)" : "");
+        AlertDialog.Builder b = new AlertDialog.Builder(this).setTitle(can ? "Ready to set up" : dlcOnly ? "Add-on content only" : "Not everything was chosen")
+                .setNegativeButton("Cancel", null);
+        if (can) b.setMessage(msg).setPositiveButton("Set up", (d, w) -> runSetup(f));
+        else if (dlcOnly) b.setMessage(msg).setPositiveButton("Add the DLC only", (d, w) -> confirmDlc(f.dlc, "the walkthrough", f.notes));
+        else b.setMessage(msg + "\n\nA first setup needs the main game, its update and the keys. Start again to choose them.").setNeutralButton("Start again", (d, w) -> askSetup());
+        b.show();
+    }
+    /** Searches dir for add-on content (a folder of DLC packages) and confirms what it finds. */
+    private void scanForDlc(File dir) {
         if (!needFiles() || !begin("Searching " + dir + "…")) return;
         File g = game();
         new Thread(() -> {
             GameSetup.Found f = GameSetup.scan(dir, GameSetup.tool(this), g, uiProgress());
-            ui.post(() -> {
-                end("");
-                if (!dlcOnly && f.bases.isEmpty() && f.updates.isEmpty() && !f.dlc.isEmpty())
-                    f.notes.add(0, "◐ No base game or update in " + dir.getName() + ": only add-on content was found.\n");
-                if (dlcOnly || (f.bases.isEmpty() && f.updates.isEmpty() && !f.dlc.isEmpty())) { confirmDlc(f.dlc, dir.getName(), f.notes); return; }
-                boolean can = f.prodKeys != null && !f.bases.isEmpty() && !f.updates.isEmpty();
-                long free = new StatFs(g.getParentFile() != null && g.getParentFile().exists() ? g.getParentFile().getPath() : Environment.getExternalStorageDirectory().getPath()).getAvailableBytes();
-                boolean haveRomfs = new File(g, "romfs/data.arc").isFile();
-                String msg = f.summary() + "\n\nInto: " + g + "\nFree space: " + (free >> 30) + " GB" + (!haveRomfs && free < (17L << 30) ? "  (about 16 GB are needed: free some space first)" : "");
-                AlertDialog.Builder b = new AlertDialog.Builder(this).setTitle(can ? "Ready to set up" : "Not everything was found").setMessage(msg).setNegativeButton("Cancel", null);
-                if (can) b.setPositiveButton("Set up", (d, w) -> runSetup(f));
-                else if (!f.dlc.isEmpty()) b.setPositiveButton("Add the DLC only", (d, w) -> confirmDlc(f.dlc, dir.getName(), f.notes));
-                b.show();
-            });
+            ui.post(() -> { end(""); confirmDlc(f.dlc, dir.getName(), f.notes); });
         }).start();
     }
     private void runSetup(GameSetup.Found f) {
