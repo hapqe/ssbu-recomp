@@ -533,6 +533,28 @@ static void poll_devices(void) {                  /* lock held */
         if (!have) dev_add(ids[k]);
     }
     SDL_free(ids);
+#ifdef SSBU_ANDROID
+    /* 2026-10-24, the owner's Switch 1 Pro Controller over Bluetooth (the Marble): Procon2Droid's rumble_pro1 grabs the
+     * kernel's device for it (hid-nintendo, 057e:2009, "Nintendo Switch Pro Controller") and passes its input on through a
+     * device of its own (057e:2098, "Pro Controller S1"). Android still lists the grabbed one, which never sends anything:
+     * it took player 2 and the controller in use came in as player 3. While the proxy is there, the grabbed one is let go. */
+    {   Dev *proxy = NULL;
+        for (int i = 0; i < MAXDEV && !proxy; i++)
+            if (g_dev[i].used && !g_dev[i].ignored && g_dev[i].js && SDL_GetJoystickVendor(g_dev[i].js) == 0x057E && SDL_GetJoystickProduct(g_dev[i].js) == 0x2098) proxy = &g_dev[i];
+        for (int i = 0; proxy && i < MAXDEV; i++) {
+            Dev *t = &g_dev[i];
+            if (!t->used || t->ignored || t->virt || !t->js || SDL_GetJoystickVendor(t->js) != 0x057E || SDL_GetJoystickProduct(t->js) != 0x2009) continue;
+            int s = t->slot;
+            if (t->gp) SDL_CloseGamepad(t->gp); else SDL_CloseJoystick(t->js);
+            t->gp = NULL; t->js = NULL; t->ignored = 1; t->slot = -1;
+            say("nn::pad: ignored \"%s\" %s: grabbed by Procon2Droid, whose \"%s\" carries its input\n", t->name, t->guid, proxy->name);
+            if (s >= 0 && (proxy->slot < 0 || proxy->slot > s)) {
+                proxy->slot = s; remember(proxy->guid, s); apply_player_index(proxy);
+                say("nn::pad: \"%s\" -> player %d\n", proxy->name, s + 1);
+            }
+        }
+    }
+#endif
     for (int i = 0; i < MAXDEV; i++) if (g_dev[i].used && !g_dev[i].ignored && g_dev[i].slot < 0) {      /* a slot may have been freed */
         g_dev[i].slot = assign_slot(&g_dev[i]);
         if (g_dev[i].slot >= 0) { remember(g_dev[i].guid, g_dev[i].slot); apply_player_index(&g_dev[i]); say("nn::pad: \"%s\" -> player %d\n", g_dev[i].name, g_dev[i].slot + 1); }
