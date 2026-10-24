@@ -473,15 +473,15 @@ public class LauncherActivity extends Activity {
     }
     private void wizardBase() {
         new AlertDialog.Builder(this).setTitle("1 of 3 · The main game")
-                .setMessage("Choose the base game of Super Smash Bros. Ultimate (.nsp).\n\n" + wizard.summary())
-                .setPositiveButton("Choose .nsp…", (d, w) -> pickWizardFile(REQ_WIZ_BASE))
+                .setMessage("Choose the base game of Super Smash Bros. Ultimate (.nsp or .xci).\n\n" + wizard.summary())
+                .setPositiveButton("Choose file…", (d, w) -> pickWizardFile(REQ_WIZ_BASE))
                 .setNeutralButton("Skip", (d, w) -> wizardUpdate())
                 .setNegativeButton("Cancel", null).show();
     }
     private void wizardUpdate() {
         new AlertDialog.Builder(this).setTitle("2 of 3 · Update or add-on content")
-                .setMessage("Choose the update (13.0.4 or 13.0.5) or a DLC package (.nsp). Choose as many packages as you have, then Next.\n\n" + wizard.summary())
-                .setPositiveButton("Choose .nsp…", (d, w) -> pickWizardFile(REQ_WIZ_PICK))
+                .setMessage("Choose the update (13.0.4 or 13.0.5) or a DLC package (.nsp or .xci). Choose as many packages as you have, then Next.\n\n" + wizard.summary())
+                .setPositiveButton("Choose file…", (d, w) -> pickWizardFile(REQ_WIZ_PICK))
                 .setNeutralButton("Next", (d, w) -> wizardKeys())
                 .setNegativeButton("Cancel", null).show();
     }
@@ -519,7 +519,7 @@ public class LauncherActivity extends Activity {
             return;
         }
         if (low.endsWith(".nsz") || low.endsWith(".xcz")) { wizardRefused(req, name + " is compressed (.nsz / .xcz): decompress it first, then choose it."); return; }
-        if (!SwitchFiles.isPackage(name)) { wizardRefused(req, name + " is not a .nsp package."); return; }
+        if (!SwitchFiles.isPackage(name)) { wizardRefused(req, name + " is not a .nsp or .xci package."); return; }
         List<Long> ids = SwitchFiles.titleIds(name);
         if (ids.isEmpty()) ids = GameSetup.idsInside(file, GameSetup.tool(this), wizard);
         if (ids.isEmpty()) { wizardRefused(req, name + ": the game cannot tell which title it is (its name has no title id)."); return; }
@@ -622,7 +622,7 @@ public class LauncherActivity extends Activity {
                 String name = displayName(uri);
                 int before = rows.size();
                 SwitchFiles.addDlc(name, rows);
-                if (rows.size() == before && (SwitchFiles.isArchive(name) || name.toLowerCase(Locale.ROOT).endsWith(".nsp"))) {
+                if (rows.size() == before && (SwitchFiles.isArchive(name) || SwitchFiles.isPackage(name))) {
                     try (InputStream in = getContentResolver().openInputStream(uri)) {
                         for (String n : SwitchFiles.namesInside(name, in)) SwitchFiles.addDlc(n, rows);
                     } catch (IOException e) { notes.add("◐ " + name + ": " + e.getMessage()); }
