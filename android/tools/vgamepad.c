@@ -12,6 +12,9 @@
  *                                                       for <hold ms>; lx = left stick fully left / right by turns, hat =
  *                                                       d-pad left / right by turns, btn = L, mix = the three in turn. Every
  *                                                       write prints "inj: <CLOCK_MONOTONIC ns> <what> <on|off>".
+ * -e /dev/input/eventN: no new device; the commands are written into that existing one (evdev write: the kernel hands them
+ * to its readers as if the hardware sent them; Switch 1 Pro Controller via hid-nintendo: sticks -32767..32767), so the
+ * input takes the whole way after the driver, through Procon2Droid's rumble_pro1 proxy included.
  * Build: aarch64-linux-android30-clang -O2 -o vgamepad vgamepad.c; run as root: su -c ./vgamepad [-p] < script */
 #include <fcntl.h>
 #include <linux/uinput.h>
@@ -60,6 +63,13 @@ static void probe_set(int kind, int dir, int on) {
 int main(int argc, char **argv) {
     procon = argc > 1 && !strcmp(argv[1], "-p");
     if (procon) { amin = 0; amax = 65535; }
+    if (argc > 2 && !strcmp(argv[1], "-e")) {
+        fd = open(argv[2], O_WRONLY);
+        if (fd < 0) { perror(argv[2]); return 1; }
+        amin = -32767; amax = 32767;
+        printf("vgamepad: writing into %s\n", argv[2]); fflush(stdout);
+        goto run;
+    }
     fd = open("/dev/uinput", O_WRONLY | O_NONBLOCK);
     if (fd < 0) { perror("/dev/uinput"); return 1; }
     ioctl(fd, UI_SET_EVBIT, EV_KEY);
@@ -79,6 +89,7 @@ int main(int argc, char **argv) {
     else { s.id.bustype = BUS_USB; s.id.vendor = 0x045e; s.id.product = 0x028e; s.id.version = 0x110; strcpy(s.name, "Microsoft X-Box 360 pad"); }
     if (ioctl(fd, UI_DEV_SETUP, &s) || ioctl(fd, UI_DEV_CREATE)) { perror("uinput setup"); return 1; }
     printf("vgamepad: created (%s)\n", procon ? "as Procon2Droid's Switch Pro Controller" : "as an Xbox 360 pad"); fflush(stdout);
+run:
     srand((unsigned)mono());
     char line[128], a[16];
     while (fgets(line, sizeof line, stdin)) {
@@ -107,7 +118,7 @@ int main(int argc, char **argv) {
         else continue;
         printf("vgamepad: %s", line); fflush(stdout);
     }
-    ioctl(fd, UI_DEV_DESTROY);
+    if (!(argc > 2 && !strcmp(argv[1], "-e"))) ioctl(fd, UI_DEV_DESTROY);
     close(fd);
     return 0;
 }
