@@ -278,7 +278,7 @@ static void audio_OpenDefaultAudioOut(Ctx *c) {       /* (AudioOut *, nn::os::Sy
             int person = !_stricmp(base, "ssbu_native.exe") || !_stricmp(base, "ssbu_user.exe") || !_stricmp(base, "ssbu_native_rb.exe");   /* (_rb: the rollback pair) */
 #else
             if (strrchr(base, '/')) base = strrchr(base, '/') + 1;
-            int person = !strcmp(base, "ssbu_native") || !strcmp(base, "ssbu_user");      /* Linux build: no ".exe" */
+            int person = !strcmp(base, "ssbu_native") || !strcmp(base, "ssbu_user") || !strcmp(base, "ssbu_native.exe") || !strcmp(base, "ssbu_user.exe");   /* Android: SSBU_EXE ends in .exe */
 #endif
             int percent = vol ? atoi(vol) : person ? (gfx_volume() >= 0 ? gfx_volume() : 100) : 0;
             if (percent < 0) percent = 0;
